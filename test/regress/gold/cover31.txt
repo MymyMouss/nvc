@@ -1,0 +1,18 @@
+** Note: Code coverage report folder: html.
+** Note: Code coverage report contains: covered, uncovered, excluded coverage details.
+** Note: code coverage results for: WORK.COVER31
+** Note:      statement:     100.0 % (8/8)
+** Note:      branch:        N.A.
+** Note:      toggle:        N.A.
+** Note:      expression:    N.A.
+** Note:      FSM state:     N.A.
+** Note:      functional:    N.A.
+** Note:      average:       100.0 % (8/8)
+** Note: code coverage results for: WORK.OPS_PKG
+** Note:      statement:     81.2 % (13/16)
+** Note:      branch:        66.7 % (12/18)
+** Note:      toggle:        N.A.
+** Note:      expression:    38.1 % (8/21)
+** Note:      FSM state:     N.A.
+** Note:      functional:    N.A.
+** Note:      average:       60.0 % (33/55)

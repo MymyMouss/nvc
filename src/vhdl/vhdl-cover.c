@@ -25,6 +25,7 @@
 #include "vhdl/vhdl-util.h"
 
 #include <assert.h>
+#include <string.h>
 
 typedef struct _lazy_cscope lazy_cscope_t;
 
@@ -43,7 +44,8 @@ static cover_scope_t *get_cover_scope(cover_data_t *db, lazy_cscope_t *lcs)
       return lcs->cscope;
    else {
       cover_scope_t *parent = get_cover_scope(db, lcs->parent);
-      ident_t name = vhdl_scope_name(lcs->tree, lcs->nth);
+      tree_t region = lcs->parent != NULL ? lcs->parent->tree : NULL;
+      ident_t name = vhdl_scope_name(lcs->tree, region, lcs->nth);
       return (lcs->cscope = cover_create_scope(db, parent, lcs->tree, name));
    }
 }
@@ -344,13 +346,51 @@ void vhdl_cover_block(tree_t block, cover_data_t *db, cover_scope_t *cs)
    }
 }
 
-ident_t vhdl_scope_name(tree_t t, int nth)
+// A subprogram simple name is ambiguous when the enclosing declarative
+// region declares more than one subprogram body with that name (i.e. it is
+// overloaded). Overloaded bodies must get distinct cover scopes, otherwise
+// their cover items collapse into a single scope and the per-expression item
+// index used during lowering desyncs from the creation order.
+static bool subprogram_name_is_ambiguous(tree_t region, tree_t body)
+{
+   if (region == NULL)
+      return false;
+
+   ident_t name = tree_ident(body);
+   int count = 0;
+
+   const int ndecls = tree_decls(region);
+   for (int i = 0; i < ndecls; i++) {
+      tree_t d = tree_decl(region, i);
+      const tree_kind_t kind = tree_kind(d);
+      if ((kind == T_FUNC_BODY || kind == T_PROC_BODY)
+          && tree_ident(d) == name && ++count > 1)
+         return true;
+   }
+
+   return false;
+}
+
+ident_t vhdl_scope_name(tree_t t, tree_t region, int nth)
 {
    switch (tree_kind(t)) {
-   case T_BLOCK:
-   case T_PROCESS:
    case T_PROC_BODY:
    case T_FUNC_BODY:
+      // Disambiguate overloaded subprograms by appending the mangled
+      // signature so each body gets its own cover scope. Non-overloaded
+      // subprograms keep their plain name to avoid noisy hierarchies.
+      if (subprogram_name_is_ambiguous(region, t) && tree_has_ident2(t)) {
+         const char *sig = strchr(istr(tree_ident2(t)), '(');
+         if (sig != NULL) {
+            LOCAL_TEXT_BUF tb = tb_new();
+            tb_istr(tb, tree_ident(t));
+            tb_cat(tb, sig);
+            return ident_new(tb_get(tb));
+         }
+      }
+      return tree_ident(t);
+   case T_BLOCK:
+   case T_PROCESS:
    case T_PSL_DIRECT:
    case T_PACK_INST:
    case T_PACKAGE:

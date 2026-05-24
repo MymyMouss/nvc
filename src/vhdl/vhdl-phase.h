@@ -26,6 +26,6 @@ tree_t vhdl_config_instance(tree_t conf, tree_t bind, ident_t dotted);
 
 void vhdl_cover_block(tree_t block, cover_data_t *db, cover_scope_t *cs);
 void vhdl_cover_package(tree_t pack, cover_data_t *db, cover_scope_t *cs);
-ident_t vhdl_scope_name(tree_t t, int nth);
+ident_t vhdl_scope_name(tree_t t, tree_t region, int nth);
 
 #endif  // _VHDL_PHASE_H

@@ -6172,7 +6172,9 @@ static gen_stack_t lower_push_cscope(gen_stack_t *gs, tree_t t, int nth)
    if (gs->cscope == NULL)
       return *gs;
 
-   ident_t name = vhdl_scope_name(t, nth);
+   // Statements and alternatives are never overloaded so no enclosing
+   // region is needed to disambiguate the scope name.
+   ident_t name = vhdl_scope_name(t, NULL, nth);
    cover_scope_t *cs = cover_get_child(gs->cscope, name);
    if (cs == NULL)
       return *gs;
@@ -9804,8 +9806,13 @@ static cover_scope_t *lower_get_cscope(lower_unit_t *lu)
       cover_scope_t *parent = lower_get_cscope(lu->parent);
       if (parent == NULL)
          return NULL;
-      else
-         return cover_get_child(parent, vhdl_scope_name(lu->container, 0));
+      else {
+         // Pass the enclosing declarative region so overloaded subprogram
+         // scope names match those created by the coverage setup walk.
+         tree_t region = lu->parent != NULL ? lu->parent->container : NULL;
+         return cover_get_child(parent,
+                                vhdl_scope_name(lu->container, region, 0));
+      }
    }
 }
 

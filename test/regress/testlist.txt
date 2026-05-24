@@ -1350,3 +1350,4 @@ select18        verilog
 select19        verilog
 select20        verilog
 cover30         shell
+cover31         shell
