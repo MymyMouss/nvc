@@ -8,6 +8,9 @@
 - Code coverage can now be collected for package declarations, opted
   in via the new `+package` directive in a coverage specification
   file (#1007).
+- Fixed a crash when collecting expression coverage for overloaded
+  subprograms in a package: each overloaded body now gets a distinct
+  coverage scope so the per-expression cover items no longer desync.
 - Several other minor bugs were resolved (#1506, #1516, #1522, #1529).
 
 ## Version 1.20.1 - 2026-04-22
