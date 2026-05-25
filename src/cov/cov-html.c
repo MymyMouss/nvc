@@ -261,12 +261,19 @@ static void cover_print_item_title(FILE *f, const cover_item_t *item)
 }
 
 static void cover_print_expr(FILE *f, const cover_item_t *item,
-                             const rpt_line_t *line)
+                             const rpt_line_t *line,
+                             const rpt_line_t *line_end)
 {
    loc_t loc = item->loc;
 
    const rpt_line_t *curr_line = line;
    const rpt_line_t *last_line = line + loc.line_delta;
+
+   // The recorded span may reach beyond the source actually read at report
+   // time (e.g. the file was shortened between compile and report); clamp so
+   // the renderer never dereferences past the end of the line array.
+   if (last_line >= line_end)
+      last_line = line_end - 1;
    bool was_space = false, is_expr = false;
    int lhs_beg = 0, rhs_beg = 0, lhs_end = 0, rhs_end = 0;
    int glob_pos = 0;
@@ -389,11 +396,17 @@ static void cover_print_expr(FILE *f, const cover_item_t *item,
 }
 
 static void cover_print_code_loc(FILE *f, const cover_item_t *item,
-                                 const rpt_line_t *line)
+                                 const rpt_line_t *line,
+                                 const rpt_line_t *line_end)
 {
    loc_t loc = item->loc;
    const rpt_line_t *curr_line = line;
    const rpt_line_t *last_line = line + loc.line_delta;
+
+   // Clamp the span to the lines actually read at report time so a recorded
+   // multi-line span longer than the source on disk cannot overrun f->lines.
+   if (last_line >= line_end)
+      last_line = line_end - 1;
 
    if (loc.line_delta == 0) {
       fprintf(f, "<code>");
@@ -522,7 +535,7 @@ static void html_print_table(const rpt_table_t *table, cov_pair_kind_t pkind,
             fprintf(f, "<div style=\"float: right\"><b>Excluded due to:</b> Exclude file</div>");
 
          cover_print_item_title(f, item0);
-         cover_print_code_loc(f, item0, table->line);
+         cover_print_code_loc(f, item0, table->line, table->line_end);
 
          fprintf(f, "<br><b>Count:</b> %d", item0->data);
          fprintf(f, "<br><b>Threshold:</b> %d", item0->atleast);
@@ -532,7 +545,7 @@ static void html_print_table(const rpt_table_t *table, cov_pair_kind_t pkind,
    case COV_ITEM_BRANCH:
       {
          cover_print_item_title(f, table->items[0]);
-         cover_print_code_loc(f, table->items[0], table->line);
+         cover_print_code_loc(f, table->items[0], table->line, table->line_end);
 
          const char *title = (table->items[0]->flags & COV_FLAG_CHOICE)
             ? "Choice of" : "Evaluated to";
@@ -572,7 +585,7 @@ static void html_print_table(const rpt_table_t *table, cov_pair_kind_t pkind,
    case COV_ITEM_EXPRESSION:
       {
          cover_print_item_title(f, table->items[0]);
-         cover_print_expr(f, table->items[0], table->line);
+         cover_print_expr(f, table->items[0], table->line, table->line_end);
 
          if (table->items[0]->flags & (COV_FLAG_TRUE | COV_FLAG_FALSE)) {
             const char *title = "Evaluated to";
@@ -720,7 +733,7 @@ static void html_print_table(const rpt_table_t *table, cov_pair_kind_t pkind,
             if (pkind == PAIR_UNCOVERED)
                cover_print_get_exclude_button(f, item0, 0, false);
             cover_print_item_title(f, item0);
-            cover_print_code_loc(f, item0, table->line);
+            cover_print_code_loc(f, item0, table->line, table->line_end);
             fprintf(f, "<br><b>Count:</b> %d", item0->data);
             fprintf(f, "<br><b>Threshold:</b> %d", item0->atleast);
          }
@@ -730,7 +743,7 @@ static void html_print_table(const rpt_table_t *table, cov_pair_kind_t pkind,
    case COV_ITEM_STATE:
       {
          cover_print_item_title(f, table->items[0]);
-         cover_print_code_loc(f, table->items[0], table->line);
+         cover_print_code_loc(f, table->items[0], table->line, table->line_end);
 
          const char *title = "State";
          cover_print_bin_header(f, pkind, 1, &title);
