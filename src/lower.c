@@ -2519,11 +2519,20 @@ static vcode_reg_t lower_logical(lower_unit_t *lu, tree_t t, int *nth,
       vcode_type_t vbool = vtype_bool();
       vcode_var_t tmp_var = lower_temp_var(lu, "shortcircuit", vbool);
       if (kind == S_SCALAR_NOR || kind == S_SCALAR_NAND)
-      emit_store(emit_not(r0), tmp_var);
+         emit_store(emit_not(r0), tmp_var);
       else
          emit_store(r0, tmp_var);
 
-      if (kind == S_SCALAR_AND || kind == S_SCALAR_NAND)
+      // When the short circuit is taken the right hand side is never
+      // evaluated, but the expression still executed with the left hand
+      // side controlling the result. Default the recorded right hand side
+      // to its non-controlling value so the corresponding bin (10 for
+      // or/nor, 01 for and/nand) is hit rather than left uncovered.
+      vcode_var_t rhs_var = lower_temp_var(lu, "shortcircuit.rhs", vbool);
+      const bool ctrl_when_true = (kind == S_SCALAR_AND || kind == S_SCALAR_NAND);
+      emit_store(emit_const(vbool, ctrl_when_true), rhs_var);
+
+      if (ctrl_when_true)
          emit_cond(r0, arg1_bb, after_bb);
       else
          emit_cond(r0, after_bb, arg1_bb);
@@ -2531,6 +2540,7 @@ static vcode_reg_t lower_logical(lower_unit_t *lu, tree_t t, int *nth,
       vcode_select_block(arg1_bb);
 
       vcode_reg_t r1 = lower_logical(lu, p1, nth, gs);
+      emit_store(r1, rhs_var);
 
       switch (kind) {
       case S_SCALAR_AND:
@@ -2549,23 +2559,18 @@ static vcode_reg_t lower_logical(lower_unit_t *lu, tree_t t, int *nth,
          should_not_reach_here();
       }
 
-      // Automaticaly flag non-executed bins as un-reachable if configured
-      unsigned unrc_msk = 0;
-      if (cover_enabled(lu->cover, COVER_MASK_EXCLUDE_UNREACHABLE)) {
-         if (kind == S_SCALAR_AND || kind == S_SCALAR_NAND)
-            unrc_msk = COV_FLAG_00 | COV_FLAG_01;
-         else
-            unrc_msk = COV_FLAG_11 | COV_FLAG_10;
-      }
-
-      // Only emit expression coverage when also arg1 is evaluated.
-      lower_expr_coverge(lu, first, emit_load(tmp_var), r0, r1, unrc_msk);
-
       emit_jump(after_bb);
 
       vcode_select_block(after_bb);
+
+      // Record expression coverage where both paths merge: on the short
+      // circuit path the right hand side keeps its non-controlling default.
+      lower_expr_coverge(lu, first, emit_load(tmp_var), r0,
+                         emit_load(rhs_var), 0);
+
       vcode_reg_t result = emit_load(tmp_var);
       lower_release_temp(lu, tmp_var);
+      lower_release_temp(lu, rhs_var);
       return result;
    }
    else {
