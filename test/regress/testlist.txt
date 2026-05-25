@@ -1353,3 +1353,4 @@ select20        verilog
 cover30         shell
 cover31         shell
 cover32         shell
+cover33         shell

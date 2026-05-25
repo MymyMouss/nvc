@@ -43,6 +43,7 @@ typedef struct {
 
 typedef struct {
    const rpt_line_t   *line;
+   const rpt_line_t   *line_end;
    unsigned            count;
    const cover_item_t *items[];
 } rpt_table_t;
