@@ -34,10 +34,37 @@ typedef struct _cobertura_class cobertura_class_t;
 
 typedef struct {
    unsigned lineno;
-   unsigned hits;
-   bool     branch;
-   unsigned bflags;
+   unsigned hits;       // Accumulated statement hits on this line
+   bool     has_stmt;   // A statement cover item lives on this line
+   bool     branch;     // A branch cover item lives on this line
+   unsigned bflags;     // OR of COV_FLAG_* for bins that were taken
+   unsigned br_exec;    // Total branch executions (fallback line hit count)
 } cobertura_line_t;
+
+// A line's hit count is its statement count when a statement lives there;
+// otherwise it is the number of times a branch on that line was taken. The
+// latter covers the "header" lines of case choices and elsif conditions,
+// which carry only a branch item and would otherwise always read hits=0
+// even though control reached them.
+static unsigned cobertura_line_hits(const cobertura_line_t *line)
+{
+   return line->has_stmt ? line->hits : line->br_exec;
+}
+
+// A branch line's condition coverage. An if/while decision has TRUE and
+// FALSE bins and is fully covered when both were taken (50% each). A case
+// choice has a single CHOICE bin per arm and is covered when the arm was
+// selected at all - the TRUE/FALSE accounting does not apply to it.
+static int cobertura_branch_pct(const cobertura_line_t *line)
+{
+   if (line->bflags & COV_FLAG_CHOICE)
+      return 100;
+
+   int pct = 0;
+   if (line->bflags & COV_FLAG_TRUE) pct += 50;
+   if (line->bflags & COV_FLAG_FALSE) pct += 50;
+   return pct;
+}
 
 typedef struct _cobertura_class {
    char              *file;
@@ -110,17 +137,28 @@ static void cobertura_export_scope(cobertura_report_t *report,
 
    for (int i = 0; i < s->items.count; i++) {
       const cover_item_t *item = s->items.items[i];
+
+      // Only statement and branch items map onto Cobertura lines/branches.
+      // Toggle, expression and FSM-state items must not create a line entry,
+      // otherwise a declaration with only toggle coverage shows up as a
+      // permanently uncovered (hits=0) source line.
+      if (item->kind != COV_ITEM_STMT && item->kind != COV_ITEM_BRANCH)
+         continue;
+
       cobertura_line_t *l = cobertura_get_line(class, &(item->loc));
 
       for (int j = 0; j < item->consecutive; j++) {
          switch (item->kind) {
          case COV_ITEM_STMT:
+            l->has_stmt = true;
             l->hits += item[j].data;
             break;
          case COV_ITEM_BRANCH:
             l->branch = true;
-            if (item[j].data > 0)
+            if (item[j].data > 0) {
                l->bflags |= item[j].flags;
+               l->br_exec += item[j].data;
+            }
             break;
          default:
             break;
@@ -139,12 +177,12 @@ static void cobertura_class_stats(const cobertura_class_t *class,
    *nlines += class->nlines;
    for (int i = 0; i < class->nlines; i++) {
       const cobertura_line_t *line = &(class->lines[i]);
-      if (line->hits > 0)
+      if (cobertura_line_hits(line) > 0)
          (*hitlines)++;
       if (line->branch) {
          (*nbranches)++;
-         if ((line->bflags & COV_FLAG_TRUE) && (line->bflags & COV_FLAG_FALSE))
-             (*hitbranches)++;
+         if (cobertura_branch_pct(line) == 100)
+            (*hitbranches)++;
       }
    }
 }
@@ -169,13 +207,11 @@ static void cobertura_print_class(cobertura_class_t *class, FILE *f)
    for (int i = 0; i < class->nlines; i++) {
       const cobertura_line_t *line = &(class->lines[i]);
       if (line->branch) {
-         int pct = 0;
-         if (line->bflags & COV_FLAG_TRUE) pct += 50;
-         if (line->bflags & COV_FLAG_FALSE) pct += 50;
+         const int pct = cobertura_branch_pct(line);
 
          fprintf(f, "<line number=\"%d\" hits=\"%d\" branch=\"true\" "
                  "condition-coverage=\"%d %%\">\n",
-                 line->lineno, line->hits, pct);
+                 line->lineno, cobertura_line_hits(line), pct);
          fprintf(f, "<conditions>\n");
          fprintf(f, "<condition number=\"0\" type=\"jump\" "
                  "coverage=\"%d %%\"/>\n", pct);
@@ -184,7 +220,7 @@ static void cobertura_print_class(cobertura_class_t *class, FILE *f)
       }
       else
          fprintf(f, "<line number=\"%d\" hits=\"%d\" branch=\"false\"/>\n",
-                 line->lineno, line->hits);
+                 line->lineno, cobertura_line_hits(line));
    }
    fprintf(f, "</lines>\n");
 
