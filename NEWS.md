@@ -11,6 +11,9 @@
 - Fixed a crash when collecting expression coverage for overloaded
   subprograms in a package: each overloaded body now gets a distinct
   coverage scope so the per-expression cover items no longer desync.
+- Expression coverage of a short-circuit logical operator no longer
+  leaves the bin where the left operand controls the result (`10` for
+  `or`/`nor`, `01` for `and`/`nand`) permanently uncovered (#1450).
 - Several other minor bugs were resolved (#1506, #1516, #1522, #1529).
 
 ## Version 1.20.1 - 2026-04-22

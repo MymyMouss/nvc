@@ -1273,6 +1273,7 @@ vlog35          verilog,gold
 issue1427       normal,2008
 ivtest22        verilog
 issue1453       normal,2008
+issue1408       normal,2008
 ivtest23        verilog
 issue1459       verilog
 issue1460       normal,2019
@@ -1351,3 +1352,4 @@ select19        verilog
 select20        verilog
 cover30         shell
 cover31         shell
+cover32         shell
