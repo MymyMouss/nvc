@@ -886,6 +886,24 @@ as
 /
 .Cm 0
 during toggle coverage collection.
+The counting is symmetric: a transition from
+.Cm 0
+/
+.Cm 1
+to
+.Cm U
+/
+.Cm X
+is likewise counted as the corresponding
+.Cm 0
+->
+.Cm 1
+or
+.Cm 1
+->
+.Cm 0
+toggle, so a signal that idles at an undefined value and only ever
+pulses to a defined level still records both toggle bins.
 .It
 .Cm count-from-to-z
 - When set, NVC also counts toggles from/to

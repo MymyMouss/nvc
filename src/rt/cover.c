@@ -84,6 +84,15 @@ static inline void cover_toggle_check_0_1_u(uint8_t old, uint8_t new,
       increment_counter(toggle_01);
    else if ((old == _U || old == _X) && new == _0)
       increment_counter(toggle_10);
+
+   // Symmetric: a transition *to* U/X also exercises leaving the 0/1 state,
+   // mirroring how the Z handling counts both directions. This is required
+   // for signals that idle at an undefined value (e.g. a resolved signal with
+   // an as-yet-undriven 'U' driver) and only ever pulse 0/1 -> U.
+   else if (old == _0 && (new == _U || new == _X))
+      increment_counter(toggle_01);
+   else if (old == _1 && (new == _U || new == _X))
+      increment_counter(toggle_10);
 }
 
 __attribute__((always_inline))
@@ -119,6 +128,13 @@ static inline void cover_toggle_check_0_1_u_z(uint8_t old, uint8_t new,
    else if ((old == _U || old == _X) && new == _1)
       increment_counter(toggle_01);
    else if ((old == _U || old == _X) && new == _0)
+      increment_counter(toggle_10);
+
+   // Symmetric: a transition *to* U/X also exercises leaving the 0/1 state
+   // (see cover_toggle_check_0_1_u).
+   else if (old == _0 && (new == _U || new == _X))
+      increment_counter(toggle_01);
+   else if (old == _1 && (new == _U || new == _X))
       increment_counter(toggle_10);
 
    else if (old == _0 && new == _Z)
