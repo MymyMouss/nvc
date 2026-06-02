@@ -1,0 +1,20 @@
+** Note: Code coverage report folder: html.
+** Note: Code coverage report contains: covered, uncovered, excluded coverage details.
+** Note: code coverage results for: WORK.COVER34
+** Note:      statement:     N.A.
+** Note:      branch:        N.A.
+** Note:      toggle:        0.0 % (0/4)
+** Note:      expression:    N.A.
+** Note:      FSM state:     N.A.
+** Note:      functional:    N.A.
+** Note:      average:       0.0 % (0/4)
+** Note: Code coverage report folder: html.
+** Note: Code coverage report contains: covered, uncovered, excluded coverage details.
+** Note: code coverage results for: WORK.COVER34
+** Note:      statement:     N.A.
+** Note:      branch:        N.A.
+** Note:      toggle:        100.0 % (4/4)
+** Note:      expression:    N.A.
+** Note:      FSM state:     N.A.
+** Note:      functional:    N.A.
+** Note:      average:       100.0 % (4/4)

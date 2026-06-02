@@ -1354,3 +1354,4 @@ cover30         shell
 cover31         shell
 cover32         shell
 cover33         shell
+cover34         cover,shell

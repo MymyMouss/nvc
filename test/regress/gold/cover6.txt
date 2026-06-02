@@ -3,28 +3,28 @@
 ** Note: code coverage results for: WORK.COVER6
 ** Note:      statement:     N.A.
 ** Note:      branch:        N.A.
-** Note:      toggle:        25.0 % (4/16)
+** Note:      toggle:        16.7 % (2/12)
 ** Note:      expression:    N.A.
 ** Note:      FSM state:     N.A.
 ** Note:      functional:    N.A.
-** Note:      average:       25.0 % (4/16)
+** Note:      average:       16.7 % (2/12)
 ** Note: Code coverage report folder: html.
 ** Note: Code coverage report contains: covered, uncovered, excluded coverage details.
 ** Note: code coverage results for: WORK.COVER6
 ** Note:      statement:     N.A.
 ** Note:      branch:        N.A.
-** Note:      toggle:        25.0 % (4/16)
+** Note:      toggle:        33.3 % (4/12)
 ** Note:      expression:    N.A.
 ** Note:      FSM state:     N.A.
 ** Note:      functional:    N.A.
-** Note:      average:       25.0 % (4/16)
+** Note:      average:       33.3 % (4/12)
 ** Note: Code coverage report folder: html.
 ** Note: Code coverage report contains: covered, uncovered, excluded coverage details.
 ** Note: code coverage results for: WORK.COVER6
 ** Note:      statement:     N.A.
 ** Note:      branch:        N.A.
-** Note:      toggle:        50.0 % (8/16)
+** Note:      toggle:        50.0 % (6/12)
 ** Note:      expression:    N.A.
 ** Note:      FSM state:     N.A.
 ** Note:      functional:    N.A.
-** Note:      average:       50.0 % (8/16)
+** Note:      average:       50.0 % (6/12)

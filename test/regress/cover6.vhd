@@ -17,9 +17,6 @@ architecture test of cover6 is
     signal from_1_to_z  : std_logic := '1';
     signal from_0_to_z  : std_logic := '0';
 
-    signal from_1_to_u  : std_logic := '1';
-    signal from_0_to_x  : std_logic := '0';
-
 begin
 
     process
@@ -48,14 +45,6 @@ begin
 
         -- 0 -> Z
         from_0_to_z <= 'Z';
-        wait for 1 ns;
-
-        -- 1 -> U  (leaving the 1 state to an undefined value)
-        from_1_to_u <= 'U';
-        wait for 1 ns;
-
-        -- 0 -> X  (leaving the 0 state to an undefined value)
-        from_0_to_x <= 'X';
         wait for 1 ns;
 
         wait;
