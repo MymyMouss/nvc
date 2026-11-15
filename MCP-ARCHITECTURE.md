@@ -305,7 +305,25 @@ typées, puis on factorisera si le besoin se confirme.
 | M3 | Bac à sable, filtre de chemins `fileio`, rlimits, fuzzing, `--disable-mcp` | Revue de sécurité sans point bloquant |
 | M4 | Checkpoints (`PLAN.md` §1), extension tâches, HTTP local, couverture | Handles qui survivent à la mort d'un worker |
 
-## 5. Points à valider et limites de cette étude
+## 5. État d'avancement (M0)
+
+L'étape M0 est écrite (`src/mcp/`, tests dans `test/test_mcp.c`):
+
+- JSON borné, validateur de schémas, protocole bi-époque, annulation,
+  limitation de la taille des requêtes, outil `nvc_analyse`.
+- Écart par rapport à D1: le worker éphémère est le binaire `nvc` lui-même
+  (`nvc [options globales] --work=… -a …`) lancé par `fork`/`exec`. Les
+  diagnostics reviennent en JSON sur un descripteur dédié grâce à l'option
+  globale interne `--diag-json=FD`, et la sortie texte (erreurs fatales) est
+  capturée à part. La commande `--mcp-worker` persistante n'apparaîtra qu'avec
+  les simulations (M1).
+- Le fuzzing de l'analyseur JSON (4 millions d'entrées mutées sous ASan et
+  UBSan) n'a rien trouvé. Le harnais n'est pas versionné.
+- Pas encore fait: l'option `--disable-mcp` à la configuration, les
+  sorties de progression, les limites mémoire (`RLIMIT_AS`) des workers,
+  et le support Windows.
+
+## 6. Points à valider et limites de cette étude
 
 À décider avec vous:
 

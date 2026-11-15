@@ -1,4 +1,8 @@
 ## Unreleased changes
+- Added an experimental Model Context Protocol server, started with
+  `nvc --mcp`, that lets AI agents drive nvc.  The first tool,
+  `nvc_analyse`, compiles source files and returns diagnostics with
+  file, line and column.  Each call runs in an isolated worker process.
 - Code coverage can now be collected for package declarations and
   bodies, opted in via the new `+package` directive (or an existing
   `+hierarchy` rule) in a coverage specification file.  Packages from the

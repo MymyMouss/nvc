@@ -1,0 +1,13 @@
+lib_libnvc_a_SOURCES += \
+	src/mcp/mcp.h \
+	src/mcp/mcp-child.c \
+	src/mcp/mcp-child.h \
+	src/mcp/mcp-diag.c \
+	src/mcp/mcp-json.c \
+	src/mcp/mcp-json.h \
+	src/mcp/mcp-main.c \
+	src/mcp/mcp-schema.c \
+	src/mcp/mcp-schema.h \
+	src/mcp/mcp-server.c \
+	src/mcp/mcp-server.h \
+	src/mcp/mcp-tools.c

@@ -73,6 +73,22 @@ Generate an HTML report from a coverage database.
 Evaluate a batch TCL script, optionally with
 .Ar unit
 loaded.
+.\" --mcp
+.It Fl \-mcp Op Fl \-root= Ns Ar dir
+Run as a Model Context Protocol server that reads requests from standard
+input and writes responses to standard output, so that an AI agent can
+analyse designs with nvc.  The server never loads a design itself: each
+tool call runs in a separate worker process, so a fatal error cannot end
+the session.  File arguments are relative to
+.Ar dir ,
+which defaults to the current directory, and may not leave it.  Global
+options given before
+.Fl \-mcp
+are passed on to the workers.  Both the 2026-07-28 revision of the
+protocol and the earlier revisions that use an
+.Cm initialize
+handshake are supported.  The only tool at present is
+.Cm nvc_analyse .
 .\" --init
 .It Fl \-init
 Initialise the working library directory.  This is not normally

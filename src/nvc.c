@@ -23,6 +23,7 @@
 #include "jit/jit.h"
 #include "lib.h"
 #include "lower.h"
+#include "mcp/mcp.h"
 #include "mir/mir-unit.h"
 #include "option.h"
 #include "phase.h"
@@ -72,6 +73,9 @@ typedef struct {
    ident_t          top_level;
    const char      *top_level_arg;
    lib_t            work;
+   const char      *exe;
+   const char     **gargv;    // Global options, forwarded to MCP workers
+   int              gargc;
 } cmd_state_t;
 
 const char copy_string[] =
@@ -117,7 +121,7 @@ static int scan_cmd(int start, int argc, char **argv)
       "-a", "-e", "-r", "-c", "--dump", "--make", "--syntax", "--list",
       "--init", "--install", "--print-deps", "--do", "-i",
       "--cover-export", "--preprocess", "--cover-merge",
-      "--cover-report",
+      "--cover-report", "--mcp",
    };
 
    for (int i = start; i < argc; i++) {
@@ -1680,6 +1684,34 @@ static int do_cmd(int argc, char **argv, cmd_state_t *state)
    return argc > 1 ? process_command(argc, argv, state) : EXIT_SUCCESS;
 }
 
+static int mcp_cmd(int argc, char **argv, cmd_state_t *state)
+{
+   static struct option long_options[] = {
+      { "root", required_argument, 0, 'r' },
+      { 0, 0, 0, 0 }
+   };
+
+   const int next_cmd = scan_cmd(2, argc, argv);
+   int c, index = 0;
+   const char *spec = ":", *root = NULL;
+   while ((c = getopt_long(next_cmd, argv, spec, long_options, &index)) != -1) {
+      switch (c) {
+      case 0: break;  // Set a flag
+      case 'r':
+         root = optarg;
+         break;
+      case '?': bad_option("mcp", argv);
+      case ':': missing_argument("mcp", argv);
+      default: abort();
+      }
+   }
+
+   if (optind < next_cmd)
+      fatal("unexpected argument $bold$%s$$ after --mcp", argv[optind]);
+
+   return mcp_run(root, state->exe, state->gargv, state->gargc);
+}
+
 static int interact_cmd(int argc, char **argv, cmd_state_t *state)
 {
    static struct option long_options[] = {
@@ -2275,6 +2307,8 @@ static void usage(void)
 #ifdef ENABLE_TCL
            { "-i [TOP]", "Launch interactive TCL shell" },
 #endif
+           { "--mcp [--root=DIR]",
+             "Run as a Model Context Protocol server on stdin and stdout" },
            { "--cover-export FILE...",
              "Export coverage database to external format" },
            { "--cover-report FILE...",
@@ -2567,6 +2601,7 @@ static int process_command(int argc, char **argv, cmd_state_t *state)
       { "cover-merge",  no_argument, 0, 'M' },
       { "cover-report", no_argument, 0, 'p' },
       { "preprocess",   no_argument, 0, 'R' },
+      { "mcp",          no_argument, 0, 'C' },
       { 0, 0, 0, 0 }
    };
 
@@ -2610,6 +2645,8 @@ static int process_command(int argc, char **argv, cmd_state_t *state)
       return cover_report_cmd(argc, argv, state);
    case 'R':
       return preprocess_cmd(argc, argv, state);
+   case 'C':
+      return mcp_cmd(argc, argv, state);
    default:
       fatal("missing command, try $bold$%s --help$$ for usage", PACKAGE);
       return EXIT_FAILURE;
@@ -2643,6 +2680,7 @@ int main(int argc, char **argv)
       { "vhpi-debug",    no_argument,       0, 'D' },
       { "vhpi-trace",    no_argument,       0, 'T' },
       { "seed",          required_argument, 0, 'S' },
+      { "diag-json",     required_argument, 0, 'J' },   // Internal
       { 0, 0, 0, 0 }
    };
 
@@ -2718,6 +2756,9 @@ int main(int argc, char **argv)
       case 'S':
          opt_set_int(OPT_RANDOM_SEED, parse_int(optarg));
          break;
+      case 'J':
+         mcp_diag_install(parse_int(optarg));
+         break;
       case '?':
          bad_option("global", argv);
       case ':':
@@ -2753,6 +2794,15 @@ int main(int argc, char **argv)
    else if (nplusargs > 0)
       warnf("found plusargs on command line but no VHPI plugin was loaded");
 
+   // Remember the global options so the MCP server can pass them to its
+   // workers: plusargs are left out as they only matter to simulation
+   state.exe = argv[0];
+   state.gargv = xcalloc_array(next_cmd, sizeof(char *));
+   for (int i = 1; i < next_cmd; i++) {
+      if (argv[i][0] != '+')
+         state.gargv[state.gargc++] = argv[i];
+   }
+
    argc -= next_cmd - 1;
    argv += next_cmd - 1;
 
@@ -2773,6 +2823,7 @@ int main(int argc, char **argv)
    if (state.cover != NULL)
       cover_data_free(state.cover);
 
+   free(state.gargv);
    tb_free(state.plugins);
 
    return ret;
