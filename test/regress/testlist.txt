@@ -1512,3 +1512,8 @@ vlog52          verilog,gold
 udp3            verilog
 issue1730       verilog
 issue1724       normal,2008
+issue1408       normal,2008
+covpkg1         shell
+covpkg2         shell
+covpkg3         shell
+covpkg4         shell
