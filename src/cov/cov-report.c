@@ -82,15 +82,16 @@ static bool rpt_is_excluded(cover_rpt_t *rpt, const rpt_item_t *ri)
 }
 
 static rpt_table_t *rpt_table_new(cover_rpt_t *rpt, const rpt_line_t *line,
-                                  int count)
+                                  const rpt_line_t *line_end, int count)
 {
    if (count == 0)
       return NULL;
 
    rpt_table_t *table = pool_malloc_flex(rpt->pool, sizeof(rpt_table_t), count,
                                          sizeof(rpt_item_t));
-   table->line  = line;
-   table->count = count;
+   table->line     = line;
+   table->line_end = line_end;
+   table->count    = count;
 
    return table;
 }
@@ -98,7 +99,8 @@ static rpt_table_t *rpt_table_new(cover_rpt_t *rpt, const rpt_line_t *line,
 static void rpt_get_detail(cover_rpt_t *rpt, rpt_detail_t *detail,
                            rpt_stats_t *stats, cover_obj_t item,
                            const cover_obj_t *bins, const int32_t *data,
-                           int count, const rpt_line_t *line)
+                           int count, const rpt_line_t *line,
+                           const rpt_line_t *line_end)
 {
    int nhit = 0, nmiss = 0, nexcl = 0;
 
@@ -129,9 +131,9 @@ static void rpt_get_detail(cover_rpt_t *rpt, rpt_detail_t *detail,
          nmiss++;
    }
 
-   rpt_table_t *hit = rpt_table_new(rpt, line, nhit);
-   rpt_table_t *miss = rpt_table_new(rpt, line, nmiss);
-   rpt_table_t *excl = rpt_table_new(rpt, line, nexcl);
+   rpt_table_t *hit = rpt_table_new(rpt, line, line_end, nhit);
+   rpt_table_t *miss = rpt_table_new(rpt, line, line_end, nmiss);
+   rpt_table_t *excl = rpt_table_new(rpt, line, line_end, nexcl);
 
    for (int i = 0, hpos = 0, mpos = 0, epos = 0; i < count; i++) {
       rpt_item_t ref = {
@@ -342,13 +344,13 @@ static void rpt_visit_scope(cover_rpt_t *rpt, rpt_hier_t *h, cover_obj_t scope)
 
          if (nbins <= ARRAY_LEN(small))
             rpt_get_detail(rpt, &h->detail, &h->flat_stats, item, small, NULL,
-                           nbins, line);
+                           nbins, line, f_src->lines + f_src->n_lines);
          else {
             cover_obj_t *ext LOCAL = xmalloc_array(nbins, sizeof(cover_obj_t));
             cover_rel(rpt->data, item, COV_REL_BINS, 0, ext, nbins);
 
             rpt_get_detail(rpt, &h->detail, &h->flat_stats, item, ext, NULL,
-                           nbins, line);
+                           nbins, line, f_src->lines + f_src->n_lines);
          }
       }
    }
@@ -399,7 +401,7 @@ static void rpt_gen_file_details(cover_rpt_t *rpt, rpt_file_t *f)
 
       cover_obj_t bins[1] = { ri->bin };
       rpt_get_detail(rpt, &f->detail, &f->stats, ri->item,
-                     bins, &ri->data, 1, line);
+                     bins, &ri->data, 1, line, f->lines + f->n_lines);
    }
 }
 

@@ -1,6 +1,6 @@
 ** Note: Code coverage report folder: html.
 ** Note: Code coverage report contains: covered, uncovered, excluded coverage details.
-** Note: code coverage results for: WORK.COVER30
+** Note: code coverage results for: WORK.COVPKG1
 ** Note:      statement:     100.0 % (4/4)
 ** Note:      branch:        N.A.
 ** Note:      toggle:        N.A.

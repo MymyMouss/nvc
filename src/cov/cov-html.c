@@ -274,13 +274,21 @@ static void cover_print_item_title(html_gen_t *g, FILE *f, cover_obj_t item)
 }
 
 static void cover_print_expr(html_gen_t *g, FILE *f, cover_obj_t item,
-                             cover_obj_t bin, const rpt_line_t *line)
+                             cover_obj_t bin, const rpt_line_t *line,
+                             const rpt_line_t *line_end)
 {
    loc_t loc = cover_get_loc(g->data, item, COV_ATTR_LOC);
    cover_flags_t flags = cover_get_flags(g->data, bin);
 
    const rpt_line_t *curr_line = line;
    const rpt_line_t *last_line = line + loc.line_delta;
+
+   // The recorded span may reach past the source read at report time
+   // (e.g. the file was shortened since compilation): clamp it so the
+   // renderer never dereferences beyond the end of the line array.
+   if (last_line >= line_end)
+      last_line = line_end - 1;
+
    bool was_space = false, is_expr = false;
    int lhs_beg = 0, rhs_beg = 0, lhs_end = 0, rhs_end = 0;
    int glob_pos = 0;
@@ -403,11 +411,16 @@ static void cover_print_expr(html_gen_t *g, FILE *f, cover_obj_t item,
 }
 
 static void cover_print_code_loc(html_gen_t *g, FILE *f, cover_obj_t item,
-                                 const rpt_line_t *line)
+                                 const rpt_line_t *line,
+                                 const rpt_line_t *line_end)
 {
    loc_t loc = cover_get_loc(g->data, item, COV_ATTR_LOC);
    const rpt_line_t *curr_line = line;
    const rpt_line_t *last_line = line + loc.line_delta;
+
+   // Clamp the span to the lines actually read at report time
+   if (last_line >= line_end)
+      last_line = line_end - 1;
 
    if (loc.line_delta == 0) {
       fprintf(f, "<code>");
@@ -548,7 +561,7 @@ static void html_print_table(html_gen_t *g, const rpt_table_t *table,
             fprintf(f, "<div style=\"float: right\"><b>Excluded due to:</b> Exclude file</div>");
 
          cover_print_item_title(g, f, item0);
-         cover_print_code_loc(g, f, item0, table->line);
+         cover_print_code_loc(g, f, item0, table->line, table->line_end);
 
          fprintf(f, "<br><b>Count:</b> %d", table->items[0].data);
          fprintf(f, "<br><b>Threshold:</b> %d",
@@ -559,7 +572,7 @@ static void html_print_table(html_gen_t *g, const rpt_table_t *table,
    case COV_ITEM_BRANCH:
       {
          cover_print_item_title(g, f, item0);
-         cover_print_code_loc(g, f, item0, table->line);
+         cover_print_code_loc(g, f, item0, table->line, table->line_end);
 
          cover_flags_t flags0 = cover_get_flags(g->data, bin0);
          const char *title = (flags0 & COV_FLAG_CHOICE)
@@ -603,7 +616,7 @@ static void html_print_table(html_gen_t *g, const rpt_table_t *table,
    case COV_ITEM_EXPRESSION:
       {
          cover_print_item_title(g, f, item0);
-         cover_print_expr(g, f, item0, bin0, table->line);
+         cover_print_expr(g, f, item0, bin0, table->line, table->line_end);
 
          cover_flags_t flags0 = cover_get_flags(g->data, bin0);
 
@@ -785,7 +798,7 @@ static void html_print_table(html_gen_t *g, const rpt_table_t *table,
             if (pkind == PAIR_UNCOVERED)
                cover_print_get_exclude_button(g, f, item0, bin0, 0, false);
             cover_print_item_title(g, f, item0);
-            cover_print_code_loc(g, f, item0, table->line);
+            cover_print_code_loc(g, f, item0, table->line, table->line_end);
             fprintf(f, "<br><b>Count:</b> %d", table->items[0].data);
             fprintf(f, "<br><b>Threshold:</b> %d",
                     cover_get_threshold(g->data, item0));
@@ -796,7 +809,7 @@ static void html_print_table(html_gen_t *g, const rpt_table_t *table,
    case COV_ITEM_STATE:
       {
          cover_print_item_title(g, f, item0);
-         cover_print_code_loc(g, f, item0, table->line);
+         cover_print_code_loc(g, f, item0, table->line, table->line_end);
 
          const char *title = "State";
          cover_print_bin_header(f, pkind, 1, &title);

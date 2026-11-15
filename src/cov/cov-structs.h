@@ -188,6 +188,7 @@ typedef A(rpt_item_t) rpt_item_array_t;
 
 typedef struct {
    const rpt_line_t   *line;
+   const rpt_line_t   *line_end;
    unsigned            count;
    rpt_item_t          items[];
 } rpt_table_t;
