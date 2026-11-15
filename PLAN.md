@@ -91,6 +91,8 @@ Les points 2 à 4 dépendent du checkpoint.
 
 ## 4. Serveur MCP natif (priorité 2)
 
+Architecture détaillée et décisions: voir `MCP-ARCHITECTURE.md`.
+
 Mode `nvc --mcp`: JSON-RPC 2.0 sur stdio, module `src/mcp/` (~1000-1500
 lignes), parseur JSON minimal à ajouter (aucun JSON dans le code actuel).
 S'appuie sur le shell TCL (`shell_eval`) et l'API `model_*`.
