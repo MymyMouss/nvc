@@ -4,10 +4,10 @@
 -- side, and therefore the coverage point, was skipped when the operator
 -- short circuited. Driving only the short-circuiting cases must now reach
 -- full expression coverage.
-entity cover32 is
+entity covpkg3 is
 end entity;
 
-architecture tb of cover32 is
+architecture tb of covpkg3 is
   -- A user function call on the right hand side forces short-circuit
   -- lowering of the logical operators.
   function ident(x : boolean) return boolean is

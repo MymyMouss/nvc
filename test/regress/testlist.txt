@@ -1350,7 +1350,7 @@ ivtest40        verilog
 select18        verilog
 select19        verilog
 select20        verilog
-cover30         shell
-cover31         shell
-cover32         shell
-cover33         shell
+covpkg1         shell
+covpkg2         shell
+covpkg3         shell
+covpkg4         shell

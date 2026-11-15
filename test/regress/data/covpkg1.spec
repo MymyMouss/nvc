@@ -7,4 +7,4 @@
 -hierarchy other_lib.*
 
 # Always cover the top-level entity itself.
-+block cover30
++block covpkg1

@@ -61,10 +61,10 @@ end package body;
 
 use work.ops_pkg.all;
 
-entity cover31 is
-end cover31;
+entity covpkg2 is
+end covpkg2;
 
-architecture test of cover31 is
+architecture test of covpkg2 is
 begin
     process
         variable v : integer;

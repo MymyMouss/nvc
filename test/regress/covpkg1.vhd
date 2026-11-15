@@ -1,6 +1,6 @@
 -- Package compiled into other_lib in the shell driver.  Although its
 -- name matches the +package *_pkg pattern, the -hierarchy other_lib.*
--- rule in cover30.spec excludes it from the coverage report.
+-- rule in covpkg1.spec excludes it from the coverage report.
 package util_pkg is
     function clamp(x, lo, hi : integer) return integer;
 end package;
@@ -48,10 +48,10 @@ use other_lib.util_pkg.all;
 
 use work.math_pkg.all;
 
-entity cover30 is
-end cover30;
+entity covpkg1 is
+end covpkg1;
 
-architecture test of cover30 is
+architecture test of covpkg1 is
 begin
     process
         variable v : integer;

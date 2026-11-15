@@ -1,8 +1,8 @@
--- Regression test for the --cover-report SEGV in cov-html.c (see cover33.sh).
-entity cover33 is
+-- Regression test for the --cover-report SEGV in cov-html.c (see covpkg4.sh).
+entity covpkg4 is
 end entity;
 
-architecture a of cover33 is
+architecture a of covpkg4 is
   signal x : integer := 0;
 begin
   process is
