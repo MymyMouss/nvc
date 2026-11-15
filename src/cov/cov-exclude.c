@@ -17,6 +17,7 @@
 
 #include "util.h"
 #include "array.h"
+#include "common.h"
 #include "cov/cov-api.h"
 #include "cov/cov-priv.h"
 #include "cov/cov-structs.h"
@@ -24,17 +25,26 @@
 #include "option.h"
 #include "printf.h"
 
+#include <ctype.h>
 #include <limits.h>
 #include <string.h>
 #include <stdlib.h>
 
 typedef struct _excl_children excl_children_t;
 typedef struct _excl_trie excl_trie_t;
+typedef struct _excl_glob excl_glob_t;
+
+struct _excl_glob {
+   char        *glob;
+   bool         include;
+   excl_glob_t *next;
+};
 
 typedef struct _cover_spec {
    excl_trie_t *hier_trie;
    excl_trie_t *block_trie;
    excl_trie_t *fsm_trie;
+   excl_glob_t *pkg_globs;
 } cover_spec_t;
 
 typedef enum {
@@ -137,10 +147,8 @@ static excl_trie_t *excl_trie_search(excl_trie_t *et, ident_t id)
    return NULL;
 }
 
-static excl_trie_t *excl_trie_for_scope(const cover_data_t *db,
-                                        excl_trie_t *root, cover_obj_t scope)
+static excl_trie_t *excl_trie_for_hier(excl_trie_t *root, ident_t hier)
 {
-   ident_t hier = cover_get_ident(db, scope, COV_ATTR_HIER);
    excl_trie_t *et = root;
 
    ident_t id;
@@ -155,6 +163,12 @@ static excl_trie_t *excl_trie_for_scope(const cover_data_t *db,
    }
 
    return et;
+}
+
+static excl_trie_t *excl_trie_for_scope(const cover_data_t *db,
+                                        excl_trie_t *root, cover_obj_t scope)
+{
+   return excl_trie_for_hier(root, cover_get_ident(db, scope, COV_ATTR_HIER));
 }
 
 static void excl_trie_print(excl_trie_t *et, int indent)
@@ -605,26 +619,41 @@ void cover_load_spec_file(cover_data_t *db, const char *path)
 
       tok++;
 
-      excl_trie_t *root;
-      if (strcmp(tok, "hierarchy") == 0)
+      const char *kind = tok;
+      excl_trie_t *root = NULL;
+      if (strcmp(kind, "hierarchy") == 0)
          root = spec->hier_trie;
-      else if (strcmp(tok, "block") == 0)
+      else if (strcmp(kind, "block") == 0)
          root = spec->block_trie;
-      else if (!strcmp(tok, "fsm_type"))
+      else if (strcmp(kind, "fsm_type") == 0)
          root = spec->fsm_trie;
+      else if (strcmp(kind, "package") != 0) {
+         error_at(&loc, "invalid command $bold$%s$$", kind);
+         continue;
+      }
+
+      char *arg = strtok(NULL, delim);
+      if (arg == NULL) {
+         error_at(&loc, "%s name missing", kind);
+         continue;
+      }
+
+      if (root != NULL) {
+         excl_trie_t *et = excl_trie_get(db, root, arg);
+         et->action = include ? ACTION_INCLUDE : ACTION_EXCLUDE;
+      }
       else {
-         error_at(&loc, "invalid command $bold$%s$$", tok);
-         continue;
+         // Package patterns are stored as a list of globs since they are
+         // matched against the bare package name
+         excl_glob_t *p = pool_calloc(db->pool, sizeof(excl_glob_t));
+         const size_t len = strlen(arg) + 1;
+         p->glob = pool_calloc(db->pool, len);
+         for (size_t i = 0; i < len; i++)
+            p->glob[i] = toupper((unsigned char)arg[i]);
+         p->include = include;
+         p->next = spec->pkg_globs;
+         spec->pkg_globs = p;
       }
-
-      char *hier = strtok(NULL, delim);
-      if (!hier) {
-         error_at(&loc, "%s name missing", tok);
-         continue;
-      }
-
-      excl_trie_t *et = excl_trie_get(db, root, hier);
-      et->action = include ? ACTION_INCLUDE : ACTION_EXCLUDE;
 
       if ((tok = strtok(NULL, delim)) != NULL)
          error_at(&loc, "unexpected '%s' after coverage specification "
@@ -650,10 +679,62 @@ void cover_load_spec_file(cover_data_t *db, const char *path)
    }
 }
 
+static bool cover_match_package(const cover_spec_t *spec, ident_t pkg_name,
+                                ident_t pkg_hier)
+{
+   // -package always overrides anything else
+   for (excl_glob_t *p = spec->pkg_globs; p != NULL; p = p->next) {
+      if (!p->include && ident_glob(pkg_name, p->glob, strlen(p->glob)))
+         return false;
+   }
+
+   const excl_trie_t *hier_et = excl_trie_for_hier(spec->hier_trie, pkg_hier);
+   if (hier_et != NULL && hier_et->action == ACTION_EXCLUDE)
+      return false;
+
+   for (excl_glob_t *p = spec->pkg_globs; p != NULL; p = p->next) {
+      if (p->include && ident_glob(pkg_name, p->glob, strlen(p->glob)))
+         return true;
+   }
+
+   return hier_et != NULL && hier_et->action == ACTION_INCLUDE;
+}
+
+bool cover_should_emit_package(const cover_data_t *db, tree_t pack)
+{
+   // Packages are not collected by default: the user must opt in with a
+   // +package or +hierarchy directive in a coverage specification file
+   if (db == NULL || db->spec == NULL)
+      return false;
+
+   // Standard libraries are never instrumented even when the spec would
+   // match them: several IEEE subprograms are replaced by intrinsics so
+   // coverage data would not be representative anyway
+   ident_t pack_hier = tree_ident(pack);
+   ident_t pack_lib = ident_until(pack_hier, '.');
+   if (pack_lib == well_known(W_STD) || pack_lib == well_known(W_IEEE)
+       || pack_lib == well_known(W_NVC))
+      return false;
+
+   return cover_match_package(db->spec, ident_rfrom(pack_hier, '.'),
+                              pack_hier);
+}
+
 bool cover_should_emit_scope(const cover_data_t *db, cover_obj_t scope)
 {
    if (db->spec == NULL)
       return true;
+
+   cover_obj_t top = cover_get_obj(db, scope, COV_ATTR_INST);
+   if (!cover_is_null(top)) {
+      cover_obj_t root = cover_get_obj(db, top, COV_ATTR_ROOT);
+      if (!cover_is_null(root) && cover_get_kind(db, root) == CSCOPE_PACKAGE) {
+         // Top-level package instance
+         ident_t name = cover_get_ident(db, top, COV_ATTR_BLOCK_NAME);
+         ident_t hier = cover_get_ident(db, top, COV_ATTR_HIER);
+         return cover_match_package(db->spec, name, hier);
+      }
+   }
 
    ident_t block_name = NULL;
    cover_obj_t inst = cover_get_obj(db, scope, COV_ATTR_INST);

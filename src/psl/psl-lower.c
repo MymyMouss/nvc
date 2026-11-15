@@ -542,7 +542,7 @@ static void psl_lower_property(lower_unit_t *lu, object_t *obj)
    ident_t name = vcode_unit_name(lu->vunit);
 
    lu->cscope = cover_get_child(lu->cover, lu->parent->cscope,
-                                vhdl_scope_name(lu->container, 0));
+                                vhdl_scope_name(lu->container, NULL, 0));
 
    vcode_type_t vcontext = vtype_context(prefix);
    emit_param(vcontext, VCODE_INVALID_STAMP, ident_new("context"));

@@ -312,6 +312,7 @@ void cover_load_spec_file(cover_data_t *db, const char *path);
 void cover_load_exclude_file(const char *path, cover_data_t *data);
 
 bool cover_should_emit_fsm_type(cover_data_t *db, ident_t name);
+bool cover_should_emit_package(const cover_data_t *db, tree_t pack);
 bool cover_should_emit_array_toggle(cover_data_t *db, int width);
 
 //

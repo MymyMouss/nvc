@@ -1,4 +1,15 @@
 ## Unreleased changes
+- Code coverage can now be collected for package declarations and
+  bodies, opted in via the new `+package` directive (or an existing
+  `+hierarchy` rule) in a coverage specification file.  Packages from the
+  `STD`, `IEEE`, and `NVC` libraries are never instrumented.
+- Fixed expression coverage of short-circuit logical operators, where
+  the bin for the unevaluated right hand side was reported as uncovered
+  (#1450).
+- Fixed a crash in expression coverage for overloaded package
+  subprograms.
+- Fixed a crash in `--cover-report` when a recorded source span extends
+  past the end of the source file.
 - Logical operators on arrays and IEEE vectors now emit a warning if
   their operands differ in length (from @NikLeberg) (#1667).
 - Added basic support for Verilog `$setup`, `$hold`, `$recovery`, and

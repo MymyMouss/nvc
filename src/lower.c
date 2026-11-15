@@ -6220,7 +6220,9 @@ static gen_stack_t lower_push_cscope(lower_unit_t *lu, gen_stack_t *gs,
    if (cover_is_null(gs->cscope))
       return *gs;
 
-   ident_t name = vhdl_scope_name(t, nth);
+   // Statements and alternatives are never overloaded so no enclosing
+   // region is needed to disambiguate the scope name.
+   ident_t name = vhdl_scope_name(t, NULL, nth);
    cover_obj_t cs = cover_get_child(lu->cover, gs->cscope, name);
    if (cover_is_null(cs))
       return *gs;
@@ -9846,9 +9848,13 @@ static cover_obj_t lower_get_cscope(lower_unit_t *lu)
       cover_obj_t parent = lower_get_cscope(lu->parent);
       if (cover_is_null(parent))
          return COVER_NULL_OBJ;
-      else
+      else {
+         // Pass the enclosing declarative region so overloaded subprogram
+         // scope names match those created by the coverage setup walk.
+         tree_t region = lu->parent != NULL ? lu->parent->container : NULL;
          return cover_get_child(lu->cover, parent,
-                                vhdl_scope_name(lu->container, 0));
+                                vhdl_scope_name(lu->container, region, 0));
+      }
    }
 }
 
@@ -12526,12 +12532,49 @@ static void lower_cache_instance_name(lower_unit_t *lu, attr_kind_t which)
    lower_put_vcode_obj(name, var, lu);
 }
 
+static void lower_cover_setup_package(lower_unit_t *lu, tree_t pack)
+{
+   if (lu->cover == NULL || !cover_should_emit_package(lu->cover, pack))
+      return;
+
+   // The package identifier already contains its library: use the bare
+   // name for the instance so the hierarchy reads LIB.PKG
+   ident_t qual = tree_ident(pack);
+   ident_t lib = ident_until(qual, '.');
+   ident_t name = ident_rfrom(qual, '.');
+
+   cover_obj_t inst = cover_inst_new(lu->cover, name, COVER_NULL_OBJ, name,
+                                     lib, lu->name);
+
+   lu->cscope = cover_scope_new(lu->cover, inst, COVER_NULL_OBJ,
+                                CSCOPE_PACKAGE, name, *tree_loc(pack));
+
+   vhdl_cover_package(pack, lu->cover, lu->cscope);
+
+   if (tree_kind(pack) == T_PACKAGE) {
+      tree_t body = body_of(pack);
+      if (body != NULL)
+         vhdl_cover_package(body, lu->cover, lu->cscope);
+   }
+
+   vcode_reg_t ptr = emit_get_counters(lu->name);
+
+   vcode_type_t vtype = vcode_reg_type(ptr);
+   ident_t cname = well_known(W_COUNTERS);
+   vcode_var_t counters = emit_var(vtype, VCODE_INVALID_STAMP, cname, 0);
+   emit_store(ptr, counters);
+
+   lower_put_vcode_obj(cname, counters, lu);
+}
+
 static void lower_pack_body(lower_unit_t *lu, object_t *obj)
 {
    tree_t body = tree_from_object(obj);
 
    tree_t pack = tree_primary(body);
    assert(!is_uninstantiated_package(pack));
+
+   lower_cover_setup_package(lu, pack);
 
    gen_stack_t gs = {
       .cscope = lower_get_cscope(lu),
@@ -12569,6 +12612,8 @@ static void lower_package(lower_unit_t *lu, object_t *obj)
 {
    tree_t pack = tree_from_object(obj);
    assert(!is_uninstantiated_package(pack));
+
+   lower_cover_setup_package(lu, pack);
 
    gen_stack_t gs = {
       .cscope = lower_get_cscope(lu),
@@ -12939,6 +12984,7 @@ typedef struct _unit_registry {
    hash_t        *map;
    hset_t        *visited;
    mir_context_t *mir;
+   cover_data_t  *cover;
 } unit_registry_t;
 
 typedef struct {
@@ -12956,6 +13002,11 @@ unit_registry_t *unit_registry_new(mir_context_t *mc)
    ur->mir = mc;
 
    return ur;
+}
+
+void unit_registry_set_cover(unit_registry_t *ur, cover_data_t *cover)
+{
+   ur->cover = cover;
 }
 
 void unit_registry_free(unit_registry_t *ur)
@@ -13122,7 +13173,8 @@ vcode_unit_t unit_registry_get(unit_registry_t *ur, ident_t ident)
          mir_defer(ur->mir, unit_name, NULL, MIR_UNIT_PACKAGE,
                    vhdl_lower_deferred, obj);
       else
-         unit_registry_defer(ur, unit_name, NULL, emit_package, fn, NULL, obj);
+         unit_registry_defer(ur, unit_name, NULL, emit_package, fn, ur->cover,
+                             obj);
 
       if (unit_name != ident) {
          // We actually wanted a unit inside this package so need to

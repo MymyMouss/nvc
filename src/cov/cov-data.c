@@ -1324,6 +1324,14 @@ uint32_t cover_get_u32(const cover_data_t *db, cover_obj_t obj,
          default:                 return def;
          }
       }
+   case COVER_TAG_SCOPE:
+      {
+         const cover_scope_t *scope = cover_scope_data_const(db, obj);
+         switch (attr) {
+         case COV_ATTR_KIND: return scope->kind;
+         default:            return def;
+         }
+      }
    case COVER_TAG_NULL:
       {
          switch (attr) {

@@ -1131,15 +1131,65 @@ static void cover_print_hier_nav_tree(html_gen_t *g, FILE *f,
    cover_obj_t root0 = cover_at(g->data, COVER_NULL_OBJ, COV_REL_CHILDREN, 0);
    ident_t name = cover_get_ident(g->data, root0, COV_ATTR_LIB_NAME);
 
-   fprintf(f, "<nav style=\"clear: left\">\n");
-   fprintf(f, "<details open>\n");
-   fprintf(f, "<summary><a href=\"../index.html\">%s</a></summary>\n",
-           istr(name));
-
+   // Top-level packages may come from a different library than the
+   // design: group the roots by library only when that is the case
+   bool multi_lib = false;
    cover_iter_t it = cover_begin(g->data, COVER_NULL_OBJ, COV_REL_CHILDREN);
    cover_obj_t root;
-   while (cover_next(&it, &root))
-      cover_print_nav_hier_node(g, f, root, selected);
+   while (cover_next(&it, &root)) {
+      if (cover_get_ident(g->data, root, COV_ATTR_LIB_NAME) != name)
+         multi_lib = true;
+   }
+
+   fprintf(f, "<nav style=\"clear: left\">\n");
+   fprintf(f, "<details open>\n");
+
+   if (!multi_lib) {
+      fprintf(f, "<summary><a href=\"../index.html\">%s</a></summary>\n",
+              istr(name));
+
+      it = cover_begin(g->data, COVER_NULL_OBJ, COV_REL_CHILDREN);
+      while (cover_next(&it, &root))
+         cover_print_nav_hier_node(g, f, root, selected);
+   }
+   else {
+      fprintf(f, "<summary><a href=\"../index.html\">root</a></summary>\n");
+
+      // Library of the top-level instance containing the selection
+      ident_t sel_lib = NULL;
+      for (cover_obj_t i = selected; !cover_is_null(i);
+           i = cover_get_obj(g->data, i, COV_ATTR_PARENT))
+         sel_lib = cover_get_ident(g->data, i, COV_ATTR_LIB_NAME);
+
+      const size_t nroots = cover_count(g->data, COVER_NULL_OBJ,
+                                        COV_REL_CHILDREN);
+      for (size_t i = 0; i < nroots; i++) {
+         cover_obj_t ri = cover_at(g->data, COVER_NULL_OBJ,
+                                   COV_REL_CHILDREN, i);
+         ident_t lib = cover_get_ident(g->data, ri, COV_ATTR_LIB_NAME);
+
+         bool emitted = false;
+         for (size_t j = 0; j < i && !emitted; j++) {
+            cover_obj_t rj = cover_at(g->data, COVER_NULL_OBJ,
+                                      COV_REL_CHILDREN, j);
+            emitted = cover_get_ident(g->data, rj, COV_ATTR_LIB_NAME) == lib;
+         }
+         if (emitted)
+            continue;
+
+         fprintf(f, "<details%s>\n", lib == sel_lib ? " open" : "");
+         fprintf(f, "<summary>%s</summary>\n", istr(lib));
+
+         for (size_t j = i; j < nroots; j++) {
+            cover_obj_t rj = cover_at(g->data, COVER_NULL_OBJ,
+                                      COV_REL_CHILDREN, j);
+            if (cover_get_ident(g->data, rj, COV_ATTR_LIB_NAME) == lib)
+               cover_print_nav_hier_node(g, f, rj, selected);
+         }
+
+         fprintf(f, "</details>\n");
+      }
+   }
 
    fprintf(f, "</details>\n");
    fprintf(f, "</nav>\n\n");
