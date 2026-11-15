@@ -1,5 +1,5 @@
 //
-//  Copyright (C) 2024-2025  Nick Gasson
+//  Copyright (C) 2024-2026  Nick Gasson
 //
 //  This program is free software: you can redistribute it and/or modify
 //  it under the terms of the GNU General Public License as published by
@@ -18,14 +18,16 @@
 #include "util.h"
 #include "diag.h"
 #include "ident.h"
-#include "jit/jit.h"
 #include "jit/jit-exits.h"
+#include "jit/jit.h"
 #include "lib.h"
 #include "printf.h"
 #include "rt/model.h"
 #include "rt/structs.h"
 #include "tree.h"
 #include "type.h"
+#include "vlog/vlog-node.h"
+#include "vlog/vlog-util.h"
 
 #include <assert.h>
 #include <inttypes.h>
@@ -85,14 +87,31 @@ static bool is_implicit_block(tree_t block)
    return tree_subkind(hier) == T_COMPONENT;
 }
 
-void x_bind_external(tree_t name, jit_handle_t scope, jit_scalar_t *args)
+static void bind_external_name(tree_t name, jit_handle_t scope,
+                               jit_scalar_t *args)
 {
    assert(tree_kind(name) == T_EXTERNAL_NAME);
 
    jit_t *j = jit_for_thread();
-   tree_t where = tree_from_object(jit_get_object(j, scope));
+   tree_t where;
+   ident_t path;
+   if (scope == JIT_HANDLE_INVALID) {
+      rt_scope_t *active = get_active_scope(get_model());
+      assert(active != NULL);
+
+      while (is_signal_scope(active))
+         active = active->parent;
+
+      assert(active->kind == SCOPE_INSTANCE);
+      where = active->where;
+      path  = active->name;
+   }
+   else {
+      where = tree_from_object(jit_get_object(j, scope));
+      path  = jit_get_name(j, scope);
+   }
+
    tree_t container = NULL, next = NULL;
-   ident_t path = jit_get_name(j, scope);
    int next_arg = 2;
 
    const int nparts = tree_parts(name);
@@ -115,15 +134,22 @@ void x_bind_external(tree_t name, jit_handle_t scope, jit_scalar_t *args)
                jit_msg(tree_loc(pe), DIAG_FATAL, "design hierarchy root has "
                        "not yet been elaborated");
 
-            tree_t root = tree_stmt(top, 0);
-
             tree_t entity = tree_part(name, ++i);
             assert(tree_subkind(entity) == PE_SIMPLE);
 
-            if (root == NULL || tree_ident(root) != tree_ident(entity))
-               jit_msg(tree_loc(pe), DIAG_FATAL, "%s is not the name of "
-                       "the root of the design hierarchy",
-                       istr(tree_ident(entity)));
+            const int nroots = tree_stmts(top);
+            tree_t root = NULL;
+            for (int i = 0; i < nroots; i++) {
+               tree_t s = tree_stmt(top, i);
+               if (ident_casecmp(tree_ident(s), tree_ident(entity))) {
+                  root = s;
+                  break;
+               }
+            }
+
+            if (root == NULL)
+               jit_msg(tree_loc(pe), DIAG_FATAL, "%pI is not the name of a "
+                       "root of the design hierarchy", tree_ident(entity));
 
             path = ident_prefix(lib_name(lib_work()), tree_ident(root), '.');
             next = root;
@@ -234,13 +260,11 @@ void x_bind_external(tree_t name, jit_handle_t scope, jit_scalar_t *args)
 
    if (!type_eq(type, expect)) {
       diag_t *d = diag_new(DIAG_ERROR, tree_loc(name));
-      diag_printf(d, "type of %s %s is not %s",
-                  class_str(tree_class(name)), istr(tree_ident(where)),
-                  type_pp2(expect, type));
-      diag_hint(d, tree_loc(name), "external name with type %s",
-                type_pp2(expect, type));
-      diag_hint(d, tree_loc(where), "declaration of %s with type %s",
-                istr(tree_ident(where)), type_pp2(type, expect));
+      diag_printf(d, "type of %s %pI is %pT but external name has %pT",
+                  class_str(tree_class(name)), tree_ident(where), type, expect);
+      diag_hint(d, tree_loc(name), "external name with type %pT", expect);
+      diag_hint(d, tree_loc(where), "declaration of %pI with type %pT",
+                tree_ident(where), type);
       diag_emit(d);
       jit_abort_with_status(1);
    }
@@ -296,4 +320,43 @@ void x_bind_external(tree_t name, jit_handle_t scope, jit_scalar_t *args)
    }
    else
       args[0].pointer = ptr;
+}
+
+static void bind_hier_ref(vlog_node_t v, jit_handle_t scope,
+                          jit_scalar_t *args)
+{
+   assert(vlog_kind(v) == V_HIER_REF);
+
+   rt_model_t *m = get_model();
+   rt_scope_t *s = get_active_scope(m);
+
+   tree_t b = vlog_walk_mod_refs(vlog_value(v), s->where);
+   assert(b != NULL);
+
+   tree_t h = tree_decl(b, 0);
+   assert(tree_kind(h) == T_HIER);
+
+   rt_scope_t *rts = find_scope(get_model(), b);
+   assert(rts != NULL);
+
+   void *ctx = *mptr_get(rts->privdata);
+   if (ctx == NULL)
+      jit_msg(vlog_loc(v), DIAG_FATAL, "%pi has not yet been elaborated",
+              tree_ident(b));
+
+   jit_t *j = jit_for_thread();
+   jit_handle_t handle = jit_compile(j, tree_ident2(h));
+
+   args[0].pointer = jit_get_frame_var(j, handle, ctx, vlog_ident(v));
+}
+
+void x_bind_external(object_t *where, jit_handle_t scope, jit_scalar_t *args)
+{
+   tree_t t = tree_from_object(where);
+   if (t != NULL)
+      bind_external_name(t, scope, args);
+
+   vlog_node_t v = vlog_from_object(where);
+   if (v != NULL)
+      bind_hier_ref(v, scope, args);
 }

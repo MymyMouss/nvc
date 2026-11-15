@@ -592,7 +592,7 @@ static int shell_cmd_noforce(ClientData cd, Tcl_Interp *interp,
             shell_signal_t *ss = &(sh->signals[i]);
             if (ss->signal->nexus.flags & NET_F_FORCED)
                release_signal(sh->model, ss->signal, 0,
-                              signal_width(ss->signal));
+                              signal_width(ss->signal), RELEASE_RECOMPUTE);
          }
       }
       else {
@@ -603,7 +603,8 @@ static int shell_cmd_noforce(ClientData cd, Tcl_Interp *interp,
          if (!(ss->signal->nexus.flags & NET_F_FORCED))
             return tcl_error(sh, "signal %s is not forced", signame);
 
-         release_signal(sh->model, ss->signal, 0, signal_width(ss->signal));
+         release_signal(sh->model, ss->signal, 0, signal_width(ss->signal),
+                        RELEASE_RECOMPUTE);
       }
    }
 
@@ -854,9 +855,9 @@ tcl_shell_t *shell_new(tree_t top, jit_t *jit, rt_model_t *m)
 {
    tcl_shell_t *sh = xcalloc(sizeof(tcl_shell_t));
 #ifdef RL_VERSION_MAJOR
-   sh->prompt  = color_asprintf("\001$+cyan$\002%%\001$$\002 ");
+   sh->prompt  = nvc_asprintf("\001$+cyan$\002%%\001$$\002 ");
 #else
-   sh->prompt  = color_asprintf("$+cyan$%%$$ ");
+   sh->prompt  = nvc_asprintf("$+cyan$%%$$ ");
 #endif
    sh->interp  = Tcl_CreateInterp();
    sh->top     = top;
@@ -869,13 +870,24 @@ tcl_shell_t *shell_new(tree_t top, jit_t *jit, rt_model_t *m)
    else
       sh->getline = shell_raw_get_line;
 
+   const char *vers = Tcl_GetVar2(sh->interp, "tcl_version", NULL,
+                                  TCL_GLOBAL_ONLY);
+   if (strcmp(vers, TCL_VERSION) != 0)
+      fatal("built against TCL %s but runtime loaded %s", TCL_VERSION, vers);
+
    if (Tcl_Init(sh->interp) != 0)
       fatal("%s", Tcl_GetStringResult(sh->interp));
+
+   Tcl_SetVar2(sh->interp, "argv0", NULL, "nvc", TCL_GLOBAL_ONLY);
+   Tcl_SetVar2(sh->interp, "argc", NULL, "0", TCL_GLOBAL_ONLY);
+   Tcl_SetVar2(sh->interp, "argv", NULL, "", TCL_GLOBAL_ONLY);
 
    Tcl_LinkVar(sh->interp, "now", (char *)&sh->now_var,
                TCL_LINK_WIDE_INT | TCL_LINK_READ_ONLY);
    Tcl_LinkVar(sh->interp, "deltas", (char *)&sh->deltas_var,
                TCL_LINK_UINT | TCL_LINK_READ_ONLY);
+   Tcl_LinkVar(sh->interp, "tcl_interactive", (char *)&sh->interactive_var,
+               TCL_LINK_INT | TCL_LINK_READ_ONLY);
 
    {
       LOCAL_TEXT_BUF tb = tb_new();
@@ -1041,6 +1053,9 @@ void shell_reset(tcl_shell_t *sh)
 
 void shell_interact(tcl_shell_t *sh)
 {
+   sh->interactive_var = 1;
+   Tcl_UpdateLinkedVar(sh->interp, "tcl_interactive");
+
    shell_print_banner(sh);
 
    char *line;
@@ -1051,10 +1066,15 @@ void shell_interact(tcl_shell_t *sh)
 
       free(line);
    }
+
+   sh->interactive_var = 0;
+   Tcl_UpdateLinkedVar(sh->interp, "tcl_interactive");
 }
 
 bool shell_do(tcl_shell_t *sh, const char *file)
 {
+   Tcl_SetVar2(sh->interp, "argv0", NULL, file, TCL_GLOBAL_ONLY);
+
    const int code = Tcl_EvalFile(sh->interp, file);
 
    switch (code) {

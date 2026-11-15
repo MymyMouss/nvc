@@ -63,6 +63,18 @@ START_TEST(test_elab3)
 }
 END_TEST
 
+START_TEST(test_casecmp1)
+{
+   opt_set_int(OPT_PRESERVE_CASE, 1);
+
+   input_from_file(TESTDIR "/elab/casecmp1.vhd");
+
+   (void)run_elab();
+
+   fail_if_errors();
+}
+END_TEST
+
 START_TEST(test_open)
 {
    tree_t top;
@@ -1434,21 +1446,23 @@ END_TEST
 
 START_TEST(test_mixed1)
 {
-   analyse_file(TESTDIR "/elab/mixed1.v", NULL, NULL, NULL);
+   input_from_file(TESTDIR "/elab/mixed1.v");
+
+   analyse_file();
 
    input_from_file(TESTDIR "/elab/mixed1.vhd");
 
    const error_t expect[] = {
       { 23, "missing matching VHDL port declaration for Verilog port 'two' "
         "in component MOD1" },
-      { 37, "port FOUR not found in Verilog module mod1" },
+      { 37, "port FOUR not found in Verilog module 'mod1'" },
       { 48, "cannot connect VHDL signal with type BIT to Verilog output "
         "port 'three'" },
       { 56, "missing matching VHDL generic declaration for Verilog parameter "
         "'g1' with no default value in component MOD1" },
       { 67, "generic G1 should have type INTEGER to match corresponding "
         "Verilog parameter" },
-      { 79, "generic G2 not found in Verilog module mod1" },
+      { 79, "generic G2 not found in Verilog module 'mod1'" },
       { 93, "VHDL port direction IN does not match corresponding Verilog "
         "port 'three' which is declared as output" },
       { -1, NULL }
@@ -1639,7 +1653,8 @@ START_TEST(test_issue759)
    jit_t *jit = jit_new(ur, mc);
 
    rt_model_t *m = model_new(jit, cover);
-   tree_t e = elab(tree_to_object(a), jit, ur, mc, cover, NULL, m);
+   object_t *top[1] = { tree_to_object(a) };
+   tree_t e = elab(top, 1, jit, ur, mc, cover, NULL, m);
    fail_if(e == NULL);
 
    model_free(m);
@@ -1667,6 +1682,7 @@ START_TEST(test_bounds42)
 
    const error_t expect[] = {
       { 27, "actual length 5 does not match formal length 2" },
+      { 31, "actual length 5 does not match formal length 3" },
       { -1, NULL }
    };
    expect_errors(expect);
@@ -1750,14 +1766,14 @@ END_TEST
 START_TEST(test_vlog1)
 {
    const error_t expect[] = {
-      { 12, "name of Verilog module sub1 in library unit WORK.SUB1 does "
-        "not match name SUB1 in module instance u2" },
+      { 12, "name of Verilog module 'sub1' in library unit WORK.SUB1 does "
+        "not match name 'SUB1' in module instance 'u2'" },
       { 13, "missing port connection for 'y'" },
-      { 14, "module bad not found in library WORK" },
+      { 14, "module 'bad' not found in library WORK" },
       { 15, "missing value for parameter p" },
       { 16, "module sub1 has 1 parameter but 2 values given" },
       { 17, "missing port connection for 'x'" },
-      { 17, "port 'foo' not found in sub1" },
+      { 17, "port 'foo' not found in 'sub1'" },
       { 18, "'z' cannot be driven by continuous assignment from port 'y'" },
       { 19, "expression cannot be driven by continuous assignment from "
         "port 'y'" },
@@ -1765,7 +1781,9 @@ START_TEST(test_vlog1)
    };
    expect_errors(expect);
 
-   analyse_file(TESTDIR "/elab/vlog1.v", NULL, NULL, NULL);
+   input_from_file(TESTDIR "/elab/vlog1.v");
+
+   analyse_file();
 
    object_t *obj = lib_get_generic(lib_work(), ident_new("WORK.VLOG1"), NULL);
    ck_assert_ptr_nonnull(obj);
@@ -1775,7 +1793,8 @@ START_TEST(test_vlog1)
    jit_t *j = jit_new(ur, mc);
    rt_model_t *m = model_new(j, NULL);
 
-   tree_t top = elab(obj, j, ur, mc, NULL, NULL, m);
+   object_t *tops[1] = { obj };
+   tree_t top = elab(tops, 1, j, ur, mc, NULL, NULL, m);
    fail_unless(top == NULL);
 
    model_free(m);
@@ -1971,7 +1990,8 @@ START_TEST(test_issue1012)
    cover_data_t *cover = cover_data_init(COVER_MASK_TOGGLE, 0, 0);
    rt_model_t *m = model_new(jit, NULL);
 
-   tree_t e = elab(tree_to_object(a), jit, ur, mc, cover, NULL, m);
+   object_t *top[1] = { tree_to_object(a) };
+   tree_t e = elab(top, 1, jit, ur, mc, cover, NULL, m);
    fail_if(e == NULL);
 
    model_free(m);
@@ -2055,7 +2075,9 @@ END_TEST
 
 START_TEST(test_clone1)
 {
-   analyse_file(TESTDIR "/elab/clone1.v", NULL, NULL, NULL);
+   input_from_file(TESTDIR "/elab/clone1.v");
+
+   analyse_file();
 
    input_from_file(TESTDIR "/elab/clone1.vhd");
 
@@ -2107,7 +2129,9 @@ END_TEST
 
 START_TEST(test_mixed2)
 {
-   analyse_file(TESTDIR "/elab/mixed2.v", NULL, NULL, NULL);
+   input_from_file(TESTDIR "/elab/mixed2.v");
+
+   analyse_file();
 
    input_from_file(TESTDIR "/elab/mixed2.vhd");
 
@@ -2216,7 +2240,6 @@ START_TEST(test_issue1333)
 
    const error_t expect[] = {
       { 20, "missing port connection for 'Y'" },
-      { 11, "specify blocks are not currently supported and will be ignored" },
       { -1, NULL }
    };
    expect_errors(expect);
@@ -2292,7 +2315,9 @@ END_TEST
 
 START_TEST(test_issue1519)
 {
-   analyse_file(TESTDIR "/elab/issue1519.v", NULL, NULL, NULL);
+   input_from_file(TESTDIR "/elab/issue1519.v");
+
+   analyse_file();
 
    input_from_file(TESTDIR "/elab/issue1519.vhd");
 
@@ -2319,6 +2344,98 @@ START_TEST(test_issue1475)
 }
 END_TEST
 
+START_TEST(test_issue1569)
+{
+   set_standard(STD_08);
+
+   input_from_file(TESTDIR "/elab/issue1569.vhd");
+
+   tree_t e = run_elab();
+   fail_if(e == NULL);
+
+   tree_t top = tree_stmt(e, 0);
+
+   tree_t b0 = tree_stmt(top, 0);
+   ck_assert_tree_kind(b0, T_BLOCK);
+   fail_unless(tree_ident(b0) == ident_new("I_TEST_1_0"));
+
+   tree_t u1_h = tree_decl(b0, 0);
+   ck_assert_tree_kind(u1_h, T_HIER);
+
+   tree_t b1 = tree_stmt(top, 1);
+   ck_assert_tree_kind(b1, T_BLOCK);
+   fail_unless(tree_ident(b1) == ident_new("I_TEST_1_1"));
+
+   tree_t u3_h = tree_decl(b1, 0);
+   ck_assert_tree_kind(u3_h, T_HIER);
+
+   fail_unless(tree_ident2(u1_h) == tree_ident2(u3_h));
+
+   fail_if_errors();
+}
+END_TEST
+
+START_TEST(test_issue1615)
+{
+   set_standard(STD_19);
+
+   input_from_file(TESTDIR "/elab/issue1615.vhd");
+
+   const error_t expect[] = {
+      {  9, "top-level port S with variable class cannot be unconnected" },
+      { -1, NULL }
+   };
+   expect_errors(expect);
+
+   tree_t e = run_elab();
+   fail_unless(e == NULL);
+
+   check_expected_errors();
+}
+END_TEST
+
+START_TEST(test_issue1638)
+{
+   input_from_file(TESTDIR "/elab/issue1638.vhd");
+
+   const error_t expect[] = {
+      { 37, "port PORT_EXTRA not found in entity WORK.DUT" },
+      {  0, "while elaborating default binding for I_DUT" },
+      { 42, "generic G not found in entity WORK.DUT2" },
+      {  0, "while elaborating default binding for I_DUT2" },
+      { -1, NULL }
+   };
+   expect_errors(expect);
+
+   tree_t e = run_elab();
+   fail_unless(e == NULL);
+
+   check_expected_errors();
+}
+END_TEST
+
+START_TEST(test_assert8)
+{
+   set_standard(STD_08);
+   elab_set_generic("G", "20");
+
+   input_from_file(TESTDIR "/elab/assert8.vhd");
+
+   const error_t expect[] = {
+      { 22, "G = 20 is too large" },
+      { -1, NULL }
+   };
+   expect_errors(expect);
+
+   rt_model_t *m = model_new(get_jit(), NULL);
+   (void)run_elab_with_model(m);
+   ck_assert_int_eq(model_exit_status(m), EXIT_FAILURE);
+   model_free(m);
+
+   check_expected_errors();
+}
+END_TEST
+
 Suite *get_elab_tests(void)
 {
    Suite *s = suite_create("elab");
@@ -2327,6 +2444,7 @@ Suite *get_elab_tests(void)
    tcase_add_test(tc, test_elab1);
    tcase_add_test(tc, test_elab2);
    tcase_add_test(tc, test_elab3);
+   tcase_add_test(tc, test_casecmp1);
    tcase_add_test(tc, test_open);
    tcase_add_test(tc, test_genagg);
    tcase_add_test(tc, test_comp);
@@ -2437,6 +2555,10 @@ Suite *get_elab_tests(void)
    tcase_add_test(tc, test_issue1421);
    tcase_add_test(tc, test_issue1519);
    tcase_add_test(tc, test_issue1475);
+   tcase_add_test(tc, test_issue1569);
+   tcase_add_test(tc, test_issue1615);
+   tcase_add_test(tc, test_issue1638);
+   tcase_add_test(tc, test_assert8);
    suite_add_tcase(s, tc);
 
    return s;

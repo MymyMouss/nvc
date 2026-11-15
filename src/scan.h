@@ -584,5 +584,10 @@ void reset_sdf_parser(void);
 #define tCOMMENT       640
 #define tDLRPERIOD     641
 #define tFINAL         642
+#define tMACROQUOTE    643
+#define tMACROESCQUOTE 644
+#define tMACROJOIN     645
+#define tCYCLEDLY      646
+#define tTIMELIT       647
 
 #endif  // _SCAN_H

@@ -23,6 +23,7 @@
 #include "mir/mir-structs.h"
 #include "mir/mir-unit.h"
 #include "printf.h"
+#include "rt/defs.h"
 #include "thread.h"
 #include "tree.h"
 #include "vlog/vlog-node.h"
@@ -136,8 +137,10 @@ const char *mir_op_string(mir_op_t op)
       [MIR_OP_FILE_WRITE] = "file write",
       [MIR_OP_LINK_VAR] = "link var",
       [MIR_OP_DRIVING_VALUE] = "driving value",
-      [MIR_OP_FORCE] = "force",
-      [MIR_OP_RELEASE] = "release",
+      [MIR_OP_SCHED_FORCE] = "sched force",
+      [MIR_OP_SCHED_RELEASE] = "sched release",
+      [MIR_OP_FORCE_SIGNAL] = "force signal",
+      [MIR_OP_RELEASE_SIGNAL] = "release signal",
       [MIR_OP_DISCONNECT] = "disconnect",
       [MIR_OP_PROCESS_INIT] = "process init",
       [MIR_OP_COVER_STMT] = "cover stmt",
@@ -412,7 +415,7 @@ static void mir_dump_stamp(mir_unit_t *mu, mir_type_t type, mir_stamp_t stamp)
       case MIR_STAMP_POINTER:
          {
             static const char *map[] = {
-               "", "null", "const", "stack", "local", "global", ""
+               "", "null", "const", "stack", "local", "global", "signal", ""
             };
             printf("%s", map[sd->u.pointer.memory]);
 
@@ -488,6 +491,17 @@ static int mir_dump_strength(mir_unit_t *mu, mir_value_t value)
    };
    return nvc_printf("$green$(%s1,%s0)$$", names[STRENGTH1(value.id)],
                      names[STRENGTH0(value.id)]);
+}
+
+static int mir_dump_release_mode(mir_value_t value)
+{
+   assert(value.tag == MIR_TAG_ENUM);
+
+   switch (value.id) {
+   case RELEASE_RECOMPUTE: return nvc_printf("$green$recompute$$");
+   case RELEASE_RETAIN:    return nvc_printf("$green$retain$$");
+   default:                return nvc_printf("$red$invalid$$");
+   }
 }
 
 static int mir_dump_vector_op(mir_unit_t *mu, mir_value_t value)
@@ -1112,12 +1126,23 @@ void mir_annotate(mir_unit_t *mu, const mir_annotate_t *cb, void *ctx)
             break;
 
          case MIR_OP_DRIVE_SIGNAL:
-         case MIR_OP_RELEASE:
+         case MIR_OP_SCHED_RELEASE:
             {
                printf("%s ", mir_op_string(n->op));
                mir_dump_value(mu, n->args[0], cb, ctx);
                printf(" count ");
                mir_dump_value(mu, n->args[1], cb, ctx);
+            }
+            break;
+
+         case MIR_OP_RELEASE_SIGNAL:
+            {
+               printf("%s ", mir_op_string(n->op));
+               mir_dump_value(mu, n->args[0], cb, ctx);
+               printf(" count ");
+               mir_dump_value(mu, n->args[1], cb, ctx);
+               printf(" mode ");
+               mir_dump_release_mode(n->args[2]);
             }
             break;
 
@@ -1518,7 +1543,8 @@ void mir_annotate(mir_unit_t *mu, const mir_annotate_t *cb, void *ctx)
             }
             break;
 
-         case MIR_OP_FORCE:
+         case MIR_OP_SCHED_FORCE:
+         case MIR_OP_FORCE_SIGNAL:
          case MIR_OP_DEPOSIT_SIGNAL:
          case MIR_OP_PUT_DRIVER:
             {
@@ -1566,6 +1592,8 @@ void mir_annotate(mir_unit_t *mu, const mir_annotate_t *cb, void *ctx)
                if (n->nargs > 2) {
                   printf(" locus ");
                   mir_dump_arg(mu, result, 2, cb, ctx);
+                  printf(" region ");
+                  mir_dump_arg(mu, result, 3, cb, ctx);
                }
             }
             break;

@@ -21,7 +21,7 @@
 #include "prim.h"
 #include "jit/jit.h"
 #include "jit/jit-ffi.h"
-#include "rt/rt.h"
+#include "rt/defs.h"
 
 #define WEAK __attribute__((weak))
 
@@ -44,6 +44,7 @@ void x_sched_active(sig_shared_t *ss, uint32_t offset, int32_t count);
 void x_alias_signal(sig_shared_t *ss, uint32_t offset, tree_t where);
 void x_sched_waveform_s(sig_shared_t *ss, uint32_t offset, uint64_t scalar,
                         int64_t after, int64_t reject);
+void x_sched_waveform_s0(sig_shared_t *ss, uint32_t offset, uint64_t scalar);
 void x_file_open(int8_t *status, void **_fp, const uint8_t *name_bytes,
                  int32_t name_len, int8_t mode);
 void x_file_write(void **_fp, void *data, int64_t size, int64_t count);
@@ -60,6 +61,7 @@ void x_div_zero(tree_t where);
 void x_assert_fail(const uint8_t *msg, int32_t msg_len, int8_t severity,
                    int64_t hint_left, int64_t hint_right, int8_t hint_valid,
                    object_t *where);
+void x_timing_check(int64_t stamp, int64_t limit, object_t *where);
 void x_report(const uint8_t *msg, int32_t msg_len, int8_t severity,
               object_t *where);
 int64_t x_last_event(sig_shared_t *ss, uint32_t offset, int32_t count);
@@ -74,8 +76,13 @@ bool x_driving(sig_shared_t *ss, uint32_t offset, int32_t count);
 void *x_driving_value(sig_shared_t *ss, uint32_t offset, int32_t count);
 void x_disconnect(sig_shared_t *ss, uint32_t offset, int32_t count,
                   int64_t after, int64_t reject);
-void x_force(sig_shared_t *ss, uint32_t offset, int32_t count, void *values);
-void x_release(sig_shared_t *ss, uint32_t offset, int32_t count);
+void x_sched_force(sig_shared_t *ss, uint32_t offset, int32_t count,
+                   void *values);
+void x_sched_release(sig_shared_t *ss, uint32_t offset, int32_t count);
+void x_force_signal(sig_shared_t *ss, uint32_t offset, int32_t count,
+                    void *values);
+void x_release_signal(sig_shared_t *ss, uint32_t offset, int32_t count,
+                      release_mode_t mode);
 void x_deposit_signal(sig_shared_t *ss, uint32_t offset, int32_t count,
                       void *values);
 void x_sched_deposit(sig_shared_t *ss, uint32_t offset, int32_t count,
@@ -101,7 +108,7 @@ rt_trigger_t *x_or_trigger(rt_trigger_t *left, rt_trigger_t *right);
 void *x_cmp_trigger(sig_shared_t *ss, uint32_t offset, int64_t right);
 void *x_level_trigger(sig_shared_t *ss, uint32_t offset, int32_t count);
 void x_add_trigger(void *ptr);
-void x_bind_external(tree_t where, jit_handle_t scope, jit_scalar_t *result);
+void x_bind_external(object_t *where, jit_handle_t scope, jit_scalar_t *result);
 void x_instance_name(attr_kind_t kind, text_buf_t *tb);
 void x_enable_trigger(rt_trigger_t *trigger);
 void x_disable_trigger(rt_trigger_t *trigger);

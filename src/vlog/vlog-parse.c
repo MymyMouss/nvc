@@ -39,6 +39,19 @@ static vlog_symtab_t   *symtab;
 static vlog_node_t      last_attr;
 static vlog_node_t      atom_types[DT_BIT + 1];
 static unsigned         next_namespace;
+static uint64_t         time_scale;
+
+static const struct {
+   const char *name;
+   uint64_t value;
+} time_units[] = {
+   { "s", UINT64_C(60000000000000) },
+   { "ms", 1000000000000 },
+   { "us", 1000000000 },
+   { "ns", 1000000 },
+   { "ps", 1000 },
+   { "fs", 1 },
+};
 
 extern loc_t yylloc;
 
@@ -51,9 +64,12 @@ extern loc_t yylloc;
 static vlog_node_t p_statement_or_null(void);
 static vlog_node_t p_expression(void);
 static vlog_node_t p_constant_expression(void);
+static vlog_node_t p_mintypmax_expression(void);
+static vlog_node_t p_primary(void);
 static vlog_node_t p_data_type(void);
 static void p_list_of_variable_decl_assignments(vlog_node_t parent,
-                                                vlog_node_t datatype);
+                                                vlog_node_t datatype,
+                                                vlog_kind_t kind);
 static vlog_node_t p_variable_lvalue(void);
 static vlog_node_t p_select(ident_t id);
 static vlog_net_kind_t p_net_type(void);
@@ -63,6 +79,7 @@ static vlog_node_t p_attribute_instance(void);
 static vlog_node_t  p_drive_strength(void);
 static vlog_strength_t p_strength0(void);
 static vlog_strength_t p_strength1(void);
+static void p_action_block(vlog_node_t parent);
 
 static vlog_node_t peek_reference(void)
 {
@@ -76,57 +93,22 @@ static void vlog_parse_error_cb(void)
    vlog_symtab_suppress(symtab);
 }
 
-static void set_timescale(uint64_t unit_value, const char *unit_name,
-                          uint64_t prec_value, const char *prec_name,
-                          const loc_t *loc)
+static void set_timescale(uint64_t unit_value, uint64_t unit_scale,
+                          uint64_t prec_value, uint64_t prec_scale)
 {
    // See IEEE 1800-2017 section 22.7 for rules
 
-   struct {
-      uint64_t    value;
-      const char *name;
-      uint64_t    parsed;
-   } args[] = {
-      { unit_value, unit_name },
-      { prec_value, prec_name },
-   };
+   const bool valid = (unit_value == 100 || unit_value == 10 || unit_value == 1)
+      && (prec_value == 100 || prec_value == 10 || prec_value == 1);
 
-   for (int i = 0; i < ARRAY_LEN(args); i++) {
-      static const struct {
-         const char *name;
-         int64_t value;
-      } valid_units[] = {
-         { "s", INT64_C(60000000000000) },
-         { "ms", 1000000000000 },
-         { "us", 1000000000 },
-         { "ns", 1000000 },
-         { "ps", 1000 },
-         { "fs", 1 },
-      };
-
-      bool name_valid = false;
-      for (int j = 0; j < ARRAY_LEN(valid_units); j++) {
-         if (strcmp(valid_units[j].name, args[i].name) == 0) {
-            args[i].parsed = valid_units[j].value;
-            name_valid = true;
-            break;
-         }
-      }
-
-      if (!name_valid)
-         error_at(loc, "invalid time unit name '%s'", args[i].name);
-
-      if (args[i].value != 1 && args[i].value != 10 && args[i].value != 100) {
-         diag_t *d = diag_new(DIAG_ERROR, loc);
-         diag_printf(d, "invalid order of magnitude in `timescale directive");
-         diag_hint(d, NULL, "the valid values are 1, 10, and 100");
-         diag_emit(d);
-      }
-
-      args[i].parsed *= args[i].value;
+   if (!valid) {
+      diag_t *d = diag_new(DIAG_ERROR, CURRENT_LOC);
+      diag_printf(d, "invalid order of magnitude in `timescale directive");
+      diag_hint(d, NULL, "the valid values are 1, 10, and 100");
+      diag_emit(d);
    }
 
-   // TODO: do something with parsed scale/precision
+   time_scale = unit_value * unit_scale;
 }
 
 static void skip_over_attributes(void)
@@ -269,13 +251,13 @@ static vlog_node_t get_data_type(ident_t id)
 {
    vlog_node_t v = vlog_symtab_query(symtab, id);
    if (v == NULL) {
-      error_at(&state.last_loc, "no data type declaration for '%pi'", id);
+      error_at(&state.last_loc, "no data type declaration for %pQ", id);
       return logic_type();
    }
    else if (!is_data_type(v)) {
       diag_t *d = diag_new(DIAG_ERROR, &state.last_loc);
-      diag_printf(d, "'%pi' is not a data type", id);
-      diag_hint(d, vlog_loc(v), "'%pi' declared here", id);
+      diag_printf(d, "%pQ is not a data type", id);
+      diag_hint(d, vlog_loc(v), "%pQ declared here", id);
       diag_emit(d);
 
       return logic_type();
@@ -284,17 +266,38 @@ static vlog_node_t get_data_type(ident_t id)
    return v;
 }
 
+static bool scan_type_declaration(void)
+{
+   switch (peek()) {
+   case tREG:       case tSTRUCT:   case tUNION:   case tTYPEDEF:
+   case tENUM:      case tSVINT:    case tINTEGER: case tSVREAL:
+   case tSHORTREAL: case tREALTIME: case tBIT:     case tLOGIC:
+   case tSHORTINT:  case tTIME:
+      return true;
+   case tID:
+      {
+         vlog_node_t dt = peek_reference();
+         return dt != NULL && is_data_type(dt);
+      }
+   default:
+      return false;
+   }
+}
+
 static bool scan_block_item_declaration(void)
 {
-   return scan(tREG, tSTRUCT, tUNION, tTYPEDEF, tENUM, tSVINT, tINTEGER,
-               tSVREAL, tSHORTREAL, tREALTIME, tBIT, tLOGIC, tSHORTINT, tTIME);
+   if (scan_type_declaration())
+      return true;
+
+   return scan(tLOCALPARAM, tPARAMETER);
 }
 
 static bool scan_tf_item_declaration(void)
 {
-   return scan(tREG, tSTRUCT, tUNION, tTYPEDEF, tENUM, tSVINT, tINTEGER,
-               tSVREAL, tSHORTREAL, tREALTIME, tBIT, tLOGIC, tSHORTINT, tTIME,
-               tINPUT, tOUTPUT);
+   if (scan_type_declaration())
+      return true;
+
+   return scan(tINPUT, tOUTPUT, tINOUT, tLOCALPARAM, tPARAMETER);
 }
 
 static ident_t p_identifier(void)
@@ -358,6 +361,85 @@ static vlog_node_t p_attribute_instance(void)
 
    vlog_set_loc(v, CURRENT_LOC);
    return v;
+}
+
+static uint64_t p_time_unit(void)
+{
+   // s | ms | us | ns | ps | fs
+
+   BEGIN("time unit");
+
+   ident_t id = p_identifier();
+
+   for (int j = 0; j < ARRAY_LEN(time_units); j++) {
+      if (icmp(id, time_units[j].name))
+         return time_units[j].value;
+   }
+
+   if (id != error_marker())
+      error_at(&state.last_loc, "invalid time unit name %pQ", id);
+
+   return 1;
+}
+
+static uint64_t p_unsigned_integer(void)
+{
+   // decimal_digit { _ | decimal_digit }
+
+   BEGIN("unsigned number");
+
+   if (consume(tUNSNUM)) {
+      uint64_t value = 0;
+      for (const char *p = state.last_lval.str; *p; p++) {
+         if (*p != '_') {
+            value *= 10;
+            value += (*p - '0');
+         }
+      }
+
+      free(state.last_lval.str);
+      return value;
+   }
+   else
+      return 0;
+}
+
+static void p_time_literal(uint64_t *value, uint64_t *scale)
+{
+   // unsigned_number time_unit | fixed_point_number time_unit
+
+   BEGIN("time literal");
+
+   consume(tTIMELIT);
+
+   *value = 0;
+   *scale = 1;
+
+   for (const char *p = state.last_lval.str; *p; p++) {
+      if (*p == '_' || isspace_iso88591(*p))
+         continue;
+      else if (!isdigit_iso88591(*p)) {
+         bool name_valid = false;
+         for (int j = 0; j < ARRAY_LEN(time_units); j++) {
+            if (strcmp(time_units[j].name, p) == 0) {
+               *scale = time_units[j].value;
+               name_valid = true;
+               break;
+            }
+         }
+
+         if (!name_valid)
+            error_at(&state.last_loc, "invalid time unit name '%s'", p);
+
+         break;
+      }
+      else {
+         *value *= 10;
+         *value += (*p - '0');
+      }
+   }
+
+   free(state.last_lval.str);
 }
 
 static vlog_node_t p_unsigned_number(void)
@@ -523,7 +605,8 @@ static vlog_node_t p_constant_mintypmax_expression(void)
    // constant_expression
    //   | constant_expression : constant_expression : constant_expression
 
-   return p_constant_expression();
+   // Checked for constant-ness later
+   return p_mintypmax_expression();
 }
 
 static vlog_node_t p_packed_dimension(void)
@@ -592,7 +675,7 @@ static void p_struct_union_member(vlog_node_t v)
    optional_attributes();
 
    vlog_node_t dt = p_data_type_or_void();
-   p_list_of_variable_decl_assignments(v, dt);
+   p_list_of_variable_decl_assignments(v, dt, V_VAR_DECL);
 
    consume(tSEMI);
 }
@@ -1171,19 +1254,34 @@ static vlog_node_t p_hierarchical_identifier(ident_t id)
    if (id == NULL)
       id = p_identifier();
 
+   vlog_node_t mr = vlog_new(V_MOD_REF);
+   vlog_set_ident(mr, id);
+   vlog_set_loc(mr, CURRENT_LOC);
+   vlog_symtab_lookup(symtab, mr);
+
+   ident_t suffix;
+   for (;;) {
+      consume(tDOT);
+
+      suffix = p_identifier();
+
+      if (peek() != tDOT)
+         break;
+
+      vlog_node_t next = vlog_new(V_MOD_REF);
+      vlog_set_ident(next, suffix);
+      vlog_set_loc(next, &state.last_loc);
+      vlog_set_value(next, mr);
+
+      mr = next;
+   };
+
    vlog_node_t v = vlog_new(V_HIER_REF);
-   vlog_set_ident(v, id);
-
-   consume(tDOT);
-
-   ident_t suffix = NULL;
-   do {
-      suffix = ident_prefix(suffix, p_identifier(), '.');
-      vlog_set_ident2(v, suffix);
-   } while (optional(tDOT));
-
+   vlog_set_value(v, mr);
+   vlog_set_ident(v, suffix);
    vlog_set_loc(v, CURRENT_LOC);
-   vlog_symtab_lookup(symtab, v);
+
+   vlog_set_global_flags(v, VLOG_GF_HIER_REF);
    return v;
 }
 
@@ -1220,36 +1318,47 @@ static vlog_node_t p_select(ident_t id)
       }
    }
 
-   if (optional(tLSQUARE)) {
-      do {
-         vlog_node_t expr = p_expression();
-         if (scan(tCOLON, tINDEXPOS, tINDEXNEG)) {
-            vlog_node_t ps = vlog_new(V_PART_SELECT);
-            vlog_set_left(ps, expr);
-            vlog_set_value(ps, prefix);
+   if (peek() != tLSQUARE)
+      return prefix;
 
-            p_part_select_range(ps);
+   switch (peek_nth(2)) {
+   case tTIMES:
+   case tPLUS:
+      return prefix;  // Repetition in property
+   default:
+      break;
+   }
 
-            consume(tRSQUARE);
+   consume(tLSQUARE);
 
-            vlog_set_loc(ps, CURRENT_LOC);
-            return ps;
-         }
+   do {
+      vlog_node_t expr = p_expression();
+      if (scan(tCOLON, tINDEXPOS, tINDEXNEG)) {
+         vlog_node_t ps = vlog_new(V_PART_SELECT);
+         vlog_set_left(ps, expr);
+         vlog_set_value(ps, prefix);
 
-         if (vlog_kind(prefix) == V_BIT_SELECT)
-            vlog_add_param(prefix, expr);
-         else {
-            vlog_node_t bs = vlog_new(V_BIT_SELECT);
-            vlog_set_loc(bs, CURRENT_LOC);
-            vlog_set_value(bs, prefix);
-            vlog_add_param(bs, expr);
-
-            prefix = bs;
-         }
+         p_part_select_range(ps);
 
          consume(tRSQUARE);
-      } while (optional(tLSQUARE));
-   }
+
+         vlog_set_loc(ps, CURRENT_LOC);
+         return ps;
+      }
+
+      if (vlog_kind(prefix) == V_BIT_SELECT)
+         vlog_add_param(prefix, expr);
+      else {
+         vlog_node_t bs = vlog_new(V_BIT_SELECT);
+         vlog_set_loc(bs, CURRENT_LOC);
+         vlog_set_value(bs, prefix);
+         vlog_add_param(bs, expr);
+
+         prefix = bs;
+      }
+
+      consume(tRSQUARE);
+   } while (optional(tLSQUARE));
 
    return prefix;
 }
@@ -1281,8 +1390,24 @@ static vlog_node_t p_system_tf_call(vlog_kind_t kind)
 
    BEGIN("system task or function call");
 
+   ident_t id = p_system_tf_identifier();
+
+   vlog_systf_t subk;
+   switch (is_well_known(id)) {
+   case W_DLR_SIGNED:   subk = V_SYSTF_SIGNED; break;
+   case W_DLR_UNSIGNED: subk = V_SYSTF_UNSIGNED; break;
+   case W_DLR_CLOG2:    subk = V_SYSTF_CLOG2; break;
+   case W_DLR_SQRT:     subk = V_SYSTF_SQRT; break;
+   case W_DLR_BITS:     subk = V_SYSTF_BITS; break;
+   case W_DLR_RTOI:     subk = V_SYSTF_RTOI; break;
+   case W_DLR_CEIL:     subk = V_SYSTF_CEIL; break;
+   case W_DLR_FLOOR:    subk = V_SYSTF_FLOOR; break;
+   default:             subk = V_SYSTF_NONE; break;
+   }
+
    vlog_node_t v = vlog_new(kind);
-   vlog_set_ident(v, p_system_tf_identifier());
+   vlog_set_ident(v, id);
+   vlog_set_subkind(v, subk);
 
    if (optional(tLPAREN)) {
       p_list_of_arguments(v);
@@ -1315,6 +1440,51 @@ static vlog_node_t p_tf_call(vlog_kind_t kind)
    return v;
 }
 
+static vlog_node_t p_method_call_root(void)
+{
+   // primary | implicit_class_handle
+
+   BEGIN("method call root");
+
+   vlog_node_t v = vlog_new(V_REF);
+   vlog_set_ident(v, p_identifier());
+   vlog_set_loc(v, CURRENT_LOC);
+
+   vlog_symtab_lookup(symtab, v);
+   return v;
+}
+
+static void p_method_call_body(vlog_node_t v)
+{
+   // method_identifier { attribute_instance } [ ( list_of_arguments ) ]
+   //   | built_in_method_call
+
+   BEGIN("method call body");
+
+   vlog_set_ident(v, p_identifier());
+
+   if (optional(tLPAREN)) {
+      p_list_of_arguments(v);
+      consume(tRPAREN);
+   }
+}
+
+static vlog_node_t p_method_call(void)
+{
+   // method_call_root . method_call_body
+
+   vlog_node_t v = vlog_new(V_METHOD_CALL);
+   vlog_set_value(v, p_method_call_root());
+
+   consume(tDOT);
+
+   p_method_call_body(v);
+
+   vlog_set_loc(v, CURRENT_LOC);
+   vlog_symtab_lookup(symtab, v);
+   return v;
+}
+
 static vlog_node_t p_subroutine_call(vlog_kind_t kind)
 {
    // tf_call | system_tf_call | method_call | [ std:: ] randomize_call
@@ -1323,6 +1493,8 @@ static vlog_node_t p_subroutine_call(vlog_kind_t kind)
 
    if (peek() == tSYSTASK)
       return p_system_tf_call(kind);
+   else if (peek_nth(2) == tDOT)
+      return p_method_call();
    else
       return p_tf_call(kind);
 }
@@ -1400,7 +1572,7 @@ static vlog_node_t p_package_identifier(void)
    object_t *obj = lib_get_generic(lib_work(), qual, NULL);
    vlog_node_t v = vlog_from_object(obj);
    if (v == NULL || vlog_kind(v) != V_PACKAGE) {
-      parse_error(&state.last_loc, "no package named '%pi' in working "
+      parse_error(&state.last_loc, "no package named %pQ in working "
                   "library", id);
       return NULL;
    }
@@ -1427,6 +1599,151 @@ static vlog_node_t p_package_scope(void)
    }
 }
 
+static void p_assignment_pattern(vlog_node_t expr)
+{
+   // '{ expression { , expression } }
+   //    | '{ structure_pattern_key : expression
+   //          { , structure_pattern_key : expression } }
+   //    | '{ array_pattern_key : expression
+   //          { , array_pattern_key : expression } }
+   //    | '{ constant_expression { expression { , expression } } }
+
+   BEGIN("assignment pattern");
+
+   consume(tTICK);
+   consume(tLBRACE);
+
+   vlog_node_t dt = NULL;
+   if (vlog_has_type(expr))
+      dt = vlog_type(expr);
+   else
+      parse_error(CURRENT_LOC, "cannot determine type of assignment pattern");
+
+   bool have_error = false;
+   do {
+      vlog_node_t v = vlog_new(V_PATTERN_ITEM);
+
+      if (optional(tDEFAULT)) {
+         vlog_set_loc(v, &state.last_loc);
+         consume(tCOLON);
+         vlog_set_right(v, p_expression());
+      }
+      else if (peek() == tID && peek_nth(2) == tCOLON) {
+         ident_t id = p_identifier();
+
+         vlog_node_t ref = vlog_new(V_REF);
+         vlog_set_ident(ref, id);
+         vlog_set_loc(ref, &state.last_loc);
+
+         if (dt != NULL) {
+            switch (vlog_kind(dt)) {
+            case V_UNION_DECL:
+            case V_STRUCT_DECL:
+               {
+                  bool found = false;
+                  const int ndecls = vlog_decls(dt);
+                  for (int i = 0; i < ndecls; i++) {
+                     vlog_node_t d = vlog_decl(dt, i);
+                     if (vlog_ident(d) == id) {
+                        vlog_set_ref(ref, d);
+                        found = true;
+                        break;
+                     }
+                  }
+
+                  if (!found && !have_error) {
+                     diag_t *d = diag_new(DIAG_ERROR, &state.last_loc);
+                     diag_printf(d, "struct or union has no field %pQ", id);
+                     diag_hint(d, vlog_loc(dt), "data type declared here");
+                     diag_emit(d);
+                     have_error = true;
+                  }
+               }
+               break;
+            default:
+               if (!have_error) {
+                  parse_error(&state.last_loc, "cannot use structure pattern "
+                              "key with this data type");
+                  have_error = true;
+               }
+               break;
+            }
+         }
+
+         vlog_set_left(v, ref);
+         vlog_set_loc(v, &state.last_loc);
+
+         consume(tCOLON);
+
+         vlog_set_right(v, p_expression());
+      }
+      else {
+         vlog_node_t head = p_expression();
+         vlog_set_loc(v, vlog_loc(head));
+
+         if (optional(tCOLON)) {
+            vlog_set_left(v, head);
+            vlog_set_right(v, p_expression());
+         }
+         else
+            vlog_set_right(v, head);
+      }
+
+      vlog_add_param(expr, v);
+   } while (optional(tCOMMA));
+
+   consume(tRBRACE);
+}
+
+static vlog_node_t p_assignment_pattern_expression(vlog_node_t dt)
+{
+   // [ assignment_pattern_expression_type ] assignment_pattern
+
+   BEGIN("assignment pattern expression");
+
+   vlog_node_t v = vlog_new(V_PATTERN_EXPR);
+   vlog_set_type(v, dt);
+
+   p_assignment_pattern(v);
+
+   vlog_set_loc(v, CURRENT_LOC);
+   return v;
+}
+
+static void p_casting_type(vlog_node_t cast, vlog_node_t head)
+{
+   // simple_type | constant_primary | signing | string | const
+
+   BEGIN("casting type");
+
+   assert(head != NULL);
+
+   vlog_set_subkind(cast, V_CAST_WIDTH);
+   vlog_set_left(cast, head);
+}
+
+
+static vlog_node_t p_cast(vlog_node_t head)
+{
+   // casting_type ' ( expression )
+
+   BEGIN_WITH_HEAD("cast", head);
+
+   vlog_node_t v = vlog_new(V_CAST);
+
+   p_casting_type(v, head);
+
+   consume(tTICK);
+   consume(tLPAREN);
+
+   vlog_set_value(v, p_expression());
+
+   consume(tRPAREN);
+
+   vlog_set_loc(v, CURRENT_LOC);
+   return v;
+}
+
 static vlog_node_t p_primary(void)
 {
    // primary_literal | empty_queue
@@ -1440,55 +1757,72 @@ static vlog_node_t p_primary(void)
 
    BEGIN("primary");
 
+   vlog_node_t head;
    switch (peek()) {
    case tID:
       switch (peek_nth(2)) {
       case tLPAREN:
       case tATTRBEGIN:
-         return p_subroutine_call(V_USER_FCALL);
+         head = p_subroutine_call(V_USER_FCALL);
+         break;
+      case tDOT:
+         if (peek_nth(4) == tLPAREN)
+            head = p_subroutine_call(V_METHOD_CALL);
+         else
+            head = p_select(p_identifier());
+         break;
       case tSCOPE:
          p_package_scope();
+         // Fall-through
       default:
-         return p_select(p_identifier());
+         head = p_select(p_identifier());
+         break;
       }
+      break;
    case tSTRING:
    case tNUMBER:
    case tUNSNUM:
    case tREAL:
-      return p_primary_literal();
+      head = p_primary_literal();
+      break;
    case tSYSTASK:
-      return p_subroutine_call(V_SYS_FCALL);
+      head = p_subroutine_call(V_SYS_FCALL);
+      break;
    case tLPAREN:
-      {
-         consume(tLPAREN);
-         vlog_node_t expr = p_mintypmax_expression();
-         consume(tRPAREN);
-         return expr;
-      }
+      consume(tLPAREN);
+      head = p_mintypmax_expression();
+      consume(tRPAREN);
+      break;
    case tLBRACE:
       {
          consume(tLBRACE);
 
-         vlog_node_t head = p_expression();
+         vlog_node_t head2 = p_expression();
          if (peek() == tLBRACE)
-            return p_multiple_concatenation(head);
+            head = p_multiple_concatenation(head2);
          else
-            return p_concatenation(head);
+            head = p_concatenation(head2);
       }
+      break;
    case tNULL:
-      {
-         consume(tNULL);
-
-         vlog_node_t v = vlog_new(V_NULL);
-         vlog_set_loc(v, CURRENT_LOC);
-         return v;
-      }
-
+      consume(tNULL);
+      head =  vlog_new(V_NULL);
+      vlog_set_loc(head, CURRENT_LOC);
+      break;
+   case tTICK:
+      head = p_assignment_pattern_expression(NULL);
+      break;
    default:
       one_of(tID, tSTRING, tNUMBER, tUNSNUM, tREAL, tSYSTASK, tLPAREN,
-             tLBRACE, tNULL);
-      return p_select(error_marker());
+             tLBRACE, tNULL, tTICK);
+      head = p_select(error_marker());
+      break;
    }
+
+   if (peek() == tTICK && peek_nth(2) == tLPAREN)
+      return p_cast(head);
+   else
+      return head;
 }
 
 static vlog_binary_t p_binary_operator(void)
@@ -1600,6 +1934,7 @@ static vlog_node_t p_nonbinary_expression(void)
    case tLPAREN:
    case tLBRACE:
    case tNULL:
+   case tTICK:
       return p_primary();
    case tMINUS:
    case tPLUS:
@@ -1769,6 +2104,219 @@ static void p_event_expression(vlog_node_t ctrl)
    } while (optional(tOR) || optional(tCOMMA));
 }
 
+static vlog_node_t p_expression_or_dist(void)
+{
+   // expression [ dist { dist_list } ]
+
+   BEGIN("expression or dist");
+
+   return p_expression();
+}
+
+static void p_cycle_delay_const_range_expression(void)
+{
+   // constant_expression : constant_expression | constant_expression : $
+
+   BEGIN("cycle delay constant range expression");
+
+   p_constant_expression();
+
+   consume(tCOLON);
+
+   p_constant_expression();
+}
+
+static void p_cycle_delay_range(void)
+{
+   // ## constant_primary
+   //   | ## [ cycle_delay_const_range_expression ]
+   //   | ##[*]
+   //   | ##[+]
+
+   BEGIN("cycle delay range");
+
+   consume(tCYCLEDLY);
+
+   switch (peek()) {
+   case tLSQUARE:
+      consume(tLSQUARE);
+      p_cycle_delay_const_range_expression();
+      consume(tRSQUARE);
+      break;
+   default:
+      p_primary();
+      break;
+   }
+}
+
+static vlog_node_t p_consecutive_repetition(vlog_node_t head)
+{
+   // [* const_or_range_expression ] | [*] | [+]
+
+   BEGIN("consecutive repetition");
+
+   consume(tLSQUARE);
+
+   switch (one_of(tTIMES, tPLUS)) {
+   case tTIMES:
+      if (!optional(tRSQUARE)) {
+         (void)p_constant_expression();
+         consume(tRSQUARE);
+      }
+      break;
+   case tPLUS:
+      consume(tRSQUARE);
+      break;
+   }
+
+   return head;
+}
+
+static vlog_node_t p_boolean_abbrev(vlog_node_t head)
+{
+   // consecutive_repetition | non_consecutive_repetition | goto_repetition
+
+   BEGIN("boolean abbreviation");
+
+   return p_consecutive_repetition(head);
+}
+
+static vlog_node_t p_sequence_expr(void)
+{
+   // cycle_delay_range sequence_expr { cycle_delay_range sequence_expr }
+   //   | sequence_expr cycle_delay_range sequence_expr
+   //       { cycle_delay_range sequence_expr }
+   //   | expression_or_dist [ boolean_abbrev ]
+   //   | sequence_instance [ sequence_abbrev ]
+   //   | ( sequence_expr { , sequence_match_item } ) [ sequence_abbrev ]
+   //   | sequence_expr and sequence_expr
+   //   | sequence_expr intersect sequence_expr
+   //   | sequence_expr or sequence_expr
+   //   | first_match ( sequence_expr { , sequence_match_item } )
+   //   | expression_or_dist throughout sequence_expr
+   //   | sequence_expr within sequence_expr
+   //   | clocking_event sequence_expr
+
+   BEGIN("sequence expression");
+
+   vlog_node_t head;
+   switch (peek()) {
+   case tCYCLEDLY:
+      (void)p_cycle_delay_range();
+      head = p_sequence_expr();
+      break;
+   default:
+      head = p_expression_or_dist();
+   }
+
+   if (peek() == tLSQUARE)
+      return p_boolean_abbrev(head);
+   else
+      return head;
+}
+
+static vlog_node_t p_clocking_event(void)
+{
+   // @ identifier | @ ( event_expression )
+
+   BEGIN("clocking event");
+
+   consume(tAT);
+
+   vlog_node_t v = vlog_new(V_EVENT_CONTROL);
+
+   switch (peek()) {
+   case tID:
+      (void)p_identifier();
+      break;
+   case tLPAREN:
+      consume(tLPAREN);
+      p_event_expression(v);
+      consume(tRPAREN);
+      break;
+   default:
+      one_of(tID, tLPAREN);
+   }
+
+   vlog_set_loc(v, CURRENT_LOC);
+   return v;
+}
+
+static vlog_node_t p_property_expr(void)
+{
+   // sequence_expr
+   //   | strong ( sequence_expr )
+   //   | weak ( sequence_expr )
+   //   | ( property_expr )
+   //   | not property_expr
+   //   | property_expr or property_expr
+   //   | property_expr and property_expr
+   //   | sequence_expr |-> property_expr
+   //   | sequence_expr |=> property_expr
+   //   | if ( expression_or_dist ) property_expr [ else property_expr ]
+   //   | case ( expression_or_dist ) property_case_item
+   //       { property_case_item } endcase
+   //   | sequence_expr #-# property_expr
+   //   | sequence_expr #=# property_expr
+   //   | nexttime property_expr
+   //   | nexttime [ constant expression ] property_expr
+   //   | s_nexttime property_expr
+   //   | s_nexttime [ constant_expression ] property_expr
+   //   | always property_expr
+   //   | always [ cycle_delay_const_range_expression ] property_expr
+   //   | s_always [ constant_range ] property_expr
+   //   | s_eventually property_expr
+   //   | eventually [ constant_range ] property_expr
+   //   | s_eventually [ cycle_delay_const_range_expression ] property_expr
+   //   | property_expr until property_expr
+   //   | property_expr s_until property_expr
+   //   | property_expr until_with property_expr
+   //   | property_expr s_until_with property_expr
+   //   | property_expr implies property_expr
+   //   | property_expr iff property_expr
+   //   | accept_on ( expression_or_dist ) property_expr
+   //   | reject_on ( expression_or_dist ) property_expr
+   //   | sync_accept_on ( expression_or_dist ) property_expr
+   //   | sync_reject_on ( expression_or_dist ) property_expr
+   //   | property_instance
+   //   | clocking_event property_expr
+
+   BEGIN("property expression");
+
+   if (peek() == tAT) {
+      (void)p_clocking_event();
+      return p_property_expr();
+   }
+
+   vlog_node_t head;
+   if (optional(tLPAREN)) {
+      head = p_property_expr();
+      consume(tRPAREN);
+   }
+   else
+      head = p_sequence_expr();
+
+   switch (peek()) {
+   case tDBLAMP:
+   case tLOGOR:
+      consume(peek());
+      (void)p_expression();
+      break;
+   case tSUFFIXOVR:
+      consume(tSUFFIXOVR);
+      (void)p_property_expr();
+      break;
+   case tSUFFIXNON:
+      consume(tSUFFIXNON);
+      (void)p_property_expr();
+      break;
+   default:
+      break;
+   }
+
+   return head;
+}
+
 static vlog_node_t p_cond_predicate(void)
 {
    // expression_or_cond_pattern { &&& expression_or_cond_pattern }
@@ -1825,7 +2373,41 @@ static vlog_node_t p_delay_value(void)
          vlog_symtab_lookup(symtab, v);
          return v;
       }
+   case tTIMELIT:
+      {
+         uint64_t value, scale;
+         p_time_literal(&value, &scale);
+
+         if (__builtin_mul_overflow(value, scale, &value))
+            error_at(&state.last_loc, "time value cannot be represented");
+
+         vlog_node_t v = vlog_new(V_NUMBER);
+         vlog_set_number(v, number_from_int(value));
+         vlog_set_loc(v, CURRENT_LOC);
+         return v;
+      }
    case tUNSNUM:
+      {
+         consume(tUNSNUM);
+
+         uint64_t value = 0;
+         for (const char *p = state.last_lval.str; *p; p++) {
+            if (*p != '_') {
+               value *= 10;
+               value += (*p - '0');
+            }
+         }
+
+         free(state.last_lval.str);
+
+         if (__builtin_mul_overflow(value, time_scale, &value))
+            error_at(&state.last_loc, "time value cannot be represented");
+
+         vlog_node_t v = vlog_new(V_NUMBER);
+         vlog_set_number(v, number_from_int(value));
+         vlog_set_loc(v, CURRENT_LOC);
+         return v;
+      }
    default:
       return p_unsigned_number();
    }
@@ -2003,12 +2585,12 @@ static vlog_node_t p_dynamic_array_new(vlog_node_t dt)
 
    vlog_node_t v = vlog_new(V_DYNAMIC_NEW);
    vlog_set_type(v, dt);
-   vlog_set_value(v, p_expression());
+   vlog_set_left(v, p_expression());
 
    consume(tRSQUARE);
 
    if (optional(tLPAREN)) {
-      (void)p_expression();   // TODO: initialise from existing array
+      vlog_set_value(v, p_expression());
       consume(tRPAREN);
    }
 
@@ -2087,17 +2669,23 @@ static vlog_node_t p_blocking_assignment(vlog_node_t lhs)
    vlog_node_t v = vlog_new(V_BASSIGN);
    vlog_set_target(v, lhs);
 
-   if (peek() == tNEW) {
+   switch (peek()) {
+   case tNEW:
       if (peek_nth(2) == tLSQUARE)
          vlog_set_value(v, p_dynamic_array_new(vlog_get_type(lhs)));
       else
          vlog_set_value(v, p_class_new(vlog_get_type(lhs)));
-   }
-   else {
-      if (scan(tHASH, tAT))
-         vlog_set_delay(v, p_delay_or_event_control());
-
+      break;
+   case tTICK:
+      vlog_set_value(v, p_assignment_pattern_expression(vlog_get_type(lhs)));
+      break;
+   case tHASH:
+   case tAT:
+      vlog_set_delay(v, p_delay_or_event_control());
+      // Fall-through
+   default:
       vlog_set_value(v, p_expression());
+      break;
    }
 
    vlog_set_loc(v, CURRENT_LOC);
@@ -2166,7 +2754,7 @@ static vlog_node_t p_seq_block(ident_t id)
 
    consume(tBEGIN);
 
-   vlog_node_t v = vlog_new(V_BLOCK);
+   vlog_node_t v = vlog_new(V_SEQ_BLOCK);
    vlog_set_ident(v, id);
    vlog_set_loc(v, CURRENT_LOC);
 
@@ -2182,6 +2770,9 @@ static vlog_node_t p_seq_block(ident_t id)
    }
 
    skip_over_attributes();
+
+   if (vlog_has_ident(v))
+      vlog_symtab_put(symtab, v);
 
    while (scan_block_item_declaration()) {
       p_block_item_declaration(v);
@@ -2352,12 +2943,17 @@ static vlog_node_t p_variable_assignment(vlog_kind_t kind)
 
    BEGIN("variable assignment");
 
+   vlog_node_t lhs = p_variable_lvalue();
+
    vlog_node_t v = vlog_new(kind);
-   vlog_set_target(v, p_variable_lvalue());
+   vlog_set_target(v, lhs);
 
    consume(tEQ);
 
-   vlog_set_value(v, p_expression());
+   if (peek() == tTICK)
+      vlog_set_value(v, p_assignment_pattern_expression(vlog_get_type(lhs)));
+   else
+      vlog_set_value(v, p_expression());
 
    vlog_set_loc(v, CURRENT_LOC);
    return v;
@@ -2387,7 +2983,7 @@ static void p_for_variable_declaration(vlog_node_t parent)
    vlog_node_t dt = p_data_type();
 
    do {
-      vlog_node_t v = vlog_new(V_VAR_DECL);
+      vlog_node_t v = vlog_new(V_LOCAL_DECL);
       vlog_set_ident(v, p_identifier());
       vlog_set_type(v, dt);
 
@@ -2727,8 +3323,29 @@ static vlog_node_t p_disable_statement(void)
 
    consume(tDISABLE);
 
+   ident_t id = p_identifier();
+
+   vlog_node_t decl = vlog_symtab_query(symtab, id);
+   if (decl == NULL)
+      error_at(&state.last_loc, "no visible label %pQ", id);
+   else {
+      switch (vlog_kind(decl)) {
+      case V_SEQ_BLOCK:
+      case V_TASK_DECL:
+         break;
+      default:
+         {
+            diag_t *d = diag_new(DIAG_ERROR, &state.last_loc);
+            diag_printf(d, "cannot disable %pQ", id);
+            diag_hint(d, vlog_loc(decl), "%pQ declared here", id);
+            diag_emit(d);
+         }
+         break;
+      }
+   }
+
    vlog_node_t v = vlog_new(V_DISABLE);
-   vlog_set_ident(v, p_identifier());
+   vlog_set_ident(v, id);
 
    consume(tSEMI);
 
@@ -2765,6 +3382,56 @@ static vlog_node_t p_jump_statement(void)
    default:
       should_not_reach_here();
    }
+}
+
+static vlog_node_t p_simple_immediate_assert_statement(void)
+{
+   // assert ( expression ) action_block
+
+   BEGIN("simple immediate assert statement");
+
+   consume(tASSERT);
+   consume(tLPAREN);
+
+   vlog_node_t v = vlog_new(V_ASSERT);
+   vlog_set_value(v, p_expression());
+
+   consume(tRPAREN);
+
+   p_action_block(v);
+
+   vlog_set_loc(v, CURRENT_LOC);
+   return v;
+}
+
+static vlog_node_t p_simple_immediate_assertion_statement(void)
+{
+   // simple_immediate_assert_statement | simple_immediate_assume_statement
+   //   | simple_immediate_cover_statement
+
+   BEGIN("simple immediate assertion statement");
+
+   return p_simple_immediate_assert_statement();
+}
+
+static vlog_node_t p_immediate_assertion_statement(void)
+{
+   // simple_immediate_assertion_statement
+   //    | deferred_immediate_assertion_statement
+
+   BEGIN("immediate assertion statement");
+
+   return p_simple_immediate_assertion_statement();
+}
+
+static vlog_node_t p_procedural_assertion_statement(void)
+{
+   // concurrent_assertion_statement | immediate_assertion_statement
+   //   | checker_instantiation
+
+   BEGIN("procedural assertion statement");
+
+   return p_immediate_assertion_statement();
 }
 
 static vlog_node_t p_statement_item(ident_t id)
@@ -2860,12 +3527,14 @@ static vlog_node_t p_statement_item(ident_t id)
       }
    case tRETURN:
       return p_jump_statement();
+   case tASSERT:
+      return p_procedural_assertion_statement();
    default:
       one_of(tID, tAT, tHASH, tBEGIN, tFORK, tSYSTASK, tVOID, tIF, tFOREVER,
              tWHILE, tREPEAT, tDO, tFOR, tWAIT, tCASE, tCASEX, tCASEZ, tIFIMPL,
-             tASSIGN, tDEASSIGN, tFORCE, tRELEASE, tRETURN);
+             tASSIGN, tDEASSIGN, tFORCE, tRELEASE, tRETURN, tASSERT);
       drop_tokens_until(&state, tSEMI);
-      return vlog_new(V_BLOCK);  // Dummy statement
+      return vlog_new(V_SEQ_BLOCK);  // Dummy statement
    }
 }
 
@@ -3307,7 +3976,8 @@ static vlog_node_t p_variable_dimension(void)
    }
 }
 
-static vlog_node_t p_variable_decl_assignment(vlog_node_t datatype)
+static vlog_node_t p_variable_decl_assignment(vlog_node_t datatype,
+                                              vlog_kind_t kind)
 {
    // variable_identifier { variable_dimension } [ = expression ]
    //   | dynamic_array_variable_identifier unsized_dimension
@@ -3316,7 +3986,7 @@ static vlog_node_t p_variable_decl_assignment(vlog_node_t datatype)
 
    BEGIN("variable declaration assignment");
 
-   vlog_node_t v = vlog_new(V_VAR_DECL);
+   vlog_node_t v = vlog_new(kind);
    vlog_set_ident(v, p_identifier());
    vlog_set_type(v, datatype);
 
@@ -3332,14 +4002,15 @@ static vlog_node_t p_variable_decl_assignment(vlog_node_t datatype)
 }
 
 static void p_list_of_variable_decl_assignments(vlog_node_t parent,
-                                                vlog_node_t datatype)
+                                                vlog_node_t datatype,
+                                                vlog_kind_t kind)
 {
    // variable_decl_assignment { , variable_decl_assignment }
 
    BEGIN("list of variable declaration assignments");
 
    do {
-      vlog_add_decl(parent, p_variable_decl_assignment(datatype));
+      vlog_add_decl(parent, p_variable_decl_assignment(datatype, kind));
    } while (optional(tCOMMA));
 }
 
@@ -3404,7 +4075,7 @@ static void p_package_import_declaration(vlog_node_t parent)
    consume(tSEMI);
 }
 
-static void p_data_declaration(vlog_node_t mod)
+static void p_data_declaration(vlog_node_t parent, vlog_kind_t kind)
 {
    // [ const ] [ var ] [ lifetime ] data_type_or_implicit
    //     list_of_variable_decl_assignments ;
@@ -3414,17 +4085,17 @@ static void p_data_declaration(vlog_node_t mod)
 
    switch (peek()) {
    case tTYPEDEF:
-      vlog_add_decl(mod, p_type_declaration());
+      vlog_add_decl(parent, p_type_declaration());
       break;
    case tIMPORT:
-      p_package_import_declaration(mod);
+      p_package_import_declaration(parent);
       break;
    default:
       {
          optional(tVAR);
 
          vlog_node_t dt = p_data_type_or_implicit();
-         p_list_of_variable_decl_assignments(mod, dt);
+         p_list_of_variable_decl_assignments(parent, dt, kind);
 
          consume(tSEMI);
       }
@@ -3454,7 +4125,7 @@ static v_port_kind_t p_tf_port_direction(void)
    return p_port_direction();
 }
 
-static vlog_node_t p_tf_port_item(void)
+static vlog_node_t p_tf_port_item(v_port_kind_t *kind, vlog_node_t *dt)
 {
    // { attribute_instance } [ tf_port_direction ] [ var ]
    //    data_type_or_implicit [ port_identifier { variable_dimension }
@@ -3466,12 +4137,17 @@ static vlog_node_t p_tf_port_item(void)
 
    skip_over_attributes();
 
-   if (scan(tINPUT, tOUTPUT, tINOUT))
-      vlog_set_subkind(v, p_tf_port_direction());
-   else
-      vlog_set_subkind(v, V_PORT_INPUT);
+   if (scan(tINPUT, tOUTPUT, tINOUT)) {
+      *kind = p_tf_port_direction();
+      *dt = p_data_type_or_implicit();
+   }
+   else if (peek() != tID)
+      *dt = p_data_type_or_implicit();
+   else if (*dt == NULL)
+      *dt = p_implicit_data_type();
 
-   vlog_set_type(v, p_data_type_or_implicit());
+   vlog_set_subkind(v, *kind);
+   vlog_set_type(v, *dt);
 
    if (peek() == tID) {
       vlog_set_ident(v, p_identifier());
@@ -3490,8 +4166,10 @@ static void p_tf_port_list(vlog_node_t tf)
 
    BEGIN("task or function port list");
 
+   v_port_kind_t kind = V_PORT_INPUT;
+   vlog_node_t dt = NULL;
    do {
-      vlog_node_t v = p_tf_port_item();
+      vlog_node_t v = p_tf_port_item(&kind, &dt);
       vlog_add_port(tf, v);
 
       if (vlog_has_ident(v))  // Ignore unnamed ports
@@ -3550,6 +4228,7 @@ static void p_tf_item_declaration(vlog_node_t tf)
    switch (peek()) {
    case tINPUT:
    case tOUTPUT:
+   case tINOUT:
    case tCONST:
       p_tf_port_declaration(tf);
       break;
@@ -3577,6 +4256,9 @@ static void p_task_body_declaration(vlog_node_t task)
    vlog_symtab_put(symtab, task);
 
    vlog_symtab_push(symtab, task);
+
+   const vlog_kind_t old_param_kind = param_kind;
+   param_kind = V_LOCALPARAM;
 
    if (optional(tLPAREN)) {
       if (peek() != tRPAREN)
@@ -3619,6 +4301,7 @@ static void p_task_body_declaration(vlog_node_t task)
    }
 
    vlog_symtab_pop(symtab);
+   param_kind = old_param_kind;
 }
 
 static void p_lifetime(void)
@@ -3702,11 +4385,15 @@ static void p_function_body_declaration(vlog_node_t func)
 
    ident_t id = p_identifier();
    vlog_set_ident(func, id);
+   vlog_set_ident2(func, vlog_symtab_qualified(symtab));
    vlog_set_loc(func, &state.last_loc);
 
    vlog_symtab_put(symtab, func);
 
    vlog_symtab_push(symtab, func);
+
+   const vlog_kind_t old_param_kind = param_kind;
+   param_kind = V_LOCALPARAM;
 
    if (optional(tLPAREN)) {
       if (peek() != tRPAREN)
@@ -3749,6 +4436,7 @@ static void p_function_body_declaration(vlog_node_t func)
    }
 
    vlog_symtab_pop(symtab);
+   param_kind = old_param_kind;
 }
 
 static vlog_node_t p_function_declaration(void)
@@ -3824,7 +4512,7 @@ static void p_parameter_declaration(vlog_node_t mod)
    p_list_of_param_assignments(mod, dt, param_kind);
 }
 
-static void p_local_parameter_declaration(vlog_node_t mod)
+static void p_local_parameter_declaration(vlog_node_t parent)
 {
    // localparam data_type_or_implicit list_of_param_assignments
 
@@ -3833,7 +4521,7 @@ static void p_local_parameter_declaration(vlog_node_t mod)
    consume(tLOCALPARAM);
 
    vlog_node_t dt = p_data_type_or_implicit();
-   p_list_of_param_assignments(mod, dt, V_LOCALPARAM);
+   p_list_of_param_assignments(parent, dt, V_LOCALPARAM);
 }
 
 static void p_class_property(vlog_node_t parent)
@@ -3844,16 +4532,17 @@ static void p_class_property(vlog_node_t parent)
 
    BEGIN("class property");
 
-   p_data_declaration(parent);
+   p_data_declaration(parent, V_VAR_DECL);
 }
 
-static void p_class_constructor_arg(vlog_node_t parent)
+static void p_class_constructor_arg(vlog_node_t parent, v_port_kind_t *kind,
+                                    vlog_node_t *dt)
 {
    // tf_port_item | default
 
    BEGIN("class constructor argument");
 
-   vlog_node_t v = p_tf_port_item();
+   vlog_node_t v = p_tf_port_item(kind, dt);
    vlog_symtab_put(symtab, v);
    vlog_add_param(parent, v);
 }
@@ -3864,8 +4553,10 @@ static void p_class_constructor_arg_list(vlog_node_t parent)
 
    BEGIN("class constructor argument list");
 
+   v_port_kind_t kind = V_PORT_INPUT;
+   vlog_node_t dt = NULL;
    do {
-      p_class_constructor_arg(parent);
+      p_class_constructor_arg(parent, &kind, &dt);
    } while (optional(tCOMMA));
 }
 
@@ -4081,7 +4772,16 @@ static void p_block_item_declaration(vlog_node_t parent)
    case tLOGIC:
    case tSHORTINT:
    case tTIME:
-      p_data_declaration(parent);
+   case tID:
+      p_data_declaration(parent, V_LOCAL_DECL);
+      break;
+   case tLOCALPARAM:
+      p_local_parameter_declaration(parent);
+      consume(tSEMI);
+      break;
+   case tPARAMETER:
+      p_parameter_declaration(parent);
+      consume(tSEMI);
       break;
    default:
       should_not_reach_here();
@@ -4136,7 +4836,7 @@ static void p_package_or_generate_item_declaration(vlog_node_t parent)
    case tBYTE:
    case tSTRINGK:
    case tIMPORT:
-      p_data_declaration(parent);
+      p_data_declaration(parent, V_VAR_DECL);
       break;
    case tTASK:
       vlog_add_decl(parent, p_task_declaration());
@@ -4238,11 +4938,12 @@ static vlog_node_t p_generate_block(void)
 
    BEGIN("generate block");
 
-   vlog_node_t b = vlog_new(V_BLOCK);
+   vlog_node_t b = vlog_new(V_GEN_BLOCK);
 
    if (scan(tID, tBEGIN)) {
+      ident_t label = NULL;
       if (peek() == tID) {
-         vlog_set_ident(b, p_identifier());
+         vlog_set_ident(b, (label = p_identifier()));
          consume(tCOLON);
       }
 
@@ -4250,12 +4951,15 @@ static vlog_node_t p_generate_block(void)
 
       if (optional(tCOLON)) {
          ident_t name = p_identifier();
-         if (vlog_has_ident(b))    // 1800-2023 section 9.3.5
+         if (label != NULL)    // 1800-2023 section 9.3.5
             parse_error(&state.last_loc, "cannot specify both a label and a "
                         "name for the same block");
          else
-            vlog_set_ident(b, name);
+            vlog_set_ident(b, (label = name));
       }
+
+      if (!vlog_has_ident(b))
+         vlog_set_ident(b, default_label("genblk"));
 
       vlog_symtab_push(symtab, b);
 
@@ -4268,18 +4972,17 @@ static vlog_node_t p_generate_block(void)
 
       if (optional(tCOLON)) {
          ident_t name = p_identifier();
-         if (!vlog_has_ident(b))
+         if (label == NULL)
             parse_error(&state.last_loc, "block does not have a label");
-         else if (name != vlog_ident(b))
-            parse_error(&state.last_loc, "'%s' does not match label '%s'",
-                        istr(name), istr(vlog_ident(b)));
+         else if (name != label)
+            parse_error(&state.last_loc, "%pQ does not match label %pQ",
+                        name, label);
       }
    }
-   else
-      p_generate_item(b);
-
-   if (!vlog_has_ident(b))
+   else {
       vlog_set_ident(b, default_label("genblk"));
+      p_generate_item(b);
+   }
 
    vlog_set_loc(b, CURRENT_LOC);
    return b;
@@ -4422,16 +5125,31 @@ static vlog_node_t p_conditional_generate_construct(void)
    }
 }
 
-static vlog_node_t p_genvar_initialization(void)
+static vlog_node_t p_genvar_initialization(vlog_node_t *var)
 {
    // [ genvar ] genvar_identifier = constant_expression
 
    BEGIN("genvar initialization");
 
+   ident_t id;
+   if (optional(tGENVAR)) {
+      vlog_node_t dt = make_integer_atom_type(DT_INTEGER);
+      vlog_set_flags(dt, VLOG_F_SIGNED);
+
+      *var = vlog_new(V_GENVAR_DECL);
+      vlog_set_ident(*var, (id = p_identifier()));
+      vlog_set_type(*var, dt);
+      vlog_set_loc(*var, &state.last_loc);
+
+      vlog_symtab_put(symtab, *var);
+   }
+   else
+      id = p_identifier();
+
    vlog_node_t v = vlog_new(V_FOR_INIT);
 
    vlog_node_t ref = vlog_new(V_REF);
-   vlog_set_ident(ref, p_identifier());
+   vlog_set_ident(ref, id);
    vlog_set_loc(ref, &state.last_loc);
 
    vlog_symtab_lookup(symtab, ref);
@@ -4495,7 +5213,7 @@ static vlog_node_t p_genvar_iteration(void)
    return v;
 }
 
-static vlog_node_t p_loop_generate_construct(void)
+static void p_loop_generate_construct(vlog_node_t parent)
 {
    // for ( genvar_initialization ; genvar_expression ; genvar_iteration )
    //   generate_block
@@ -4507,9 +5225,10 @@ static vlog_node_t p_loop_generate_construct(void)
 
    vlog_node_t v = vlog_new(V_FOR_GENERATE);
 
-   vlog_symtab_push(symtab, v);
+   vlog_symtab_push(symtab, NULL);
 
-   vlog_set_left(v, p_genvar_initialization());
+   vlog_node_t var = NULL;
+   vlog_set_left(v, p_genvar_initialization(&var));
 
    consume(tSEMI);
 
@@ -4521,12 +5240,172 @@ static vlog_node_t p_loop_generate_construct(void)
 
    consume(tRPAREN);
 
-   vlog_add_stmt(v, p_generate_block());
+   vlog_node_t b = p_generate_block();
+   vlog_add_stmt(v, b);
 
    vlog_symtab_pop(symtab);
 
    vlog_set_loc(v, CURRENT_LOC);
+   vlog_add_stmt(parent, v);
+
+   if (var != NULL) {
+      // Genvar must be allocated in parent context
+      ident_t prefixed = ident_prefix(vlog_ident(b), vlog_ident(var), '.');
+      vlog_set_ident(var, prefixed);
+      vlog_add_decl(parent, var);
+   }
+}
+
+static vlog_node_t p_property_spec(void)
+{
+   // [ clocking_event ] [ disable iff ( expression_or_dist ) ] property_expr
+
+   BEGIN("property spec");
+
+   return p_property_expr();
+}
+
+static void p_action_block(vlog_node_t parent)
+{
+   // statement_or_null | [ statement ] else statement_or_null
+
+   BEGIN("action block");
+
+   vlog_node_t then =  NULL;
+   if (peek() != tELSE) {
+      then = p_statement_or_null();
+      if (then != NULL) {
+         vlog_node_t c0 = vlog_new(V_COND);
+         vlog_add_stmt(c0, then);
+
+         vlog_add_cond(parent, c0);
+      }
+   }
+
+   if (optional(tELSE)) {
+      if (then == NULL) {
+         vlog_node_t c0 = vlog_new(V_COND);
+         vlog_add_cond(parent, c0);
+      }
+
+      vlog_node_t c1 = vlog_new(V_COND);
+      vlog_add_cond(parent, c1);
+
+      vlog_node_t stmt = p_statement_or_null();
+      if (stmt != NULL)
+         vlog_add_stmt(c1, stmt);
+   }
+}
+
+static vlog_node_t p_assert_property_statement(ident_t label)
+{
+   // assert property ( property_spec ) action_block
+
+   BEGIN("assert property statement");
+
+   consume(tASSERT);
+   consume(tPROPERTY);
+   consume(tLPAREN);
+
+   vlog_node_t v = vlog_new(V_ASSERT);
+   vlog_set_ident(v, label);
+   vlog_set_value(v, p_property_spec());
+
+   consume(tRPAREN);
+
+   p_action_block(v);
+
+   vlog_set_loc(v, CURRENT_LOC);
    return v;
+}
+
+static vlog_node_t p_assume_property_statement(ident_t label)
+{
+   // assume property ( property_spec ) action_block
+
+   BEGIN("assume property statement");
+
+   consume(tASSUME);
+   consume(tPROPERTY);
+   consume(tLPAREN);
+
+   vlog_node_t v = vlog_new(V_ASSUME);
+   vlog_set_ident(v, label);
+   vlog_set_value(v, p_property_spec());
+
+   consume(tRPAREN);
+
+   p_action_block(v);
+
+   vlog_set_loc(v, CURRENT_LOC);
+   return v;
+}
+
+static vlog_node_t p_cover_property_statement(ident_t label)
+{
+   // cover property ( property_spec ) statement_or_null
+
+   BEGIN("cover property statement");
+
+   consume(tCOVER);
+   consume(tPROPERTY);
+   consume(tLPAREN);
+
+   vlog_node_t v = vlog_new(V_ASSUME);
+   vlog_set_ident(v, label);
+   vlog_set_value(v, p_property_spec());
+
+   consume(tRPAREN);
+
+   p_action_block(v);
+
+   vlog_set_loc(v, CURRENT_LOC);
+   return v;
+}
+
+static vlog_node_t p_concurrent_assertion_statement(ident_t label)
+{
+   // assert_property_statement | assume_property_statement
+   //   | cover_property_statement | cover_sequence_statement
+   //   | restrict_property_statement
+
+   BEGIN("concurrent assertion statement");
+
+   switch (peek()) {
+   case tASSERT:
+      return p_assert_property_statement(label);
+   case tASSUME:
+      return p_assume_property_statement(label);
+   case tCOVER:
+      return p_cover_property_statement(label);
+   default:
+      should_not_reach_here();
+   }
+}
+
+static vlog_node_t p_concurrent_assertion_item(void)
+{
+   // [ block_identifier : ] concurrent_assertion_statement
+   //    | checker_instantiation
+
+   BEGIN("concurrent assertion item");
+
+   ident_t label = NULL;
+   if (optional(tID)) {
+      label = state.last_lval.ident;
+      consume(tCOLON);
+   }
+
+   return p_concurrent_assertion_statement(label);
+}
+
+static vlog_node_t p_assertion_item(void)
+{
+   // concurrent_assertion_item | deferred_immediate_assertion_item
+
+   BEGIN("assertion item");
+
+   return p_concurrent_assertion_item();
 }
 
 static void p_module_common_item(vlog_node_t mod)
@@ -4579,7 +5458,6 @@ static void p_module_common_item(vlog_node_t mod)
    case tLOCALPARAM:
    case tPARAMETER:
    case tEVENT:
-   case tID:
    case tGENVAR:
    case tVAR:
    case tLOGIC:
@@ -4595,7 +5473,7 @@ static void p_module_common_item(vlog_node_t mod)
       p_continuous_assign(mod);
       break;
    case tFOR:
-      vlog_add_stmt(mod, p_loop_generate_construct());
+      p_loop_generate_construct(mod);
       break;
    case tIF:
    case tCASE:
@@ -4604,6 +5482,25 @@ static void p_module_common_item(vlog_node_t mod)
    case tFINAL:
       vlog_add_stmt(mod, p_final_construct());
       break;
+   case tASSERT:
+   case tASSUME:
+   case tCOVER:
+      vlog_add_stmt(mod, p_assertion_item());
+      break;
+   case tID:
+      {
+         bool is_assert = false;
+         if (peek_nth(2) == tCOLON) {
+            const token_t tok3 = peek_nth(3);
+            is_assert = tok3 == tASSERT || tok3 == tASSUME || tok3 == tCOVER;
+         }
+
+         if (is_assert)
+            vlog_add_stmt(mod, p_assertion_item());
+         else
+            p_module_or_generate_item_declaration(mod);
+      }
+      break;
    default:
       one_of(tALWAYS, tALWAYSCOMB, tALWAYSFF, tALWAYSLATCH, tWIRE, tUWIRE,
              tSUPPLY0, tSUPPLY1, tTRI, tTRI0, tTRI1, tTRIAND, tTRIOR, tTRIREG,
@@ -4611,7 +5508,7 @@ static void p_module_common_item(vlog_node_t mod)
              tSVINT, tINTEGER, tSVREAL, tSHORTREAL, tREALTIME, tTIME, tTASK,
              tFUNCTION, tPARAMETER, tLOCALPARAM, tEVENT, tID, tGENVAR, tVAR,
              tLOGIC, tBIT, tSHORTINT, tLONGINT, tBYTE, tSTRINGK, tIMPORT,
-             tASSIGN, tFOR, tIF, tCASE, tFINAL);
+             tASSIGN, tFOR, tIF, tCASE, tFINAL, tASSERT, tASSUME, tCOVER);
       drop_tokens_until(&state, tSEMI);
    }
 }
@@ -5069,7 +5966,7 @@ static void p_path_delay_expression(void)
 
    BEGIN("path delay expression");
 
-   (void)p_constant_expression();
+   (void)p_constant_mintypmax_expression();
 }
 
 static void p_list_of_path_delay_expressions(void)
@@ -5106,6 +6003,8 @@ static vlog_node_t p_specify_terminal_descriptor(void)
    vlog_node_t v = vlog_new(V_REF);
    vlog_set_ident(v, p_identifier());
    vlog_set_loc(v, CURRENT_LOC);
+
+   vlog_symtab_lookup(symtab, v);
 
    if (optional(tLSQUARE)) {
       (void)p_constant_range_expression();
@@ -5377,16 +6276,27 @@ static vlog_node_t p_path_declaration(void)
    return NULL;
 }
 
-static void p_timing_check_event_control(void)
+static vlog_node_t p_timing_check_event_control(void)
 {
    // posedge | negedge | edge | edge_control_specifier
 
    BEGIN("timing check event control");
 
-   one_of(tPOSEDGE, tNEGEDGE, tEDGE);
+   vlog_node_t v = vlog_new(V_EVENT);
+
+   if (optional(tPOSEDGE))
+      vlog_set_subkind(v, V_EVENT_POSEDGE);
+   else if (optional(tNEGEDGE))
+      vlog_set_subkind(v, V_EVENT_NEGEDGE);
+   else if (optional(tEDGE))
+      vlog_set_subkind(v, V_EVENT_EDGE);
+   else
+      vlog_set_subkind(v, V_EVENT_LEVEL);
+
+   return v;
 }
 
-static void p_scalar_timing_check_condition(void)
+static vlog_node_t p_scalar_timing_check_condition(void)
 {
    //    expression
    // | ~ expression
@@ -5397,10 +6307,10 @@ static void p_scalar_timing_check_condition(void)
 
    BEGIN("scalar timing check condition")
 
-   p_expression();
+   return p_expression();
 }
 
-static void p_timing_check_condition(void)
+static vlog_node_t p_timing_check_condition(void)
 {
    //     scalar_timing_check_condition
    // | ( scalar_timing_check_condition )
@@ -5408,11 +6318,12 @@ static void p_timing_check_condition(void)
    BEGIN("timing check condition");
 
    if (optional(tLPAREN)) {
-      p_scalar_timing_check_condition();
+      vlog_node_t cond = p_scalar_timing_check_condition();
       consume(tRPAREN);
+      return cond;
    }
    else
-      p_scalar_timing_check_condition();
+      return p_scalar_timing_check_condition();
 }
 
 static vlog_node_t p_timing_check_event(void)
@@ -5422,15 +6333,21 @@ static vlog_node_t p_timing_check_event(void)
 
    BEGIN("timing check event");
 
-   if (scan(tEDGE, tPOSEDGE, tNEGEDGE))
-      p_timing_check_event_control();
+   vlog_node_t v = vlog_new(V_TCHECK_EVENT);
 
-   (void)p_specify_terminal_descriptor();
+   if (scan(tPOSEDGE, tNEGEDGE, tEDGE)) {
+      vlog_node_t v_e = p_timing_check_event_control();
+      vlog_set_value(v_e, p_specify_terminal_descriptor());
+      vlog_set_loc(v_e, CURRENT_LOC);
+      vlog_add_param(v, v_e);
+   }
+   else
+      vlog_add_param(v, p_specify_terminal_descriptor());
 
    if (optional(tTRPLAMP))
-      p_timing_check_condition();
+      vlog_add_param(v, p_timing_check_condition());
 
-   return NULL;
+   return v;
 }
 
 static vlog_node_t p_controlled_timing_check_event(void)
@@ -5460,18 +6377,25 @@ static vlog_node_t p_setup_or_hold_timing_check(void)
 
    BEGIN("setup/hold timing check");
 
-   one_of(tDLRSETUP, tDLRHOLD);
+   vlog_tcheck_kind_t subkind;
+   switch (one_of(tDLRSETUP, tDLRHOLD)) {
+   case tDLRSETUP:
+      subkind = V_TCHECK_SETUP;
+      break;
+   default:
+      subkind = V_TCHECK_HOLD;
+      break;
+   }
    consume(tLPAREN);
 
-   (void)p_timing_check_event();
+   vlog_node_t v = vlog_new(V_TCHECK);
+   vlog_set_subkind(v, subkind);
 
+   vlog_add_param(v, p_timing_check_event());
    consume(tCOMMA);
-
-   (void)p_timing_check_event();
-
+   vlog_add_param(v, p_timing_check_event());
    consume(tCOMMA);
-
-   (void)p_expression();
+   vlog_add_param(v, p_expression());
 
    if (optional(tCOMMA)) {
       if (peek() == tID)
@@ -5481,7 +6405,9 @@ static vlog_node_t p_setup_or_hold_timing_check(void)
    consume(tRPAREN);
    consume(tSEMI);
 
-   return NULL;
+   vlog_set_loc(v, CURRENT_LOC);
+
+   return v;
 }
 
 static vlog_node_t p_recovery_or_removal_timing_check(void)
@@ -5494,18 +6420,29 @@ static vlog_node_t p_recovery_or_removal_timing_check(void)
 
    BEGIN("recovery/removal timing check");
 
-   one_of(tDLRRECOVERY, tDLRREMOVAL);
+   vlog_tcheck_kind_t subkind;
+   switch (one_of(tDLRRECOVERY, tDLRREMOVAL)) {
+   case tDLRRECOVERY:
+      subkind = V_TCHECK_RECOVERY;
+      break;
+   default:
+      subkind = V_TCHECK_REMOVAL;
+      break;
+   }
    consume(tLPAREN);
 
-   (void)p_timing_check_event();
+   vlog_node_t v = vlog_new(V_TCHECK);
+   vlog_set_subkind(v, subkind);
+
+   vlog_add_param(v, p_timing_check_event());
 
    consume(tCOMMA);
 
-   (void)p_timing_check_event();
+   vlog_add_param(v, p_timing_check_event());
 
    consume(tCOMMA);
 
-   (void)p_expression();
+   vlog_add_param(v, p_expression());
 
    if (optional(tCOMMA)) {
       if (peek() == tID)
@@ -5515,7 +6452,9 @@ static vlog_node_t p_recovery_or_removal_timing_check(void)
    consume(tRPAREN);
    consume(tSEMI);
 
-   return NULL;
+   vlog_set_loc(v, CURRENT_LOC);
+
+   return v;
 }
 
 static vlog_node_t p_width_timing_check(void)
@@ -5685,16 +6624,20 @@ static vlog_node_t p_pulse_control_specparam(void)
    vlog_node_t v = vlog_new(V_SPECPARAM);
 
    consume(tPATHPULSE);
-
    consume(tEQ);
-   consume(tLPAREN);
 
-   vlog_set_value(v, p_constant_mintypmax_expression());
+   if (optional(tLPAREN)) {
+      vlog_set_value(v, p_constant_mintypmax_expression());
 
-   if (optional(tCOMMA))
-      (void)p_constant_mintypmax_expression();
+      if (optional(tCOMMA))
+         (void)p_constant_mintypmax_expression();
 
-   consume(tRPAREN);
+      consume(tRPAREN);
+   }
+   else {
+      // Accepted by other simulators and present in Xilinx models
+      vlog_set_value(v, p_constant_mintypmax_expression());
+   }
 
    vlog_set_loc(v, CURRENT_LOC);
    return v;
@@ -5774,7 +6717,12 @@ static void p_specify_item(vlog_node_t parent)
    case tDLRRECREM:
    case tDLRWIDTH:
    case tDLRPERIOD:
-      (void)p_system_timing_check();
+      {
+         vlog_node_t tcheck = p_system_timing_check();
+         // TODO: Remove once all timing checks are supported.
+         if (tcheck != NULL)
+            vlog_add_stmt(parent, tcheck);
+      }
       break;
    default:
       one_of(tSPECPARAM, tLPAREN, tIF, tIFNONE, tDLRSETUP, tDLRHOLD,
@@ -6122,6 +7070,9 @@ static void p_module_or_generate_item(vlog_node_t mod)
    case tSTRINGK:
    case tIMPORT:
    case tFINAL:
+   case tASSERT:
+   case tASSUME:
+   case tCOVER:
       p_module_common_item(mod);
       break;
    case tPULLDOWN:
@@ -6150,14 +7101,22 @@ static void p_module_or_generate_item(vlog_node_t mod)
       p_parameter_override(mod);
       break;
    case tID:
-      {
-         vlog_node_t ref = peek_reference();
-         if (ref == NULL)
-            p_module_or_udp_instantiation(mod);
-         else
-            p_module_common_item(mod);
+      if (peek_nth(2) == tCOLON) {
+         p_module_common_item(mod);
+         break;
       }
-      break;
+      else {
+         vlog_node_t ref = peek_reference();
+         if (ref == NULL) {
+            p_module_or_udp_instantiation(mod);
+            break;
+         }
+         else if (is_data_type(ref) || peek_nth(2) == tID) {
+            p_module_common_item(mod);
+            break;
+         }
+      }
+      // Fall-through
    default:
       expect(tALWAYS, tALWAYSCOMB, tALWAYSFF, tALWAYSLATCH, tWIRE, tUWIRE,
              tSUPPLY0, tSUPPLY1, tTRI,  tTRI0, tTRI1, tTRIAND, tTRIOR, tTRIREG,
@@ -6165,9 +7124,9 @@ static void p_module_or_generate_item(vlog_node_t mod)
              tINITIAL, tTYPEDEF, tENUM, tSVINT, tINTEGER, tSVREAL, tSHORTREAL,
              tREALTIME, tTIME, tTASK, tFUNCTION, tLOCALPARAM, tPARAMETER, tIF,
              tFOR, tEVENT, tGENVAR, tVAR, tLOGIC, tBIT, tSHORTINT, tLONGINT,
-             tBYTE, tSTRINGK, tIMPORT, tFINAL, tPULLDOWN, tPULLUP, tID, tAND,
-             tNAND, tOR, tNOR, tXOR, tXNOR, tNOT, tBUF, tBUFIF0, tBUFIF1,
-             tNOTIF0, tNOTIF1, tDEFPARAM, tID);
+             tBYTE, tSTRINGK, tIMPORT, tFINAL, tASSERT, tASSUME, tCOVER,
+             tPULLDOWN, tPULLUP, tID, tAND, tNAND, tOR, tNOR, tXOR, tXNOR,
+             tNOT, tBUF, tBUFIF0, tBUFIF1, tNOTIF0, tNOTIF1, tDEFPARAM, tID);
       drop_tokens_until(&state, tSEMI);
    }
 }
@@ -6188,13 +7147,24 @@ static void p_generate_region(vlog_node_t mod)
       // This is non-standard but seen in some legacy code
       consume(tCOLON);
 
-      vlog_node_t b = vlog_new(V_BLOCK);
-      vlog_set_ident(b, p_identifier());
+      ident_t label = p_identifier();
+
+      vlog_node_t b = vlog_new(V_GEN_BLOCK);
+      vlog_set_ident(b, label);
 
       while (not_at_token(tEND))
          p_generate_item(b);
 
       consume(tEND);
+
+      if (optional(tCOLON)) {
+         ident_t name = p_identifier();
+         if (label == NULL)
+            parse_error(&state.last_loc, "block does not have a label");
+         else if (name != label)
+            parse_error(&state.last_loc, "%pQ does not match label %pQ",
+                        name, label);
+      }
 
       vlog_set_loc(b, CURRENT_LOC);
       vlog_add_stmt(mod, b);
@@ -6286,6 +7256,9 @@ static void p_non_port_module_item(vlog_node_t mod)
    case tIMPORT:
    case tDEFPARAM:
    case tFINAL:
+   case tASSERT:
+   case tASSUME:
+   case tCOVER:
       p_module_or_generate_item(mod);
       break;
    case tSPECIFY:
@@ -6303,7 +7276,8 @@ static void p_non_port_module_item(vlog_node_t mod)
              tENUM, tSVINT, tINTEGER, tSVREAL, tSHORTREAL, tREALTIME, tTIME,
              tTASK, tFUNCTION, tLOCALPARAM, tPARAMETER, tEVENT, tIF, tFOR,
              tGENVAR, tVAR, tLOGIC, tBIT, tSHORTINT, tLONGINT, tBYTE, tSTRINGK,
-             tIMPORT, tDEFPARAM, tFINAL, tSPECIFY, tGENERATE);
+             tIMPORT, tDEFPARAM, tFINAL, tASSERT, tASSUME, tCOVER, tSPECIFY,
+             tGENERATE);
       drop_tokens_until(&state, tSEMI);
    }
 }
@@ -6349,6 +7323,9 @@ static void p_ansi_port_declaration(vlog_node_t mod, v_port_kind_t *kind,
    vlog_set_ident2(v, ext);
    vlog_set_type(v, *dt);
    vlog_set_loc(v, &state.last_loc);
+
+   while (peek() == tLSQUARE)
+      vlog_add_range(v, p_unpacked_dimension());
 
    if (optional(tEQ))
       vlog_set_value(v, p_constant_expression());
@@ -7246,6 +8223,11 @@ static void p_non_port_program_item(vlog_node_t parent)
    case tINITIAL:
       vlog_add_stmt(parent, p_initial_construct());
       break;
+   case tASSERT:
+   case tASSUME:
+   case tCOVER:
+      vlog_add_stmt(parent, p_concurrent_assertion_item());
+      break;
    default:
       p_module_or_generate_item_declaration(parent);
       break;
@@ -7308,6 +8290,7 @@ static vlog_node_t p_description(void)
    case tCLASS:
    case tTYPEDEF:
    case tIMPORT:
+   case tPARAMETER:
       {
          vlog_node_t v = vlog_new(V_NAMESPACE);
 
@@ -7319,14 +8302,14 @@ static vlog_node_t p_description(void)
 
          do {
             p_package_item(v);
-         } while (scan(tCLASS, tTYPEDEF, tIMPORT));
+         } while (scan(tCLASS, tTYPEDEF, tIMPORT, tPARAMETER));
 
          vlog_set_loc(v, CURRENT_LOC);
          return v;
       }
    default:
       expect(tPRIMITIVE, tMODULE, tPACKAGE, tPROGRAM, tCLASS, tTYPEDEF,
-             tIMPORT);
+             tIMPORT, tPARAMETER);
       return NULL;
    }
 }
@@ -7339,25 +8322,37 @@ static void p_timescale_compiler_directive(void)
 
    consume(tTIMESCALE);
 
-   uint64_t unit_value = 1;
-   if (consume(tUNSNUM))
-      unit_value = atoll(state.last_lval.str);
-
-   const char *unit_name = "fs";
-   if (consume(tID))
-      unit_name = istr(state.last_lval.ident);
+   uint64_t unit_value = 1, unit_scale = 1;
+   switch (peek()) {
+   case tUNSNUM:
+      unit_value = p_unsigned_integer();
+      unit_scale = p_time_unit();
+      break;
+   case tTIMELIT:
+      p_time_literal(&unit_value, &unit_scale);
+      break;
+   default:
+      one_of(tUNSNUM, tTIMELIT);
+      break;
+   }
 
    consume(tOVER);
 
-   uint64_t prec_value = 1;
-   if (consume(tUNSNUM))
-      prec_value = atoll(state.last_lval.str);
+   uint64_t prec_value = 1, prec_scale = 1;
+   switch (peek()) {
+   case tUNSNUM:
+      prec_value = p_unsigned_integer();
+      prec_scale = p_time_unit();
+      break;
+   case tTIMELIT:
+      p_time_literal(&prec_value, &prec_scale);
+      break;
+   default:
+      one_of(tUNSNUM, tTIMELIT);
+      break;
+   }
 
-   const char *prec_name = "fs";
-   if (consume(tID))
-      prec_name = istr(state.last_lval.ident);
-
-   set_timescale(unit_value, unit_name, prec_value, prec_name, CURRENT_LOC);
+   set_timescale(unit_value, unit_scale, prec_value, prec_scale);
 }
 
 static void p_defaultnettype_compiler_directive(void)
@@ -7538,6 +8533,7 @@ void reset_verilog_parser(void)
    implicit_kind = V_NET_WIRE;
    last_attr = NULL;
    next_namespace = 1;
+   time_scale = 1;
 
    if (symtab != NULL) {
       vlog_symtab_free(symtab);

@@ -1,5 +1,5 @@
 //
-//  Copyright (C) 2022-2025  Nick Gasson
+//  Copyright (C) 2022-2026  Nick Gasson
 //
 //  This program is free software: you can redistribute it and/or modify
 //  it under the terms of the GNU General Public License as published by
@@ -24,6 +24,7 @@ typedef enum {
    V_EVENT_LEVEL,
    V_EVENT_POSEDGE,
    V_EVENT_NEGEDGE,
+   V_EVENT_EDGE
 } v_event_kind_t;
 
 typedef enum {
@@ -67,6 +68,13 @@ typedef enum {
 } vlog_case_kind_t;
 
 typedef enum {
+   V_TCHECK_SETUP,
+   V_TCHECK_HOLD,
+   V_TCHECK_RECOVERY,
+   V_TCHECK_REMOVAL
+} vlog_tcheck_kind_t;
+
+typedef enum {
    V_MODULE,
    V_PORT_DECL,
    V_REF,
@@ -75,7 +83,7 @@ typedef enum {
    V_NBASSIGN,
    V_EVENT,
    V_INITIAL,
-   V_BLOCK,
+   V_SEQ_BLOCK,
    V_SYS_TCALL,
    V_STRING,
    V_NUMBER,
@@ -165,6 +173,18 @@ typedef enum {
    V_DEFPARAM,
    V_PORT_MAP,
    V_FINAL,
+   V_LOCAL_DECL,
+   V_GEN_BLOCK,
+   V_METHOD_CALL,
+   V_MOD_REF,
+   V_ASSERT,
+   V_ASSUME,
+   V_COVER,
+   V_PATTERN_EXPR,
+   V_PATTERN_ITEM,
+   V_CAST,
+   V_TCHECK,
+   V_TCHECK_EVENT,
 
    V_LAST_NODE_KIND
 } vlog_kind_t;
@@ -301,9 +321,45 @@ typedef enum {
 } vlog_udp_symbol_t;
 
 typedef enum {
+   V_SYSTF_NONE,
+   V_SYSTF_SIGNED,
+   V_SYSTF_UNSIGNED,
+   V_SYSTF_CLOG2,
+   V_SYSTF_SQRT,
+   V_SYSTF_BITS,
+   V_SYSTF_RTOI,
+   V_SYSTF_CEIL,
+   V_SYSTF_FLOOR,
+} vlog_systf_t;
+
+typedef enum {
+   V_METHOD_USER,
+   V_METHOD_ENUM_FIRST,
+   V_METHOD_ENUM_LAST,
+   V_METHOD_ENUM_NEXT,
+   V_METHOD_ENUM_PREV,
+   V_METHOD_ENUM_NUM,
+   V_METHOD_ENUM_NAME,
+} vlog_method_t;
+
+typedef enum {
+   V_CAST_TYPE,
+   V_CAST_WIDTH,
+   V_CAST_SIGN,
+   V_CAST_STRING,
+   V_CAST_CONST,
+} vlog_cast_t;
+
+typedef enum {
    VLOG_F_SIGNED = (1 << 0),
    VLOG_F_PACKED = (1 << 1),
+   VLOG_F_CONST  = (1 << 2),
+   VLOG_F_FOLDED = (1 << 3),
 } vlog_flags_t;
+
+typedef enum {
+   VLOG_GF_HIER_REF = (1 << 0),
+} vlog_global_flags_t;
 
 #define STRENGTH1(st) (((st) >> 5) & 7)
 #define STRENGTH0(st) (((st) >> 2) & 7)
@@ -379,6 +435,7 @@ bool vlog_has_type(vlog_node_t v);
 void vlog_set_type(vlog_node_t v, vlog_node_t t);
 
 vlog_node_t vlog_left(vlog_node_t v);
+bool vlog_has_left(vlog_node_t v);
 void vlog_set_left(vlog_node_t v, vlog_node_t e);
 
 vlog_node_t vlog_right(vlog_node_t v);
@@ -398,6 +455,7 @@ void vlog_set_ival(vlog_node_t v, int64_t i);
 
 vlog_flags_t vlog_flags(vlog_node_t t);
 void vlog_set_flags(vlog_node_t v, vlog_flags_t mask);
+void vlog_clear_flags(vlog_node_t v, vlog_flags_t mask);
 
 typedef void (*vlog_visit_fn_t)(vlog_node_t v, void *context);
 
@@ -405,9 +463,11 @@ void vlog_visit(vlog_node_t v, vlog_visit_fn_t fn, void *context);
 void vlog_visit_only(vlog_node_t v, vlog_visit_fn_t fn, void *context,
                      vlog_kind_t kind);
 
-typedef vlog_node_t (*vlog_rewrite_fn_t)(vlog_node_t t, void *context);
+typedef void (*vlog_rewrite_pre_fn_t)(vlog_node_t t, void *context);
+typedef vlog_node_t (*vlog_rewrite_post_fn_t)(vlog_node_t t, void *context);
 
-vlog_node_t vlog_rewrite(vlog_node_t v, vlog_rewrite_fn_t fn, void *context);
+vlog_node_t vlog_rewrite(vlog_node_t v, vlog_rewrite_pre_fn_t pre_fn,
+                         vlog_rewrite_post_fn_t post_fn, void *context);
 
 typedef bool (*vlog_copy_pred_t)(vlog_node_t, void *);
 
@@ -415,5 +475,8 @@ vlog_node_t vlog_copy(vlog_node_t v, vlog_copy_pred_t pred, void *ctx);
 
 object_t *vlog_to_object(vlog_node_t v);
 vlog_node_t vlog_from_object(object_t *obj);
+
+vlog_global_flags_t vlog_global_flags(vlog_node_t v);
+void vlog_set_global_flags(vlog_node_t v, vlog_global_flags_t flags);
 
 #endif  // _VLOG_NODE_H

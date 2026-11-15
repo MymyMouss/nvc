@@ -24,6 +24,7 @@
 #include "type.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -62,6 +63,7 @@ typedef struct _printf_arg {
    size_t          len;
    fmt_fn_t        fn;
    printf_value_t  value;
+   int             width;
    int             precision;
 } printf_arg_t;
 
@@ -118,6 +120,19 @@ static int format_ident(ostream_t *os, printf_state_t *state, printf_arg_t *arg)
    return ostream_write(os, istr(id), ident_len(id));
 }
 
+static int format_ident_quoted(ostream_t *os, printf_state_t *state,
+                               printf_arg_t *arg)
+{
+   ident_t id = arg->value.p;
+   int nchars = 0;
+
+   nchars += ostream_putc(os, '\'');
+   nchars += ostream_write(os, istr(id), ident_len(id));
+   nchars += ostream_putc(os, '\'');
+
+   return nchars;
+}
+
 static int format_ident_toupper(ostream_t *os, printf_state_t *state,
                                 printf_arg_t *arg)
 {
@@ -126,16 +141,47 @@ static int format_ident_toupper(ostream_t *os, printf_state_t *state,
    const char *str = istr(id);
    int nchars = 0;
    char chunk[32];
+   char quote = '\0';
 
    for (int i = 0; i < len; i += sizeof(chunk)) {
       const int tocopy = MIN(sizeof(chunk), len - i);
-      for (int j = 0; j < tocopy; j++)
-         chunk[j] = toupper_iso88591(str[i + j]);
+      for (int j = 0; j < tocopy; j++) {
+         if (quote)
+            chunk[j] = str[i + j];
+         else
+            chunk[j] = toupper_iso88591(str[i + j]);
+
+         if (str[i + j] == quote)
+            quote = false;
+         else if (str[i + j] == '\'' || str[i + j] == '\"')
+            quote = str[i + j];
+      }
 
       nchars += ostream_write(os, chunk, tocopy);
    }
 
    return nchars;
+}
+
+static int format_one_type(ostream_t *os, type_t type, const type_t *others,
+                           size_t nothers)
+{
+   const char *full1 = istr(type_ident(type));
+   const char *dot1  = strrchr(full1, '.');
+   const char *tail1 = dot1 ? dot1 + 1 : full1;
+
+   for (int i = 0; i < nothers; i++) {
+      if (type_has_ident(others[i])) {
+         const char *full2 = istr(type_ident(others[i]));
+         const char *dot2  = strrchr(full2, '.');
+         const char *tail2 = dot2 ? dot2 + 1 : full2;
+
+         if (strcmp(tail1, tail2) == 0)
+            return ostream_puts(os, full1);
+      }
+   }
+
+   return ostream_puts(os, tail1);
 }
 
 static int format_type(ostream_t *os, printf_state_t *state, printf_arg_t *arg)
@@ -145,13 +191,51 @@ static int format_type(ostream_t *os, printf_state_t *state, printf_arg_t *arg)
    // Print a fully qualified name if there is another type in the
    // argument list with the same simple name
 
-   for (int i = 0; i < state->nargs; i++) {
-      const printf_arg_t *other = &(state->args[i]);
-      if (other != arg && other->fn == format_type)
-         return ostream_puts(os, type_pp2(type, other->value.p));
+   const type_kind_t kind = type_kind(type);
+   if (kind == T_GENERIC && !type_has_ident(type))
+      return ostream_puts(os, "(an anonymous type)");
+
+   type_t others[8];
+   int count = 0;
+
+   for (const printf_arg_t *it = state->args;
+        it != state->args + state->nargs; it++) {
+      if (it != arg && it->fn == format_type && count < ARRAY_LEN(others))
+         others[count++] = it->value.p;
    }
 
-   return ostream_puts(os, type_pp(type));
+   if (kind == T_SIGNATURE) {
+      int nchars = 0;
+
+      if (type_has_ident(type)) {
+         nchars += ostream_puts(os, istr(type_ident(type)));
+         nchars += ostream_putc(os, ' ');
+      }
+
+      nchars += ostream_putc(os, '[');
+
+      const int nparams = type_params(type);
+      for (int i = 0; i < nparams; i++) {
+         nchars += ostream_puts(os, i == 0 ? "" : ", ");
+         nchars += format_one_type(os, type_param(type, i), others, count);
+      }
+
+      if (type_has_result(type)) {
+         nchars += ostream_puts(os, nparams > 0 ? " " : "");
+         nchars += ostream_puts(os, "return ");
+         nchars += format_one_type(os, type_result(type), others, count);
+      }
+
+      return nchars + ostream_putc(os, ']');
+   }
+   else
+      return format_one_type(os, type, others, count);
+}
+
+static int format_class(ostream_t *os, printf_state_t *state, printf_arg_t *arg)
+{
+   tree_t t = arg->value.p;
+   return ostream_puts(os, class_str(class_of(t)));
 }
 
 static int format_object_kind(ostream_t *os, printf_state_t *state,
@@ -216,7 +300,9 @@ static fmt_fn_t get_pointer_formatter(char ch)
    switch (ch) {
    case 'i': return format_ident;
    case 'I': return format_ident_toupper;
+   case 'Q': return format_ident_quoted;
    case 'T': return format_type;
+   case 'C': return format_class;
    case 'K': return format_object_kind;
    case 'M': return format_mir;
    default: return NULL;
@@ -232,8 +318,11 @@ static int ansi_escape(ostream_t *os, printf_state_t *state, const char **fmt)
       (*fmt)++;
    } while (**fmt != '\0' && **fmt != '$');
 
-   if (**fmt == '\0')
-      return ostream_write(os, start, *fmt - start);
+   if (**fmt == '\0') {
+      int nchars = ostream_putc(os, '$');
+      nchars += printf_interpret(os, state, start + 1, *fmt);
+      return nchars;
+   }
 
    const char *end = *fmt;
    (*fmt)++;   // Advance past final '$'
@@ -349,7 +438,9 @@ static int format_i(ostream_t *os, printf_state_t *s, printf_arg_t *arg)
 
 static int format_f(ostream_t *os, printf_state_t *s, printf_arg_t *arg)
 {
-   if (arg->precision != INT_MIN)
+   if (arg->width != INT_MIN)
+      return delegate(os, s, arg, arg->width, arg->precision, arg->value.f);
+   else if (arg->precision != INT_MIN)
       return delegate(os, s, arg, arg->precision, arg->value.f);
    else
       return delegate(os, s, arg, arg->value.f);
@@ -357,7 +448,9 @@ static int format_f(ostream_t *os, printf_state_t *s, printf_arg_t *arg)
 
 static int format_s(ostream_t *os, printf_state_t *s, printf_arg_t *arg)
 {
-   if (arg->precision != INT_MIN)
+   if (arg->width != INT_MIN)
+      return delegate(os, s, arg, arg->width, arg->precision, arg->value.p);
+   else if (arg->precision != INT_MIN)
       return delegate(os, s, arg, arg->precision, arg->value.p);
    else
       return delegate(os, s, arg, arg->value.p);
@@ -416,7 +509,11 @@ int nvc_vfprintf(ostream_t *os, const char *fmt, va_list ap)
          break;
       }
 
-      printf_arg_t arg = { .start = p, .precision = INT_MIN };
+      printf_arg_t arg = {
+         .start = p,
+         .width = INT_MIN,
+         .precision = INT_MIN,
+      };
       bool z_mod = false;
       int l_mod = 0;
    again:
@@ -433,6 +530,7 @@ int nvc_vfprintf(ostream_t *os, const char *fmt, va_list ap)
       case '0'...'9':
          goto again;
       case '*':
+         arg.width = arg.precision;
          arg.precision = va_arg(ap, int);
          goto again;
       case 'd':
@@ -531,6 +629,8 @@ static void init_terminal_ostream(ostream_t *os, FILE *f)
    os->context = f;
    os->flags = 0;
 
+   const int saved_errno = errno;
+
    if (isatty(fileno(f))) {
       os->charset = utf8_terminal() ? CHARSET_UTF8 : CHARSET_ISO88591;
       os->flags |= OS_TERMINAL;
@@ -540,6 +640,8 @@ static void init_terminal_ostream(ostream_t *os, FILE *f)
 
    if (color_terminal())
       os->flags |= OS_COLOR;
+
+   errno = saved_errno;
 }
 
 ostream_t *nvc_stdout(void)
@@ -556,10 +658,13 @@ ostream_t *nvc_stderr(void)
    return &os;
 }
 
-char *color_asprintf(const char *fmt, ...)
+char *nvc_asprintf(const char *fmt, ...)
 {
    LOCAL_TEXT_BUF tb = tb_new();
-   ostream_t os = { tb_ostream_write, tb, CHARSET_ISO88591, OS_COLOR };
+   ostream_t os = { tb_ostream_write, tb, CHARSET_ISO88591 };
+
+   if (color_terminal())
+      os.flags |= OS_COLOR;
 
    va_list ap;
    va_start(ap, fmt);

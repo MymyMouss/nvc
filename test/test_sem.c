@@ -732,8 +732,12 @@ START_TEST(test_conv)
       { 32, "conversion only allowed between closely related types" },
       { 33, "type of value B does not match type of target A" },
       { 35, "conversion only allowed between closely related types" },
+      {  0, "element type INTEGER does not match E" },
       { 42, "conversion only allowed between closely related types" },
+      {  0, "first index type of K is E which is not closely related to "
+         "the first index type of A" },
       { 43, "conversion only allowed between closely related types" },
+      {  0, "A has 1 dimension but A2 has 2" },
       { 44, "unexpected , while parsing type conversion" },
       { 44, "conversion only allowed between closely related types" },
       { -1, NULL }
@@ -3442,6 +3446,8 @@ START_TEST(test_lcs2016_75)
 
    const error_t expect[] = {
       { 38, "conversion only allowed between closely related types" },
+      {  0, "field Z in record type T_REC3 has no matching element in "
+         "type T_REC1" },
       { -1, NULL }
    };
    expect_errors(expect);
@@ -4054,6 +4060,49 @@ START_TEST(test_lcs2016_99)
 }
 END_TEST
 
+START_TEST(test_issue1594)
+{
+   set_standard(STD_19);
+
+   input_from_file(TESTDIR "/sem/issue1594.vhd");
+
+   parse_and_check(T_PACKAGE, T_ENTITY, T_ARCH, T_ENTITY, T_ARCH);
+
+   fail_if_errors();
+}
+END_TEST
+
+START_TEST(test_issue1683)
+{
+   set_standard(STD_08);
+
+   input_from_file(TESTDIR "/sem/issue1683.vhd");
+
+   parse_and_check(T_PACKAGE, T_ENTITY, T_ARCH);
+
+   fail_if_errors();
+}
+END_TEST
+
+START_TEST(test_issue1686)
+{
+   set_standard(STD_08);
+
+   input_from_file(TESTDIR "/sem/issue1686.vhd");
+
+   const error_t expect[] = {
+      { 10, "named association not allowed in indexed name" },
+      { 23, "prefix of attribute LEFT with dimension is not an array" },
+      { -1, NULL }
+   };
+   expect_errors(expect);
+
+   parse_and_check(T_ENTITY, T_ARCH, T_ENTITY, T_ARCH);
+
+   check_expected_errors();
+}
+END_TEST
+
 Suite *get_sem_tests(void)
 {
    Suite *s = suite_create("sem");
@@ -4244,6 +4293,9 @@ Suite *get_sem_tests(void)
    tcase_add_test(tc_core, test_issue1290);
    tcase_add_test(tc_core, test_issue1329);
    tcase_add_test(tc_core, test_lcs2016_99);
+   tcase_add_test(tc_core, test_issue1594);
+   tcase_add_test(tc_core, test_issue1683);
+   tcase_add_test(tc_core, test_issue1686);
    suite_add_tcase(s, tc_core);
 
    return s;

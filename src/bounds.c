@@ -83,7 +83,7 @@ static void add_hint_string(diag_t *d, tree_t where)
    default: return;
    }
 
-   diag_printf(d, " for %s %s", what, istr(tree_ident(where)));
+   diag_printf(d, " for %s %pI", what, tree_ident(where));
 }
 
 static void bounds_check_scalar(tree_t value, type_t type, tree_t hint)
@@ -114,7 +114,7 @@ static void bounds_check_scalar(tree_t value, type_t type, tree_t hint)
       diag_t *d = diag_new(DIAG_ERROR, tree_loc(value));
       diag_printf(d, "value ");
       to_string(diag_text_buf(d), type, folded);
-      diag_printf(d, " outside of %s range ", type_pp(type));
+      diag_printf(d, " outside of %pT range ", type);
       format_type_range(d, type, tree_subkind(r), low, high);
 
       if (hint != NULL)
@@ -151,6 +151,75 @@ static void bounds_check_array(tree_t value, type_t type, tree_t hint)
             add_hint_string(d, hint);
 
          diag_emit(d);
+      }
+   }
+}
+
+static void bounds_check_predef_op(tree_t t)
+{
+   tree_t decl = tree_ref(t);
+   bool is_equality;
+
+   const subprogram_kind_t kind = tree_subkind(decl);
+   switch (kind) {
+   case S_ARRAY_EQ:
+   case S_ARRAY_NEQ:
+      // Warn if calling the predefined array equality operators and the
+      // left and right hand sides have different lengths as this always
+      // returns FALSE
+      is_equality = true;
+      break;
+
+   case S_IEEE_LOGICAL:
+   case S_ARRAY_AND:
+   case S_ARRAY_OR:
+   case S_ARRAY_XOR:
+   case S_ARRAY_NAND:
+   case S_ARRAY_NOR:
+   case S_ARRAY_XNOR:
+      // Logical operators require operands of the same length.
+      is_equality = false;
+      break;
+
+   default:
+      return;
+   }
+
+   assert(tree_params(t) == 2);
+
+   type_t ltype = tree_type(tree_value(tree_param(t, 0)));
+   type_t rtype = tree_type(tree_value(tree_param(t, 1)));
+
+   const int ndims = dimension_of(ltype);
+   for (int i = 0; i < ndims; i++) {
+      tree_t left_r = range_of(ltype, i);
+      tree_t right_r = range_of(rtype, i);
+
+      int64_t left_len;
+      if (!folded_length(left_r, &left_len))
+         continue;
+
+      int64_t right_len;
+      if (!folded_length(right_r, &right_len))
+         continue;
+
+      if (left_len != right_len) {
+         diag_t *d;
+         d = diag_new(DIAG_WARN, tree_loc(t));
+         if (is_equality) {
+            diag_printf(d, "call to predefined operator %pI always returns %s",
+                        tree_ident(t), kind == S_ARRAY_EQ ? "FALSE" : "TRUE");
+         }
+         else {
+            diag_printf(d, "arguments in call to %soperator %pI have "
+                        "different lengths",
+                        kind != S_IEEE_LOGICAL ? "predefined " : "",
+                        tree_ident(t));
+         }
+         diag_hint(d, tree_loc(t), "left length is %"PRIi64" but right "
+                   "length is %"PRIi64, left_len, right_len);
+         diag_emit(d);
+         break;
       }
    }
 }
@@ -213,7 +282,7 @@ static tree_t bounds_check_call_args(tree_t t)
                if (ndims > 1)
                   diag_printf(d, " for dimension %d", j + 1);
                diag_printf(d, " does not match formal length %"PRIi64
-                           " for parameter %s", f_len, istr(tree_ident(port)));
+                           " for parameter %pI", f_len, tree_ident(port));
                diag_emit(d);
             }
          }
@@ -225,39 +294,8 @@ static tree_t bounds_check_call_args(tree_t t)
    if (tree_kind(decl) == T_GENERIC_DECL)
       return t;
 
-   const subprogram_kind_t kind = tree_subkind(decl);
-   if (known_arg_length && (kind == S_ARRAY_EQ || kind == S_ARRAY_NEQ)) {
-      // Warn if calling the predefined array equality operators and the
-      // left and right hand sides have different lengths as this always
-      // returns FALSE
-
-      type_t ltype = tree_type(tree_value(tree_param(t, 0)));
-      type_t rtype = tree_type(tree_value(tree_param(t, 1)));
-
-      const int ndims = dimension_of(ltype);
-      for (int i = 0; i < ndims; i++) {
-         tree_t left_r = range_of(ltype, i);
-         tree_t right_r = range_of(rtype, i);
-
-         int64_t left_len;
-         if (!folded_length(left_r, &left_len))
-            continue;
-
-         int64_t right_len;
-         if (!folded_length(right_r, &right_len))
-            continue;
-
-         if (left_len != right_len) {
-            diag_t *d = diag_new(DIAG_WARN, tree_loc(t));
-            diag_printf(d, "call to predefined operator %s always returns "
-                        "FALSE", istr(tree_ident(t)));
-            diag_hint(d, tree_loc(t), "left length is %"PRIi64" but right "
-                      "length is %"PRIi64, left_len, right_len);
-            diag_emit(d);
-            break;
-         }
-      }
-   }
+   if (known_arg_length)
+      bounds_check_predef_op(t);
 
    return t;
 }
@@ -282,7 +320,7 @@ static bool bounds_check_index(tree_t index, type_t type, range_kind_t kind,
       diag_t *d = diag_new(DIAG_ERROR, tree_loc(index));
       diag_printf(d, "%s index ", what);
       to_string(diag_text_buf(d), type, folded);
-      diag_printf(d, " outside of %s range ", type_pp(type));
+      diag_printf(d, " outside of %pT range ", type);
       format_type_range(d, type, kind, low, high);
       diag_emit(d);
 
@@ -326,10 +364,10 @@ static void bounds_check_array_ref(tree_t t)
                diag_t *d = diag_new(DIAG_ERROR, tree_loc(pvalue));
                diag_printf(d, "array");
                if (tree_kind(value) == T_REF)
-                  diag_printf(d, " %s", istr(tree_ident(value)));
+                  diag_printf(d, " %pI", tree_ident(value));
                diag_printf(d, " index ");
                to_string(diag_text_buf(d), index_type, ivalue);
-               diag_printf(d, " outside of %s range ", type_pp(index_type));
+               diag_printf(d, " outside of %pT range ", index_type);
                format_type_range(d, index_type, dir, low, high);
 
                diag_emit(d);
@@ -407,10 +445,10 @@ static void bounds_check_array_slice(tree_t t)
       diag_t *d = diag_new(DIAG_ERROR, tree_loc(r));
       diag_printf(d, "array");
       if (tree_kind(value) == T_REF)
-         diag_printf(d, " %s", istr(tree_ident(value)));
+         diag_printf(d, " %pI", tree_ident(value));
       diag_printf(d, " slice %s index ", error);
       to_string(diag_text_buf(d), index_type, folded);
-      diag_printf(d, " outside of %s range ", type_pp(index_type));
+      diag_printf(d, " outside of %pT range ", index_type);
       format_type_range(d, index_type, dir, blow, bhigh);
 
       diag_emit(d);
@@ -466,12 +504,12 @@ static void bounds_cover_choice(interval_t **isp, tree_t t, type_t type,
          else if (type_is_enum(type)) {
             type_t base = type_base_recur(type);
             if (rlow == rhigh)
-               bounds_error(t, "duplicate choice for %s",
-                            istr(tree_ident(type_enum_literal(base, rlow))));
+               bounds_error(t, "duplicate choice for %pI",
+                            tree_ident(type_enum_literal(base, rlow)));
             else
-               bounds_error(t, "duplicate choices for range %s to %s",
-                            istr(tree_ident(type_enum_literal(base, rlow))),
-                            istr(tree_ident(type_enum_literal(base, rhigh))));
+               bounds_error(t, "duplicate choices for range %pI to %pI",
+                            tree_ident(type_enum_literal(base, rlow)),
+                            tree_ident(type_enum_literal(base, rhigh)));
          }
          it->low = MIN(low, it->low);
          it->high = MAX(high, it->high);
@@ -509,7 +547,7 @@ static void report_interval(diag_t *d, type_t type, range_kind_t dir,
          diag_printf(d, "%"PRIi64, low);
       else if (type_is_enum(type)) {
          type_t base = type_base_recur(type);
-         diag_printf(d, "%s", istr(tree_ident(type_enum_literal(base, low))));
+         diag_printf(d, "%pI", tree_ident(type_enum_literal(base, low)));
       }
    }
    else
@@ -565,10 +603,9 @@ static void bounds_check_missing_choices(tree_t t, type_t type,
    }
 
    if (index_type == NULL)
-      diag_printf(d, " of type %s", type_pp(type));
+      diag_printf(d, " of type %pT", type);
    else
-      diag_printf(d, " of %s with index type %s", type_pp(type),
-                  type_pp(index_type));
+      diag_printf(d, " of %pT with index type %pT", type, index_type);
 
    type_t base = index_type ?: type;
    while (is_anonymous_subtype(base))
@@ -738,9 +775,8 @@ static void bounds_check_aggregate(tree_t t)
          if ((ilow < low || ihigh > high) && known_elem_count) {
             diag_t *d = diag_new(DIAG_ERROR, tree_loc(t));
             diag_printf(d, "expected at most %"PRIi64" positional "
-                        "associations in %s aggregate with index type %s "
-                        "range ", MAX(0, high - low + 1), type_pp(type),
-                        type_pp(index_type));
+                        "associations in %pT aggregate with index type %pT "
+                        "range ", MAX(0, high - low + 1), type, index_type);
             format_type_range(d, index_type, dir, low, high);
             diag_emit(d);
 
@@ -837,16 +873,15 @@ static void bounds_check_index_contraints(type_t type)
 
          if (dim_low < bounds_low)
             bounds_error(dir == RANGE_TO ? tree_left(dim) : tree_right(dim),
-                         "%s index %g violates constraint %s",
+                         "%s index %g violates constraint %pT",
                          dir == RANGE_TO ? "left" : "right",
-                         dim_low, type_pp(cons));
+                         dim_low, cons);
 
          if (dim_high > bounds_high)
             bounds_error(dir == RANGE_TO ? tree_right(dim) : tree_left(dim),
-                         "%s index %g violates constraint %s",
+                         "%s index %g violates constraint %pT",
                          dir == RANGE_TO ? "right" : "left",
-                         dim_high, type_pp(cons));
-
+                         dim_high, cons);
       }
       else {
          int64_t dim_low, bounds_low;
@@ -870,30 +905,30 @@ static void bounds_check_index_contraints(type_t type)
                type_t cons_base = type_base_recur(cons);
                tree_t lit = type_enum_literal(cons_base, (unsigned)dim_low);
                bounds_error(dir == RANGE_TO ? tree_left(dim) : tree_right(dim),
-                            "%s index %s violates constraint %s",
+                            "%s index %pI violates constraint %pT",
                             dir == RANGE_TO ? "left" : "right",
-                            istr(tree_ident(lit)), type_pp(cons));
+                            tree_ident(lit), cons);
             }
 
             if (dim_high > bounds_high) {
                type_t cons_base = type_base_recur(cons);
                tree_t lit = type_enum_literal(cons_base, (unsigned)dim_high);
                bounds_error(dir == RANGE_TO ? tree_right(dim) : tree_left(dim),
-                            "%s index %s violates constraint %s",
+                            "%s index %pI violates constraint %pT",
                             dir == RANGE_TO ? "right" : "left",
-                            istr(tree_ident(lit)), type_pp(cons));
+                            tree_ident(lit), cons);
             }
          }
          else if (dim_high > bounds_high)
             bounds_error(dir == RANGE_TO ? tree_right(dim) : tree_left(dim),
-                         "%s index %"PRIi64" violates constraint %s",
+                         "%s index %"PRIi64" violates constraint %pT",
                          dir == RANGE_TO ? "right" : "left",
-                         dim_high, type_pp(cons));
+                         dim_high, cons);
          else if (dim_low < bounds_low)
             bounds_error(dir == RANGE_TO ? tree_left(dim) : tree_right(dim),
-                         "%s index %"PRIi64" violates constraint %s",
+                         "%s index %"PRIi64" violates constraint %pT",
                          dir == RANGE_TO ? "left" : "right",
-                         dim_low, type_pp(cons));
+                         dim_low, cons);
       }
    }
 }
@@ -960,7 +995,7 @@ static void bounds_check_type_decl(tree_t t)
    else if (type_is_scalar(type)) {
       int64_t low, high;
       if (folded_bounds(range_of(type, 0), &low, &high) && low > high)
-         warn_at(tree_loc(t), "type %s has null range", type_pp(type));
+         warn_at(tree_loc(t), "type %pT has null range", type);
    }
 }
 
@@ -1232,9 +1267,9 @@ static void bounds_check_array_case(tree_t t, type_t type, bool matching)
             diag_printf(d, "%"PRIi64, expect);
          diag_printf(d, " possible values");
 
-         diag_hint(d, loc, "expression has %"PRIi64" elements of type %s, "
+         diag_hint(d, loc, "expression has %"PRIi64" elements of type %pT, "
                    "each of which has %"PRIi64" possible values",
-                   length, type_pp(type_elem(type)), elemsz);
+                   length, type_elem(type), elemsz);
 
          if (!known_length)
             diag_hint(d, NULL, "the case expression subtype is not locally "
@@ -1315,8 +1350,8 @@ static void bounds_check_conv_array(tree_t value, type_t from, type_t to)
          if (to_length != from_length)
             bounds_error(value, "length of type conversion argument %"PRIi64
                          " does not match expected length %"PRIi64
-                         " for constrained array subtype %s",
-                         from_length, to_length, type_pp(to));
+                         " for constrained array subtype %pT",
+                         from_length, to_length, to);
       }
    }
    else if (!to_constrained && from_constrained) {
@@ -1352,10 +1387,10 @@ static void bounds_check_conv_array(tree_t value, type_t from, type_t to)
             diag_t *d = diag_new(DIAG_ERROR, tree_loc(value));
             diag_printf(d, "array ");
             if (tree_kind(value) == T_REF)
-               diag_printf(d, "%s ", istr(tree_ident(value)));
+               diag_printf(d, "%pI ", tree_ident(value));
             diag_printf(d, "%s bound ", error);
             to_string(diag_text_buf(d), index_type, folded);
-            diag_printf(d, " violates %s index constraint ", type_pp(to));
+            diag_printf(d, " violates %pT index constraint ", to);
             format_type_range(d, index_type, tree_subkind(r_to), low, high);
             diag_emit(d);
          }
@@ -1395,8 +1430,8 @@ static void bounds_check_attr_ref(tree_t t)
             if (!folded_int(dim_tree, &dim))
                bounds_error(dim_tree, "dimension is not constant");
             else if (dim < 1 || dim > dimension_of(type))
-               bounds_error(dim_tree, "invalid dimension %"PRIi64" for type %s",
-                            dim, type_pp(type));
+               bounds_error(dim_tree, "invalid dimension %"PRIi64" for "
+                            "type %pT", dim, type);
          }
       }
       break;

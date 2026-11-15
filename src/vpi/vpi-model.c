@@ -639,6 +639,9 @@ static c_operation *build_operation(vlog_node_t v)
       op->subtype = vlog_subkind(v) == V_INCDEC_PLUS
          ? vpiPreIncOp : vpiPreDecOp;
       break;
+   case V_CONCAT:
+      op->subtype = vlog_has_value(v) ? vpiMultiConcatOp : vpiConcatOp;
+      break;
    default:
       break;
    }
@@ -675,7 +678,7 @@ static c_vpiObject *build_expr(vlog_node_t v, c_abstractScope *scope)
          }
 
          // Task and function locals
-         if (vlog_kind(d) == V_VAR_DECL)
+         if (kind == V_VAR_DECL || kind == V_LOCAL_DECL)
             return &(build_operation(v)->expr.object);
 
          fatal_trace("cannot find declaration for %s", istr(vlog_ident(d)));
@@ -686,10 +689,14 @@ static c_vpiObject *build_expr(vlog_node_t v, c_abstractScope *scope)
    case V_EMPTY:
    case V_PREFIX:
    case V_POSTFIX:
+   case V_CONCAT:
    case V_COND_EXPR:
    case V_PART_SELECT:
    case V_BIT_SELECT:   // XXX: check this
    case V_MEMBER_REF:
+   case V_HIER_REF:
+   case V_USER_FCALL:
+   case V_CAST:
       return &(build_operation(v)->expr.object);
    default:
       fatal_trace("cannot build VPI expr for node kind %s",
@@ -781,7 +788,7 @@ static c_abstractScope *cached_scope(tree_t block, rt_scope_t *s)
       case V_INST_BODY:
          as = &(build_module(v, block, s)->scope);
          break;
-      case V_BLOCK:
+      case V_GEN_BLOCK:
          as = &(build_genScope(v, block, s)->scope);
          break;
       default:
@@ -1284,11 +1291,20 @@ vpiHandle vpi_put_value(vpiHandle handle, p_vpi_value value_p,
 
       case vpiIntFunc:
          {
-            assert(value_p->format == vpiIntVal);
-
-            // TODO: mask should be based on result size
-            c->args[0].integer = value_p->value.integer & 0xffffffff;
-            c->args[1].integer = 0;
+            switch (value_p->format) {
+            case vpiIntVal:
+               // TODO: mask should be based on result size
+               c->args[0].integer = value_p->value.integer & 0xffffffff;
+               c->args[1].integer = 0;
+               break;
+            case vpiVectorVal:
+               c->args[0].integer = value_p->value.vector[0].aval;
+               c->args[1].integer = value_p->value.vector[0].bval;
+               break;
+            default:
+               vpi_error(vpiError, &(obj->loc), "unsupported format %d",
+                         value_p->format);
+            }
 
             return NULL;
          }
@@ -1536,10 +1552,13 @@ vpiHandle vpi_bind_foreign(ident_t name, vlog_node_t where)
       return call->handle;
    }
 
-   rt_model_t *m = get_model();
-   rt_scope_t *rs = get_active_scope(m);
-
-   c_abstractScope *scope = cached_scope(rs->where, rs);
+   c_abstractScope *scope = NULL;
+   rt_model_t *m = get_model_or_null();
+   if (m != NULL) {
+      rt_scope_t *rs = get_active_scope(m);
+      if (rs != NULL)
+         scope = cached_scope(rs->where, rs);
+   }
 
    for (int i = 0; i < c->systasks.count; i++) {
       c_vpiObject *obj = from_handle(c->systasks.items[i]);

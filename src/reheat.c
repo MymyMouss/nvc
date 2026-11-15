@@ -74,9 +74,13 @@ static void reheat_block(tree_t b, const reheat_ctx_t *parent)
       vlog_lower_block(ctx.mir, parent->cloned, b);
    }
    else {
-      cover_scope_t *cs = cover_get_scope(ctx.cover, ctx.dotted);
+      cover_obj_t inst = cover_find(ctx.cover, ctx.dotted);
+      cover_obj_t scope = COVER_NULL_OBJ;
+      if (!cover_is_null(inst))
+         scope = cover_get_obj(ctx.cover, inst, COV_ATTR_ROOT);
+
       ctx.lowered = lower_instance(ctx.registry, parent->lowered, ctx.cover,
-                                   cs, b);
+                                   scope, b);
    }
 
    ctx.scope = create_scope(ctx.model, b, parent->scope);
@@ -93,8 +97,6 @@ void reheat(tree_t top, unit_registry_t *ur, mir_context_t *mc,
             cover_data_t *cover, rt_model_t *m)
 {
    assert(tree_kind(top) == T_ELAB);
-
-   unit_registry_set_cover(ur, cover);
 
    rt_scope_t *root = create_scope(m, top, NULL);
 

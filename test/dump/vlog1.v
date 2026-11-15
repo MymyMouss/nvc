@@ -47,6 +47,10 @@ module mod2;
   endfunction // func
   enum byte { a = 5, b } e1;
   reg signed [3:0] s1;
+  tri0 grst = glbl.grst;
+  typedef enum { RED, GREEN, BLUE } t_color;
+  integer      arr[];
+  initial arr = new [5] (p2);
 endmodule // mod2
 
 primitive multiplexer (mux, control, dataA, dataB);
@@ -74,4 +78,20 @@ module mod3;   // Check operator precedence
   assign z = {x, y};
   assign zz = {5{z}};
   final v1 /= 2;
+  genvar i;
+  for (i = 1; i <= 4; i = i + 1) begin
+  end
 endmodule // mod3
+
+module mod4;   // Check specify
+  wire d;
+  wire clk;
+  wire en;
+
+  specify
+    $setup(d, clk, 10);
+    $setup(edge d, clk, 10);
+    $setup(negedge d, posedge clk, 5);
+    $hold(posedge clk &&& en, negedge d &&& en, 3);
+  endspecify
+endmodule // mod4

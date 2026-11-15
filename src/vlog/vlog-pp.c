@@ -40,7 +40,13 @@ struct _ifdef_stack {
    bool           cond;
 };
 
-typedef A(ident_t) arg_list_t;
+typedef struct {
+   ident_t  name;
+   char    *def;
+} macro_arg_t;
+
+typedef A(macro_arg_t) arg_list_t;
+typedef A(loc_t) loc_stack_t;
 
 typedef struct {
    ident_t     name;
@@ -62,12 +68,14 @@ static bool           emit_locs;
 static pp_mode_t      mode;
 static parse_state_t  state;
 static hash_t        *macro_args = NULL;
+static loc_stack_t    macro_locs;
 
 extern loc_t yylloc;
 extern yylval_t yylval;
 extern scan_buf_t yyspan;
 
 static void p_block_of_text(void);
+static void p_expression(text_buf_t *tb);
 static void p_text_macro_usage(void);
 
 static void free_macros(void)
@@ -77,6 +85,8 @@ static void free_macros(void)
    for (hash_iter_t it = HASH_BEGIN; hash_iter(macros, &it, &key, &value); ) {
       macro_t *m = value;
       tb_free(m->text);
+      for (int i = 0; i < m->args.count; i++)
+         free(m->args.items[i].def);
       ACLEAR(m->args);
       free(m);
    }
@@ -185,6 +195,39 @@ static token_t lex_directive(scan_buf_t buf)
    return make_token(tMACROUSAGE, buf, (yylval_t){ .span = buf });
 }
 
+static token_t lex_macro_escape(scan_buf_t buf)
+{
+   // Macro string-construction escapes (IEEE 1800-2017 22.5.1)
+
+   char ch;
+   if (!scan_next(&buf, &ch))
+      return tEOF;
+
+   switch (ch) {
+   case '"':
+      return make_token(tMACROQUOTE, buf, (yylval_t){ .span = buf });
+   case '`':
+      return make_token(tMACROJOIN, buf, (yylval_t){ .span = buf });
+   case '\\':
+      {
+         scan_buf_t look = buf;
+         char p2, p3;
+         if (scan_peek(look, &p2) && p2 == '`') {
+            scan_advance(&look);
+            if (scan_peek(look, &p3) && p3 == '"') {
+               scan_advance(&look);
+               return make_token(tMACROESCQUOTE, look,
+                                 (yylval_t){ .span = look });
+            }
+         }
+
+         return make_token(tTEXT, buf, (yylval_t){ .span = buf });
+      }
+   default:
+      should_not_reach_here();
+   }
+}
+
 static token_t lex_whitespace(scan_buf_t buf)
 {
    char ch;
@@ -269,15 +312,8 @@ static token_t lex_text(scan_buf_t buf)
    while (scan_peek(buf, &ch)) {
       switch (ch) {
       case '0'...'9':
-      case 'A'...'F':
-      case 'a'...'f':
-      case 'h': case 'H':
-      case 'o': case 'O':
-      case 's': case 'S':
-      case 'x': case 'X':
-      case 'z': case 'Z': case '?':
-      case '\'': case '_':
-      case '+': case '-': case '*':
+      case '?': case '\'': case '_':
+      case '+': case '-':  case '*':
          scan_advance(&buf);
          continue;
       default:
@@ -355,7 +391,19 @@ static token_t vlogpp_lex(void)
    case '_':
       return lex_identifier(buf);
    case '`':
-      return lex_directive(buf);
+      if (scan_peek(buf, &ch)) {
+         switch (ch) {
+         case 'a'...'z':
+         case 'A'...'Z':
+         case '_':
+            return lex_directive(buf);
+         case '"':
+         case '`':
+         case '\\':
+            return lex_macro_escape(buf);
+         }
+      }
+      return lex_text(buf);
    case ' ':
    case '\t':
       return lex_whitespace(buf);
@@ -363,8 +411,18 @@ static token_t vlogpp_lex(void)
       return make_token(tLPAREN, buf, (yylval_t){ .ch = '(' });
    case ')':
       return make_token(tRPAREN, buf, (yylval_t){ .ch = ')' });
+   case '{':
+      return make_token(tLBRACE, buf, (yylval_t){ .ch = '{' });
+   case '}':
+      return make_token(tRBRACE, buf, (yylval_t){ .ch = '}' });
+   case '[':
+      return make_token(tLSQUARE, buf, (yylval_t){ .ch = '[' });
+   case ']':
+      return make_token(tRSQUARE, buf, (yylval_t){ .ch = ']' });
    case ',':
       return make_token(tCOMMA, buf, (yylval_t){ .ch = ',' });
+   case '=':
+      return make_token(tEQ, buf, (yylval_t){ .ch = '=' });
    case '/':
       if (scan_peek(buf, &ch)) {
          if (ch == '/')
@@ -397,19 +455,31 @@ static ident_t p_identifier(void)
       return error_marker();
 }
 
-static ident_t p_formal_argument(void)
+static macro_arg_t p_formal_argument(void)
 {
    // simple_identifier [ = default_text ]
 
    BEGIN("formal argument");
 
-   optional(tWHITESPACE);
-
-   ident_t name = p_identifier();
+   macro_arg_t arg = {};
 
    optional(tWHITESPACE);
 
-   return name;
+   arg.name = p_identifier();
+
+   optional(tWHITESPACE);
+
+   if (optional(tEQ)) {
+      optional(tWHITESPACE);
+
+      LOCAL_TEXT_BUF tb = tb_new();
+      while (not_at_token(tCOMMA, tRPAREN))
+         p_expression(tb);
+
+      arg.def = tb_claim(tb);
+   }
+
+   return arg;
 }
 
 static void p_list_of_formal_arguments(macro_t *m)
@@ -458,21 +528,29 @@ static void p_text_macro_definition(void)
 
    optional(tWHITESPACE);
 
-   while (not_at_token(tNEWLINE)) {
-      const token_t tok = peek();
+   bool in_block_comment = false;
+   while (in_block_comment || not_at_token(tNEWLINE)) {
+      token_t tok = peek();
       switch (tok) {
       case tTEXT:
       case tWHITESPACE:
       case tID:
       case tMACROUSAGE:
       case tSTRING:
+      case tMACROQUOTE:
+      case tMACROESCQUOTE:
+      case tMACROJOIN:
          consume(tok);
          tb_catn(m->text, state.last_lval.span.ptr, state.last_lval.span.len);
          break;
-      case tNEWLINE:
       case tLPAREN:
       case tRPAREN:
+      case tLBRACE:
+      case tRBRACE:
+      case tLSQUARE:
+      case tRSQUARE:
       case tCOMMA:
+      case tEQ:
          consume(tok);
          tb_append(m->text, state.last_lval.ch);
          break;
@@ -484,16 +562,64 @@ static void p_text_macro_definition(void)
          break;
       case tCOMMENT:
          consume(tok);
-         goto done;
+         if (in_block_comment || mode == PP_C_COMMENT) {
+            tb_catn(m->text, state.last_lval.span.ptr,
+                    state.last_lval.span.len);
+            in_block_comment = mode == PP_C_COMMENT;
+         }
+         break;
+      case tNEWLINE:
+         assert(in_block_comment);
+         consume(tok);
+         tb_append(m->text, '\n');
+         tb_append(output, '\n');
+         break;
       default:
          one_of(tTEXT, tWHITESPACE, tMACROUSAGE);
          break;
       }
    }
- done:
 
    consume(tNEWLINE);
    tb_append(output, '\n');
+}
+
+static void p_inactive_text_macro_definition(void)
+{
+   consume(tDEFINE);
+
+   for (;;) {
+      const token_t tok = peek();
+      switch (tok) {
+      case tEOF:
+         return;
+      case tCONTINUATION:
+         consume(tok);
+         consume(tNEWLINE);
+         tb_append(output, '\n');
+         break;
+      case tNEWLINE:
+         consume(tok);
+         tb_append(output, '\n');
+         if (mode != PP_C_COMMENT)
+            return;
+         break;
+      default:
+         consume(tok);
+         break;
+      }
+   }
+}
+
+static void p_inactive_include_directive(void)
+{
+   consume(tINCLUDE);
+
+   while (not_at_token(tEOF, tNEWLINE))
+      consume(peek());
+
+   if (optional(tNEWLINE))
+      tb_append(output, '\n');
 }
 
 static void p_expression(text_buf_t *tb)
@@ -506,17 +632,24 @@ static void p_expression(text_buf_t *tb)
    // {}, double quotes " ", triple quotes """ """, or an escaped
    // identifier.
 
-   switch (one_of(tTEXT, tLPAREN, tWHITESPACE, tID, tSTRING, tMACROUSAGE,
-                  tCOMMA)) {
+   switch (one_of(tTEXT, tLPAREN, tLBRACE, tLSQUARE, tWHITESPACE, tID,
+                  tSTRING, tMACROUSAGE, tCOMMA, tEQ, tMACROQUOTE,
+                  tMACROESCQUOTE, tMACROJOIN)) {
    case tTEXT:
    case tWHITESPACE:
    case tID:
    case tSTRING:
    case tMACROUSAGE:
+   case tMACROQUOTE:
+   case tMACROESCQUOTE:
+   case tMACROJOIN:
       tb_catn(tb, state.last_lval.span.ptr, state.last_lval.span.len);
       break;
    case tCOMMA:
       tb_append(tb, ',');
+      break;
+   case tEQ:
+      tb_append(tb, '=');
       break;
    case tLPAREN:
       tb_append(tb, '(');
@@ -524,6 +657,20 @@ static void p_expression(text_buf_t *tb)
          p_expression(tb);
       consume(tRPAREN);
       tb_append(tb, ')');
+      break;
+   case tLBRACE:
+      tb_append(tb, '{');
+      while (not_at_token(tRBRACE))
+         p_expression(tb);
+      consume(tRBRACE);
+      tb_append(tb, '}');
+      break;
+   case tLSQUARE:
+      tb_append(tb, '[');
+      while (not_at_token(tRSQUARE))
+         p_expression(tb);
+      consume(tRSQUARE);
+      tb_append(tb, ']');
       break;
    }
 
@@ -544,8 +691,16 @@ static void p_actual_argument(macro_t *m, int pos)
    while (not_at_token(tCOMMA, tRPAREN))
       p_expression(tb);
 
-   if (pos < m->args.count)
-      hash_put(macro_args, m->args.items[pos], tb_claim(tb));
+   if (pos >= m->args.count)
+      return;
+
+   char *buf;
+   if (tb_len(tb) == 0 && m->args.items[pos].def != NULL)
+      buf = xstrdup(m->args.items[pos].def);
+   else
+      buf = tb_claim(tb);
+
+   hash_put(macro_args, m->args.items[pos].name, buf);
 }
 
 static void p_list_of_actual_arguments(macro_t *m)
@@ -559,9 +714,28 @@ static void p_list_of_actual_arguments(macro_t *m)
       p_actual_argument(m, pos++);
    } while (optional(tCOMMA));
 
-   if (pos != m->args.count && !m->error) {
-      error_at(&state.last_loc, "macro '%pi' requires exactly %d arguments",
-               m->name, m->args.count);
+   if (pos < m->args.count && !m->error) {
+      for (int i = pos; i < m->args.count; i++) {
+         if (m->args.items[i].def != NULL) {
+            char *copy = xstrdup(m->args.items[i].def);
+            hash_put(macro_args, m->args.items[i].name, copy);
+         }
+         else {
+            error_at(&state.last_loc, "macro %pQ is missing argument %pQ "
+                     "with no default value", m->name, m->args.items[i].name);
+            m->error = true;
+            break;
+         }
+      }
+   }
+   else if (pos != m->args.count && !m->error) {
+      bool has_def = false;
+      for (int i = pos; i < m->args.count; i++)
+         has_def |= (m->args.items[i].def != NULL);
+
+      error_at(&state.last_loc, "macro %pQ requires %s %d arguments, "
+               "%d were given", m->name, has_def ? "at most" : "exactly",
+               m->args.count, pos);
       m->error = true;
    }
 }
@@ -590,7 +764,7 @@ static void p_text_macro_usage(void)
 
    macro_t *m = hash_get(macros, name);
    if (m == NULL) {
-      warn_at(&yylloc, "macro '%pi' undefined", name);
+      warn_at(&yylloc, "macro %pQ undefined", name);
 
       // Prevent further warnings for this macro name
       macro_t *dummy = xcalloc(sizeof(macro_t));
@@ -611,15 +785,29 @@ static void p_text_macro_usage(void)
       // the input buffer until after the macro is expanded if there are
       // no arguments
       scan_buf_t buf = get_input_buffer();
+
+      bool has_args = false;
       char peek;
-      if (scan_peek(buf, &peek) && peek == '(') {
+      while (scan_peek(buf, &peek)) {
+         if (peek == ' ' || peek == '\t')
+            scan_advance(&buf);   // Skip over whitespace
+         else if (peek == '(') {
+            has_args = true;
+            break;
+         }
+         else
+            break;
+      }
+
+      if (has_args) {
+         optional(tWHITESPACE);
          consume(tLPAREN);
          macro_args = hash_new(16);
          p_list_of_actual_arguments(m);
          consume(tRPAREN);
       }
       else {
-         error_at(&state.last_loc, "macro '%pi' requires arguments", m->name);
+         error_at(&state.last_loc, "macro %pQ requires arguments", m->name);
          m->error = true;
          macro_args = NULL;
       }
@@ -633,11 +821,17 @@ static void p_text_macro_usage(void)
    const char last = outlen > 0 ? tb_get(output)[outlen - 1] : '\0';
    const bool at_boundary = last == '\0' || last == ' '
       || last == '\t' || last == '\n';
+   loc_t loc = state.last_loc;
+   if (loc_invalid_p(&loc) && macro_locs.count > 0)
+      loc = ATOP(macro_locs);
 
-   if (emit_locs && at_boundary)
+   const bool emit_loc = emit_locs && at_boundary && !loc_invalid_p(&loc);
+
+   if (emit_loc)
       tb_printf(output, "\n`__nvc_push \"`%pi\",%d:%d,%d\n", name,
-                yylloc.first_line, yylloc.first_column, yylloc.column_delta);
+                loc.first_line, loc.first_column, loc.column_delta);
 
+   APUSH(macro_locs, loc);
    push_buffer(tb_get(m->text), tb_len(m->text), FILE_INVALID);
 
    while (not_at_token(tEOF))
@@ -657,8 +851,9 @@ static void p_text_macro_usage(void)
    macro_args = old_args;
 
    pop_buffer();
+   APOP(macro_locs);
 
-   if (emit_locs && at_boundary)
+   if (emit_loc)
       tb_printf(output, "\n`__nvc_pop\n");
 }
 
@@ -803,6 +998,11 @@ static void p_include_compiler_directive(void)
       }
    }
 
+   if (ifdefs != NULL && !ifdefs->cond) {
+      free(file_name);
+      return;
+   }
+
    if (emit_locs)
       tb_printf(output, "\n`__nvc_push \"%s\",%d:%d,%d\n", file_name,
                 loc.first_line, loc.first_column, loc.column_delta);
@@ -817,6 +1017,9 @@ static void p_include_compiler_directive(void)
    consume(tEOF);
 
    pop_buffer();
+
+   if (emit_locs)
+      tb_printf(output, "\n`__nvc_pop\n");
 }
 
 static void p_undef_compiler_directive(void)
@@ -841,7 +1044,10 @@ static void p_block_of_text(void)
    const token_t tok = peek();
    switch (tok) {
    case tDEFINE:
-      p_text_macro_definition();
+      if (ifdefs == NULL || ifdefs->cond)
+         p_text_macro_definition();
+      else
+         p_inactive_text_macro_definition();
       break;
    case tMACROUSAGE:
       if (ifdefs == NULL || ifdefs->cond)
@@ -854,14 +1060,21 @@ static void p_block_of_text(void)
       p_conditional_compilation_directive();
       break;
    case tINCLUDE:
-      p_include_compiler_directive();
+      if (ifdefs == NULL || ifdefs->cond)
+         p_include_compiler_directive();
+      else
+         p_inactive_include_directive();
       break;
    case tUNDEF:
-      p_undef_compiler_directive();
+      if (ifdefs == NULL || ifdefs->cond)
+         p_undef_compiler_directive();
+      else
+         consume(tUNDEF);
       break;
    case tUNDEFALL:
       consume(tUNDEFALL);
-      undefall_macro();
+      if (ifdefs == NULL || ifdefs->cond)
+         undefall_macro();
       break;
    case tID:
       if (macro_args != NULL && (ifdefs == NULL || ifdefs->cond)) {
@@ -889,14 +1102,35 @@ static void p_block_of_text(void)
    case tCONTINUATION:
       consume(tCONTINUATION);
       consume(tNEWLINE);
-      tb_cat(output, "\\\n");
+      if (ifdefs == NULL || ifdefs->cond)
+         tb_cat(output, "\\\n");
+      else
+         tb_append(output, '\n');
       break;
    case tLPAREN:
    case tRPAREN:
+   case tLBRACE:
+   case tRBRACE:
+   case tLSQUARE:
+   case tRSQUARE:
    case tCOMMA:
+   case tEQ:
       consume(tok);
       if (ifdefs == NULL || ifdefs->cond)
          tb_append(output, state.last_lval.ch);
+      break;
+   case tMACROQUOTE:
+      consume(tMACROQUOTE);
+      if (ifdefs == NULL || ifdefs->cond)
+         tb_append(output, '"');
+      break;
+   case tMACROESCQUOTE:
+      consume(tMACROESCQUOTE);
+      if (ifdefs == NULL || ifdefs->cond)
+         tb_cat(output, "\\\"");
+      break;
+   case tMACROJOIN:
+      consume(tMACROJOIN);
       break;
    default:
       one_of(tDEFINE, tMACROUSAGE, tIFDEF, tIFNDEF, tINCLUDE, tTEXT,
@@ -927,6 +1161,7 @@ void vlog_preprocess(text_buf_t *tb, bool precise)
 
    assert(ifdefs == NULL);
    assert(macro_args == NULL);
+   assert(macro_locs.count == 0);
 
    emit_locs = precise;
    mode = PP_INITIAL;
@@ -939,6 +1174,7 @@ void vlog_preprocess(text_buf_t *tb, bool precise)
 
    assert(ifdefs == NULL);
    assert(macro_args == NULL);
+   assert(macro_locs.count == 0);
    output = NULL;
 
    if (!opt_get_int(OPT_SINGLE_UNIT))

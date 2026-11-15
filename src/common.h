@@ -50,7 +50,6 @@ unsigned dimension_of(type_t type);
 type_t index_type_of(type_t type, unsigned dim);
 range_kind_t direction_of(type_t type, unsigned dim);
 tree_t range_of(type_t type, unsigned dim);
-int64_t rebase_index(type_t array_type, int dim, int64_t value);
 bool unit_needs_cgen(tree_t t);
 bool package_needs_body(tree_t pack);
 bool is_subprogram(tree_t t);
@@ -94,9 +93,6 @@ type_t calculate_aggregate_subtype(tree_t expr);
 bool can_be_signal(type_t type);
 type_t merge_constraints(type_t to, type_t from);
 
-void analyse_file(const char *file, jit_t *jit, unit_registry_t *ur,
-                  mir_context_t *mc);
-
 void print_syntax(const char *fmt, ...)
    __attribute__((format(printf, 1, 2)));
 void capture_syntax(text_buf_t *tb);
@@ -116,15 +112,6 @@ typedef union {
 } parsed_value_t;
 
 bool parse_value(type_t type, const char *str, parsed_value_t *value);
-
-//
-// Utility typedefs
-//
-
-typedef unsigned (*tree_formals_t)(tree_t t);
-typedef tree_t (*tree_formal_t)(tree_t t, unsigned n);
-typedef unsigned (*tree_actuals_t)(tree_t t);
-typedef tree_t (*tree_actual_t)(tree_t t, unsigned n);
 
 //
 // VHDL standard revisions
@@ -296,6 +283,11 @@ typedef enum {
    W_DLR_SIGNED,
    W_DLR_UNSIGNED,
    W_DLR_CLOG2,
+   W_DLR_SQRT,
+   W_DLR_BITS,
+   W_DLR_RTOI,
+   W_DLR_CEIL,
+   W_DLR_FLOOR,
    W_COUNTERS,
 
    NUM_WELL_KNOWN

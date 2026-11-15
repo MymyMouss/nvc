@@ -29,11 +29,6 @@
 
 #include <assert.h>
 
-#define CANNOT_HANDLE(v) do {                                           \
-      fatal_at(vlog_loc(v), "cannot handle %s in %s" ,                  \
-               vlog_kind_str(vlog_kind(v)), __FUNCTION__);              \
-   } while (0)
-
 typedef struct {
    tree_t  out;
    tree_t  chars[256];
@@ -308,6 +303,7 @@ void vlog_trans(vlog_node_t mod, tree_t out)
       case V_TASK_DECL:
       case V_NET_DECL:
       case V_VAR_DECL:
+      case V_LOCAL_DECL:
       case V_LOCALPARAM:
          trans_generic(&gen, d);
          break;
@@ -321,7 +317,7 @@ void vlog_trans(vlog_node_t mod, tree_t out)
       }
    }
 
-   if (vlog_kind(mod) == V_BLOCK)
+   if (vlog_kind(mod) == V_GEN_BLOCK)
       return;
 
    const int nports = vlog_ports(mod);
@@ -351,6 +347,22 @@ void vlog_trans(vlog_node_t mod, tree_t out)
             tree_set_loc(wrap, vlog_loc(s));
 
             tree_add_stmt(out, wrap);
+         }
+         break;
+      case V_SPECIFY:
+         {
+            int n_stmts = vlog_stmts(s);
+            for (int i = 0; i < n_stmts; i++) {
+               vlog_node_t stmt = vlog_stmt(s, i);
+               if (vlog_kind(stmt) != V_TCHECK)
+                  continue;
+
+               tree_t wrap = tree_new(T_VERILOG);
+               tree_set_vlog(wrap, stmt);
+               tree_set_loc(wrap, vlog_loc(stmt));
+
+               tree_add_stmt(out, wrap);
+            }
          }
          break;
       default:

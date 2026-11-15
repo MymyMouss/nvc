@@ -28,11 +28,12 @@
 #include "phase.h"
 #include "printf.h"
 #include "rt/assert.h"
+#include "rt/defs.h"
 #include "rt/model.h"
 #include "rt/mspace.h"
-#include "rt/rt.h"
 #include "rt/wave.h"
 #include "scan.h"
+#include "sdf/sdf-phase.h"
 #include "tcl/tcl-shell.h"
 #include "thread.h"
 #include "vhpi/vhpi-model.h"
@@ -65,7 +66,7 @@ typedef struct {
    bool             user_set_std;
    vhpi_context_t  *vhpi;
    vpi_context_t   *vpi;
-   const char      *plugins;
+   text_buf_t      *plugins;
    rt_model_t      *model;
    cover_data_t    *cover;
    ident_t          top_level;
@@ -89,6 +90,17 @@ static jit_t *get_jit(cmd_state_t *state);
 static ident_t to_unit_name(const char *str)
 {
    char *name LOCAL = xstrdup(str);
+
+   char *lparen = strchr(name, '(');
+   if (lparen != NULL) {
+      char *rparen = strrchr(lparen + 1, ')');
+      if (rparen == NULL || rparen == lparen + 1 || rparen[1] != '\0')
+         fatal("'%s' is not a valid design unit name", str);
+
+      *lparen = '-';
+      *rparen = '\0';
+   }
+
    for (char *p = name; *p; p++) {
       if (!isalnum_iso88591(*p) && (p == name || (*p != '_' && *p != '-')))
          fatal("'%s' is not a valid design unit name", str);
@@ -160,8 +172,71 @@ static bool parse_warn_option(char *optarg)
    }
 }
 
-static void do_file_list(const char *file, jit_t *jit, unit_registry_t *ur,
-                         mir_context_t *mc)
+static void analyse_file(const char *file, cmd_state_t *state)
+{
+   input_from_file(file);
+
+   switch (source_kind()) {
+   case SOURCE_VHDL:
+      {
+         lib_t work = lib_work();
+         int base_errors = 0;
+         tree_t unit;
+         while (base_errors = error_count(), (unit = parse())) {
+            if (error_count() == base_errors) {
+               lib_put(work, unit);
+
+               simplify_local(unit, state->jit, state->registry, state->mir);
+               bounds_check(unit);
+            }
+            else
+               lib_put_error(work, unit);
+         }
+      }
+      break;
+
+   case SOURCE_VERILOG:
+      {
+         LOCAL_TEXT_BUF tb = tb_new();
+         vlog_preprocess(tb, true);
+
+         file_ref_t file_ref = loc_file_ref(file, NULL);
+         input_from_buffer(tb_get(tb), tb_len(tb), file_ref, SOURCE_VERILOG);
+
+         if (state->vpi == NULL)
+            state->vpi = vpi_context_new();
+
+         lib_t work = lib_work();
+         vlog_node_t module;
+         while ((module = vlog_parse())) {
+            if (error_count() == 0) {
+               vlog_check(module);
+
+               if (error_count() == 0) {
+                  vlog_simp(module);
+                  vlog_fold(module, state->mir, state->jit);
+                  lib_put_vlog(work, module);
+               }
+            }
+         }
+      }
+      break;
+
+   case SOURCE_SDF:
+      {
+         sdf_file_t *sdf_file = sdf_parse(file, 0);
+         progress("analysed SDF file: %s", file);
+
+         if (sdf_file != NULL) {
+            warnf("SDF is not yet supported");
+            sdf_file_free(sdf_file);
+         }
+      }
+      break;
+   }
+}
+
+static void do_file_list(const char *file, cmd_state_t *state)
 {
    FILE *f;
    if (strcmp(file, "-") == 0)
@@ -187,26 +262,40 @@ static void do_file_list(const char *file, jit_t *jit, unit_registry_t *ur,
 
       for (char *p = line; *p;) {
          if (*p == '$') {  // Interpolate environment variable
-            const char *start = ++p;
+            p++;
+            // Check environment variables with braces
+            bool envvar_with_braces = (*p == '{');
+            if (envvar_with_braces) // Skip opening brace
+               p++;
+            const char *start = p;
+
             while (isalnum_iso88591(*p) || *p == '_') p++;
             const char tail = *p;
             *p++ = '\0';
+            if (envvar_with_braces && tail != '}')
+               warnf("missing closing brace for environment variable"
+                     " %s\n", start);
+            else if (!envvar_with_braces && (tail == '}'))
+               warnf("missing opening brace for environment variable"
+                     " %s\n", start);
 
             const char *envvar = getenv(start);
             if (envvar == NULL) {
                warnf("environment variable $%s not set", start);
-               tb_cat(tb, start - 1);
+               tb_cat(tb, start - (envvar_with_braces ? 2 : 1));
             }
             else
                tb_cat(tb, envvar);
 
-            tb_append(tb, tail);
+            // Do not append the closing brace for valid envvars with braces
+            if (envvar == NULL || tail != '}')
+               tb_append(tb, tail);
          }
          else
             tb_append(tb, *p++);
       }
 
-      analyse_file(tb_get(tb), jit, ur, mc);
+      analyse_file(tb_get(tb), state);
    }
 
    free(line);
@@ -334,21 +423,30 @@ static int analyse(int argc, char **argv, cmd_state_t *state)
    if (state->registry == NULL)
       state->registry = unit_registry_new(state->mir);
 
-   jit_t *jit = jit_new(state->registry, state->mir);
+   if (state->model != NULL) {
+      // The model of an earlier elaboration or run lives in the JIT
+      model_free(state->model);
+      state->model = NULL;
+   }
+
+   if (state->jit != NULL)
+      jit_free(state->jit);
+
+   state->jit = jit_new(state->registry, state->mir);
 
    if (state->vhpi != NULL)
       vhpi_run_callbacks(vhpiCbStartOfAnalysis);
 
    if (file_list != NULL)
-      do_file_list(file_list, jit, state->registry, state->mir);
+      do_file_list(file_list, state);
    else if (optind == next_cmd)
       fatal("missing file name");
 
    for (int i = optind; i < next_cmd; i++) {
       if (argv[i][0] == '@')
-         do_file_list(argv[i] + 1, jit, state->registry, state->mir);
+         do_file_list(argv[i] + 1, state);
       else
-         analyse_file(argv[i], jit, state->registry, state->mir);
+         analyse_file(argv[i], state);
    }
 
    if (state->vhpi != NULL)
@@ -357,7 +455,9 @@ static int analyse(int argc, char **argv, cmd_state_t *state)
    if (werror)
       diag_remove_hint_fn(werror_diag_cb, NULL);
 
-   jit_free(jit);
+   jit_free(state->jit);
+   state->jit = NULL;
+
    set_error_limit(0);
 
    if (error_count() > 0)
@@ -558,14 +658,26 @@ static int elaborate(int argc, char **argv, cmd_state_t *state)
       }
    }
 
-   set_top_level(argv, next_cmd, state);
+   const int ntops = next_cmd - optind;
+   if (ntops == 0)
+      fatal("missing top-level unit name");
 
    progress("initialising");
 
-   object_t *obj = lib_get_generic(state->work, state->top_level, NULL);
-   if (obj == NULL)
-      fatal("cannot find unit %s in library %s",
-            istr(state->top_level), istr(lib_name(state->work)));
+   object_t **tops LOCAL = xmalloc_array(ntops, sizeof(object_t *));
+   for (int i = 0; i < ntops; i++) {
+      ident_t name = to_unit_name(argv[optind + i]);
+
+      tops[i] = lib_get_generic(state->work, name, NULL);
+      if (tops[i] == NULL)
+         fatal("cannot find unit %pI in library %pI", name,
+               lib_name(state->work));
+
+      if (i == 0) {
+         state->top_level = name;
+         state->top_level_arg = argv[optind + i];
+      }
+   }
 
    progress("loading top-level unit");
 
@@ -584,7 +696,7 @@ static int elaborate(int argc, char **argv, cmd_state_t *state)
 
    if (sdf_args != NULL) {
       // TODO: Pass min-max spec to underlying sdf_parse somehow
-      analyse_file(sdf_args, NULL, NULL, NULL);
+      analyse_file(sdf_args, state);
    }
 
    if (state->model != NULL) {
@@ -620,13 +732,13 @@ static int elaborate(int argc, char **argv, cmd_state_t *state)
 
    vhpi_run_callbacks(vhpiCbStartOfElaboration);
 
-   tree_t top = elab(obj, state->jit, state->registry, state->mir,
-                     state->cover, NULL, state->model);
+   tree_t e = elab(tops, ntops, state->jit, state->registry, state->mir,
+                   state->cover, NULL, state->model);
 
-   if (top == NULL)
+   if (e == NULL)
       return EXIT_FAILURE;
 
-   lib_put_meta(state->work, top, &meta);
+   lib_put_meta(state->work, e, &meta);
 
    progress("elaborating design");
 
@@ -854,11 +966,11 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       { 0, 0, 0, 0 }
    };
 
-   wave_format_t wave_fmt = WAVE_FORMAT_FST;
-   uint64_t      stop_time = TIME_HIGH;
-   const char   *wave_fname = NULL;
-   const char   *gtkw_fname = NULL;
-   const char   *pli_plugins = NULL;
+   wave_format_t   wave_fmt = WAVE_FORMAT_FST;
+   uint64_t        stop_time = TIME_HIGH;
+   const char     *wave_fname = NULL;
+   const char     *gtkw_fname = NULL;
+   LOCAL_TEXT_BUF  pli_plugins = tb_new();
 
    static bool have_run = false;
    if (have_run)
@@ -928,7 +1040,8 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
          wave_exclude_glob(optarg);
          break;
       case 'l':
-         pli_plugins = optarg;
+         tb_append(pli_plugins, ',');
+         tb_cat(pli_plugins, optarg);
          break;
       case 'x':
          parse_exit_severity(optarg);
@@ -1039,7 +1152,7 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
    if (nplusargs > 0)
       vhpi_set_plusargs(state->vhpi, nplusargs, plusargs);
 
-   if (pli_plugins != NULL || state->plugins != NULL) {
+   if (tb_len(pli_plugins) > 0 || tb_len(state->plugins) > 0) {
       vhpi_context_initialise(state->vhpi, top, state->model, state->jit);
       vpi_context_initialise(state->vpi, top, state->model, state->jit,
                              nplusargs, plusargs);
@@ -1047,8 +1160,8 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
    else if (nplusargs > 0)
       warnf("found plusargs on command line but no VHPI plugin was loaded");
 
-   if (pli_plugins != NULL)
-      vhpi_load_plugins(pli_plugins);
+   if (tb_len(pli_plugins) > 0)
+      vhpi_load_plugins(tb_get(pli_plugins));
 
    set_ctrl_c_handler(ctrl_c_handler, state->model);
 
@@ -1558,6 +1671,9 @@ static int do_cmd(int argc, char **argv, cmd_state_t *state)
    vpi_context_free(state->vpi);
    state->vpi = NULL;
 
+   if (get_vhdl_assert_exit_status() != 0)
+      return EXIT_FAILURE;
+
    argc -= next_cmd - 1;
    argv += next_cmd - 1;
 
@@ -1757,7 +1873,7 @@ static int coverage_cmd(int argc, char **argv, cmd_state_t *state)
             merged = db;
          else {
             cover_merge(merged, db, MERGE_UNION);
-            // TODO: not safe to free db here
+            cover_data_free(db);
          }
       }
       else
@@ -2154,7 +2270,7 @@ static void usage(void)
       { "Commands",
         {
            { "-a [OPTION]... FILE...", "Analyse FILEs into work library" },
-           { "-e [OPTION]... TOP", "Elaborate design unit TOP" },
+           { "-e [OPTION]... TOP...", "Elaborate design unit TOP" },
            { "-r [OPTION]... TOP", "Execute previously elaborated TOP" },
 #ifdef ENABLE_TCL
            { "-i [TOP]", "Launch interactive TCL shell" },
@@ -2533,7 +2649,7 @@ int main(int argc, char **argv)
    opterr = 0;
 
    const char *work_name = "work";
-   cmd_state_t state = {};
+   cmd_state_t state = { .plugins = tb_new() };
 
    const int next_cmd = scan_cmd(1, argc, argv);
    int c, index = 0;
@@ -2586,7 +2702,8 @@ int main(int argc, char **argv)
          parse_stderr_severity(optarg);
          break;
       case 'l':
-         state.plugins = optarg;
+         tb_append(state.plugins, ',');
+         tb_cat(state.plugins, optarg);
          break;
       case 'T':
          opt_set_str(OPT_PLI_TRACE, "1");
@@ -2625,12 +2742,13 @@ int main(int argc, char **argv)
          nplusargs++, optind++;
    }
 
-   if (state.plugins != NULL) {
+   if (tb_len(state.plugins) > 0) {
       state.vhpi = vhpi_context_new();
-      vhpi_load_plugins(state.plugins);
 
       if (nplusargs > 0)
          vhpi_set_plusargs(state.vhpi, nplusargs, plusargs);
+
+      vhpi_load_plugins(tb_get(state.plugins));
    }
    else if (nplusargs > 0)
       warnf("found plusargs on command line but no VHPI plugin was loaded");
@@ -2654,6 +2772,8 @@ int main(int argc, char **argv)
 
    if (state.cover != NULL)
       cover_data_free(state.cover);
+
+   tb_free(state.plugins);
 
    return ret;
 }

@@ -22,15 +22,18 @@
 #include "tree.h"
 
 #define CANNOT_HANDLE(t) do {                                           \
-      fatal_at(tree_loc(t), "cannot handle %s in %s" ,                  \
-               tree_kind_str(tree_kind(t)), __FUNCTION__);              \
+      fatal_at(tree_loc(t), "cannot handle %pK in %s",                  \
+               t, __FUNCTION__);                                        \
    } while (0)
 
 ident_t predef_func_name(type_t type, const char *op);
+void print_signature(type_t type, text_buf_t *tb);
 
 bool vhdl_is_short_circuit(subprogram_kind_t kind);
 bool vhdl_is_logical(subprogram_kind_t kind);
 
 bool vhdl_is_range_attr(tree_t t);
+
+int nested_dimension_of(type_t type);
 
 #endif  // _VHDL_UTIL_H

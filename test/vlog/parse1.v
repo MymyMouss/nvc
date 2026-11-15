@@ -155,9 +155,12 @@ module parse1;
   reg dyn[];
   string str1;
   generate begin : genblk
-  end
+  end : genblk
   endgenerate
   buf (weak0, weak1) g3(x, y);
   tranif1 (x, y, z);
   rtran (x, y);
+  reg s;
+  initial #0 s = 1;  // Not a time literal
+  initial by1 = 8'(si);
 endmodule // parse1

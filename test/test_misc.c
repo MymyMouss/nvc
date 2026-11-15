@@ -1,5 +1,5 @@
 //
-//  Copyright (C) 2021-2024  Nick Gasson
+//  Copyright (C) 2021-2026  Nick Gasson
 //
 //  This program is free software: you can redistribute it and/or modify
 //  it under the terms of the GNU General Public License as published by
@@ -460,6 +460,8 @@ START_TEST(test_printf1)
    do_printf("  42", "%*.u", 4, 42);
    do_printf("          2147483648", "%*."PRIu64, 20, u64);
    do_printf("   1", "%*.f", 4, 1.2523);
+   do_printf("    1.25", "%*.*f", 8, 2, 1.2523);
+   do_printf("     hel", "%*.*s", 8, 3, "hello");
    do_printf(" xx", "%3s", "xx");
    do_printf("ident", "%pi", id);
    do_printf("IDENT", "%pI", id);
@@ -479,6 +481,7 @@ START_TEST(test_printf1)
    do_printf("\033]8;;foo\07bar\033]8;;\07", "$link:%s\07%s$", "foo", "bar");
    do_printf("                                                       "
              "              1 hello", "%70d %s", 1, "hello");
+   do_printf("$ with 5", "$ with %d", 5);
 }
 END_TEST
 
@@ -630,6 +633,38 @@ START_TEST(test_subtract)
    fail_if(mask_test(&m1, 5));
    fail_if(mask_test(&m1, 1));
    fail_unless(mask_test(&m1, 4));
+
+   mask_free(&m1);
+   mask_free(&m2);
+}
+END_TEST
+
+START_TEST(test_ffs)
+{
+   bit_mask_t m1, m2;
+   mask_init(&m1, mask_size[_i]);
+   mask_init(&m2, mask_size[_i]);
+
+   ck_assert_int_eq(mask_ffs(&m1), -1);
+   ck_assert_int_eq(mask_ffs(&m2), -1);
+
+   mask_set(&m1, mask_size[_i] - 1);
+   ck_assert_int_eq(mask_ffs(&m1), mask_size[_i] - 1);
+
+   mask_set(&m1, 5);
+   ck_assert_int_eq(mask_ffs(&m1), 5);
+
+   mask_set(&m2, 0);
+   ck_assert_int_eq(mask_ffs(&m2), 0);
+
+   if (mask_size[_i] > 64) {
+      mask_clearall(&m2);
+      mask_set(&m2, 70);
+      ck_assert_int_eq(mask_ffs(&m2), 70);
+
+      mask_set(&m2, 63);
+      ck_assert_int_eq(mask_ffs(&m2), 63);
+   }
 
    mask_free(&m1);
    mask_free(&m2);
@@ -977,6 +1012,7 @@ Suite *get_misc_tests(void)
    tcase_add_loop_test(tc_mask, test_count_clear, 0, ARRAY_LEN(mask_size));
    tcase_add_loop_test(tc_mask, test_scan_backwards, 0, ARRAY_LEN(mask_size));
    tcase_add_loop_test(tc_mask, test_subtract, 0, ARRAY_LEN(mask_size));
+   tcase_add_loop_test(tc_mask, test_ffs, 0, ARRAY_LEN(mask_size));
    tcase_add_test(tc_mask, test_empty_mask);
    tcase_add_test(tc_mask, test_mask_iter);
    suite_add_tcase(s, tc_mask);

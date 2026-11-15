@@ -19,7 +19,7 @@ IvtestDir = Pathname.new(ARGV[0]).realpath
 TestList = Pathname.new(ARGV[1] || "#{TestDir}/ivtest.list").realpath
 GitRev = IO::popen("git rev-parse --short HEAD").read.chomp
 Tool = ENV['NVC'] ? Pathname.new(ENV['NVC']).realpath.to_s : 'nvc'
-ExpectFails = 1240
+ExpectFails = 1169
 
 ENV['NVC_COLORS'] = 'always'
 
@@ -177,8 +177,8 @@ File.open(TestList).each_line do |line|
     if type == "CE" || type == "CO" then
       cmd = "#{Tool} --work=work:#{workdir}/work -a #{aflags} --no-save #{f}"
     else
-      cmd = "#{Tool} --work=work:#{workdir}/work -a #{aflags} --no-save #{f} " +
-            "-e --jit --no-save #{m} -r"
+      cmd = "#{Tool} --seed=0 --work=work:#{workdir}/work -a #{aflags} " +
+            "--no-save #{f} -e --jit --no-save #{m} -r"
     end
 
     gold = flags[:gold] ? "#{IvtestDir}/gold/#{flags[:gold]}" : nil

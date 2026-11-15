@@ -1,5 +1,5 @@
 //
-//  Copyright (C) 2023-2025  Nick Gasson
+//  Copyright (C) 2023-2026  Nick Gasson
 //
 //  This program is free software: you can redistribute it and/or modify
 //  it under the terms of the GNU General Public License as published by
@@ -16,13 +16,14 @@
 //
 
 #include "util.h"
+#include "array.h"
 #include "cov/cov-api.h"
-#include "cov/cov-data.h"
-#include "cov/cov-priv.h"
+#include "diag.h"
 #include "hash.h"
 #include "ident.h"
 #include "option.h"
 
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -33,10 +34,17 @@
 typedef struct _cobertura_class cobertura_class_t;
 
 typedef struct {
-   unsigned lineno;
-   unsigned hits;
-   bool     branch;
-   unsigned bflags;
+   loc_t       loc;
+   cover_src_t source;
+   unsigned    hits;
+   unsigned    flags;
+   unsigned    hit_flags;
+} cobertura_cond_t;
+
+typedef struct {
+   unsigned            lineno;
+   unsigned            stmt_hits;
+   A(cobertura_cond_t) conds;
 } cobertura_line_t;
 
 typedef struct _cobertura_class {
@@ -49,28 +57,45 @@ typedef struct _cobertura_class {
 } cobertura_class_t;
 
 typedef struct {
-   hash_t            *class_map;
-   cobertura_class_t *classes;
-   const char        *relative;
+   hash_t             *class_map;
+   cobertura_class_t  *classes;
+   const cover_data_t *data;
+   const char         *relative;
 } cobertura_report_t;
 
 static cobertura_class_t *cobertura_get_class(cobertura_report_t *report,
-                                              ident_t name, const loc_t *loc)
+                                              cover_obj_t scope)
 {
-   cobertura_class_t *c = hash_get(report->class_map, name);
-   if (c == NULL) {
-      text_buf_t *tb = tb_new();
-      get_relative_path(tb, report->relative, loc_file_str(loc));
+   cover_obj_t inst = cover_get_obj(report->data, scope, COV_ATTR_INST);
+   ident_t block_name = cover_get_ident(report->data, inst,
+                                        COV_ATTR_BLOCK_NAME);
 
-      c = xcalloc(sizeof(cobertura_class_t));
-      c->name = name;
-      c->file = tb_claim(tb);
-      c->next = report->classes;
+   cobertura_class_t *c = hash_get(report->class_map, block_name);
+   if (c != NULL)
+      return c;
 
-      report->classes = c;
-      hash_put(report->class_map, name, c);
-   }
+   cover_obj_t item0 = cover_at(report->data, scope, COV_REL_ITEMS, 0);
+   cover_obj_t child0 = cover_at(report->data, scope, COV_REL_CHILDREN, 0);
 
+   // For instance scopes location will be in the instantiating file
+   loc_t loc;
+   if (!cover_is_null(item0))
+      loc = cover_get_loc(report->data, item0, COV_ATTR_LOC);
+   else if (!cover_is_null(child0))
+      loc = cover_get_loc(report->data, child0, COV_ATTR_LOC);
+   else
+      loc = cover_get_loc(report->data, scope, COV_ATTR_LOC);
+
+   LOCAL_TEXT_BUF tb = tb_new();
+   get_relative_path(tb, report->relative, loc_file_str(&loc));
+
+   c = xcalloc(sizeof(cobertura_class_t));
+   c->name = block_name;
+   c->file = tb_claim(tb);
+   c->next = report->classes;
+
+   report->classes = c;
+   hash_put(report->class_map, block_name, c);
    return c;
 }
 
@@ -101,35 +126,84 @@ static cobertura_line_t *cobertura_get_line(cobertura_class_t *class,
    return line;
 }
 
-static void cobertura_export_scope(cobertura_report_t *report,
-                                   cobertura_class_t *class,
-                                   cover_scope_t *s)
+static cobertura_cond_t *cobertura_get_cond(cobertura_line_t *line,
+                                            const loc_t *loc,
+                                            cover_src_t source)
 {
-   if (s->block_name != NULL)
-      class = cobertura_get_class(report, s->block_name, &s->loc);
+   for (int i = 0; i < line->conds.count; i++) {
+      cobertura_cond_t *cond = &(line->conds.items[i]);
+      if (cond->source == source && loc_eq(&(cond->loc), loc))
+         return cond;
+   }
 
-   for (int i = 0; i < s->items.count; i++) {
-      const cover_item_t *item = s->items.items[i];
-      cobertura_line_t *l = cobertura_get_line(class, &(item->loc));
+   APUSH(line->conds, ((cobertura_cond_t) {
+      .loc = *loc,
+      .source = source,
+   }));
+   return &ATOP(line->conds);
+}
 
-      for (int j = 0; j < item->consecutive; j++) {
-         switch (item->kind) {
-         case COV_ITEM_STMT:
-            l->hits += item[j].data;
-            break;
-         case COV_ITEM_BRANCH:
-            l->branch = true;
-            if (item[j].data > 0)
-               l->bflags |= item[j].flags;
-            break;
-         default:
-            break;
+static void cobertura_export_scope(cobertura_report_t *report,
+                                   cobertura_class_t *class, cover_obj_t scope)
+{
+   cover_iter_t item_it = cover_begin(report->data, scope, COV_REL_ITEMS);
+   cover_obj_t item;
+   while (cover_next(&item_it, &item)) {
+      loc_t loc = cover_get_loc(report->data, item, COV_ATTR_LOC);
+      cobertura_line_t *l = cobertura_get_line(class, &loc);
+
+      switch (cover_get_kind(report->data, item)) {
+      case COV_ITEM_STMT:
+         {
+            cover_obj_t bin = cover_at(report->data, item, COV_REL_BINS, 0);
+            l->stmt_hits += cover_get_u32(report->data, bin, COV_ATTR_DATA, 0);
          }
+         break;
+      case COV_ITEM_BRANCH:
+         {
+            const cover_src_t source =
+               cover_get_u32(report->data, item, COV_ATTR_SOURCE,
+                             COV_SRC_UNKNOWN);
+            cobertura_cond_t *cond = cobertura_get_cond(l, &loc, source);
+
+            cover_obj_t bins[2];
+            int nbins = cover_rel(report->data, item, COV_REL_BINS, 0, bins, 2);
+            assert(nbins <= ARRAY_LEN(bins));
+
+            for (int j = 0; j < nbins; j++) {
+               uint32_t data = cover_get_u32(report->data, bins[j],
+                                             COV_ATTR_DATA, 0);
+               const unsigned flags =
+                  cover_get_u32(report->data, bins[j], COV_ATTR_FLAGS, 0);
+               cond->hits += data;
+               cond->flags |= flags;
+               if (data > 0)
+                  cond->hit_flags |= flags;
+            }
+         }
+         break;
+      default:
+         break;
       }
    }
 
-   for (int i = 0; i < s->children.count; i++)
-      cobertura_export_scope(report, class, s->children.items[i]);
+   cover_iter_t child_it = cover_begin(report->data, scope, COV_REL_CHILDREN);
+   cover_obj_t child;
+   while (cover_next(&child_it, &child))
+      cobertura_export_scope(report, class, child);
+}
+
+static void cobertura_export_inst(cobertura_report_t *report, cover_obj_t inst)
+{
+   cover_obj_t root = cover_get_obj(report->data, inst, COV_ATTR_ROOT);
+   cobertura_class_t *class = cobertura_get_class(report, root);
+
+   cobertura_export_scope(report, class, root);
+
+   cover_iter_t it = cover_begin(report->data, inst, COV_REL_CHILDREN);
+   cover_obj_t child;
+   while (cover_next(&it, &child))
+      cobertura_export_inst(report, child);
 }
 
 static void cobertura_class_stats(const cobertura_class_t *class,
@@ -139,13 +213,22 @@ static void cobertura_class_stats(const cobertura_class_t *class,
    *nlines += class->nlines;
    for (int i = 0; i < class->nlines; i++) {
       const cobertura_line_t *line = &(class->lines[i]);
-      if (line->hits > 0)
-         (*hitlines)++;
-      if (line->branch) {
-         (*nbranches)++;
-         if ((line->bflags & COV_FLAG_TRUE) && (line->bflags & COV_FLAG_FALSE))
-             (*hitbranches)++;
+      bool line_hit = line->stmt_hits > 0;
+      for (int j = 0; j < line->conds.count; j++) {
+         const cobertura_cond_t *cond = &(line->conds.items[j]);
+         line_hit |= cond->hits > 0;
+
+         const unsigned flags = cond->flags;
+         const unsigned hit_flags = cond->hit_flags;
+         *nbranches += !!(flags & COV_FLAG_TRUE)
+            + !!(flags & COV_FLAG_FALSE) + !!(flags & COV_FLAG_CHOICE);
+         *hitbranches += !!(hit_flags & COV_FLAG_TRUE)
+            + !!(hit_flags & COV_FLAG_FALSE)
+            + !!(hit_flags & COV_FLAG_CHOICE);
       }
+
+      if (line_hit)
+         (*hitlines)++;
    }
 }
 
@@ -157,8 +240,10 @@ static void cobertura_print_class(cobertura_class_t *class, FILE *f)
    int nlines = 0, hitlines = 0, nbranches = 0, hitbranches = 0;
    cobertura_class_stats(class, &nlines, &hitlines, &nbranches, &hitbranches);
 
-   const double line_rate = (double)hitlines / (double)nlines;
-   const double branch_rate = (double)hitbranches / (double)nbranches;
+   const double line_rate =
+      nlines > 0 ? (double)hitlines / (double)nlines : 1.0;
+   const double branch_rate =
+      nbranches > 0 ? (double)hitbranches / (double)nbranches : 1.0;
 
    fprintf(f, "<class name=\"%s(%s)\" filename=\"%s\" "
            "line-rate=\"%f\" branch-rate=\"%f\" complexity=\"0.0\" >\n",
@@ -168,37 +253,71 @@ static void cobertura_print_class(cobertura_class_t *class, FILE *f)
    fprintf(f, "<lines>\n");
    for (int i = 0; i < class->nlines; i++) {
       const cobertura_line_t *line = &(class->lines[i]);
-      if (line->branch) {
-         int pct = 0;
-         if (line->bflags & COV_FLAG_TRUE) pct += 50;
-         if (line->bflags & COV_FLAG_FALSE) pct += 50;
+      unsigned branch_hits = 0;
+      int nbins = 0, hitbins = 0;
+      for (int j = 0; j < line->conds.count; j++) {
+         const cobertura_cond_t *cond = &(line->conds.items[j]);
+         branch_hits = MAX(branch_hits, cond->hits);
+
+         const unsigned flags = cond->flags;
+         const unsigned hit_flags = cond->hit_flags;
+         nbins += !!(flags & COV_FLAG_TRUE) + !!(flags & COV_FLAG_FALSE)
+            + !!(flags & COV_FLAG_CHOICE);
+         hitbins += !!(hit_flags & COV_FLAG_TRUE)
+            + !!(hit_flags & COV_FLAG_FALSE)
+            + !!(hit_flags & COV_FLAG_CHOICE);
+      }
+
+      const unsigned hits =
+         line->conds.count > 0 ? branch_hits : line->stmt_hits;
+      if (line->conds.count > 0) {
+         const int pct = nbins > 0 ? 100 * hitbins / nbins : 100;
 
          fprintf(f, "<line number=\"%d\" hits=\"%d\" branch=\"true\" "
-                 "condition-coverage=\"%d %%\">\n",
-                 line->lineno, line->hits, pct);
+                 "condition-coverage=\"%d %% (%d/%d)\">\n",
+                 line->lineno, hits, pct, hitbins, nbins);
          fprintf(f, "<conditions>\n");
-         fprintf(f, "<condition number=\"0\" type=\"jump\" "
-                 "coverage=\"%d %%\"/>\n", pct);
+         for (int j = 0; j < line->conds.count; j++) {
+            const cobertura_cond_t *cond = &(line->conds.items[j]);
+            const unsigned flags = cond->flags;
+            const unsigned hit_flags = cond->hit_flags;
+            const int ntotal = !!(flags & COV_FLAG_TRUE)
+               + !!(flags & COV_FLAG_FALSE) + !!(flags & COV_FLAG_CHOICE);
+            const int nhit = !!(hit_flags & COV_FLAG_TRUE)
+               + !!(hit_flags & COV_FLAG_FALSE)
+               + !!(hit_flags & COV_FLAG_CHOICE);
+            const int cpct = ntotal > 0 ? 100 * nhit / ntotal : 100;
+            const char *type = cond->source == COV_SRC_CASE_CHOICE
+               ? "switch" : "jump";
+
+            fprintf(f, "<condition number=\"%d\" type=\"%s\" "
+                    "coverage=\"%d %%\"/>\n", j, type, cpct);
+         }
          fprintf(f, "</conditions>\n");
          fprintf(f, "</line>\n");
       }
       else
          fprintf(f, "<line number=\"%d\" hits=\"%d\" branch=\"false\"/>\n",
-                 line->lineno, line->hits);
+                 line->lineno, hits);
    }
    fprintf(f, "</lines>\n");
 
    fprintf(f, "</class>\n");
 }
 
-void cover_export_cobertura(cover_data_t *data, FILE *f, const char *relative)
+void cover_export_cobertura(const cover_data_t *db, FILE *f,
+                            const char *relative)
 {
    cobertura_report_t report = {
       .class_map = hash_new(64),
       .relative = relative,
+      .data = db,
    };
 
-   cobertura_export_scope(&report, NULL, data->root_scope);
+   cover_iter_t it = cover_begin(db, COVER_NULL_OBJ, COV_REL_CHILDREN);
+   cover_obj_t root;
+   while (cover_next(&it, &root))
+      cobertura_export_inst(&report, root);
 
    fprintf(f, "<?xml version='1.0' encoding='UTF-8'?>\n");
    fprintf(f, "<!DOCTYPE coverage SYSTEM "
@@ -208,8 +327,10 @@ void cover_export_cobertura(cover_data_t *data, FILE *f, const char *relative)
    for (cobertura_class_t *it = report.classes; it; it = it->next)
       cobertura_class_stats(it, &nlines, &hitlines, &nbranches, &hitbranches);
 
-   const double line_rate = (double)hitlines / (double)nlines;
-   const double branch_rate = (double)hitbranches / (double)nbranches;
+   const double line_rate =
+      nlines > 0 ? (double)hitlines / (double)nlines : 1.0;
+   const double branch_rate =
+      nbranches > 0 ? (double)hitbranches / (double)nbranches : 1.0;
 
    time_t timestamp;
    const long override_time = opt_get_int(OPT_COVER_TIMESTAMP);
@@ -219,6 +340,9 @@ void cover_export_cobertura(cover_data_t *data, FILE *f, const char *relative)
       timestamp = time(NULL);
 
    const char *version = opt_get_str(OPT_COVER_VERSION) ?: PACKAGE_STRING;
+
+   cover_obj_t root0 = cover_at(db, COVER_NULL_OBJ, COV_REL_CHILDREN, 0);
+   ident_t work_name = cover_get_ident(db, root0, COV_ATTR_LIB_NAME);
 
    fprintf(f, "<coverage version=\"%s\" "
            "line-rate=\"%f\" branch-rate=\"%f\" complexity=\"0.0\" "
@@ -233,7 +357,7 @@ void cover_export_cobertura(cover_data_t *data, FILE *f, const char *relative)
    fprintf(f, "<packages>\n");
    fprintf(f, "<package name=\"%s\" "
            "line-rate=\"%f\" branch-rate=\"%f\" complexity=\"0.0\">\n",
-           istr(data->root_scope->name), line_rate, branch_rate);
+           istr(work_name), line_rate, branch_rate);
 
    fprintf(f, "<classes>\n");
    for (cobertura_class_t *it = report.classes; it; it = it->next)
@@ -246,6 +370,8 @@ void cover_export_cobertura(cover_data_t *data, FILE *f, const char *relative)
 
    for (cobertura_class_t *it = report.classes, *tmp; it; it = tmp) {
       tmp = it->next;
+      for (int i = 0; i < it->nlines; i++)
+         ACLEAR(it->lines[i].conds);
       free(it->lines);
       free(it->file);
       free(it);
@@ -257,69 +383,132 @@ void cover_export_cobertura(cover_data_t *data, FILE *f, const char *relative)
 ////////////////////////////////////////////////////////////////////////////////
 // XML dump format for debugging and testing
 
-static void dump_item_xml(const cover_item_t *item, int indent, FILE *f)
+static void dump_item_xml(const cover_data_t *db, cover_obj_t item, int indent,
+                          FILE *f)
 {
-   for (int i = 0; i < item->consecutive; i++) {
-      switch (item->kind) {
+   const cover_item_kind_t kind = cover_get_kind(db, item);
+
+   cover_iter_t it = cover_begin(db, item, COV_REL_BINS);
+   cover_obj_t bin;
+   while (cover_next(&it, &bin)) {
+      ident_t hier = cover_get_ident(db, bin, COV_ATTR_HIER);
+      uint32_t data = cover_get_u32(db, bin, COV_ATTR_DATA, 0);
+
+      switch (kind) {
       case COV_ITEM_STMT:
          fprintf(f, "%*s<statement hier=\"%s\" data=\"%d\"/>\n", indent + 2, "",
-                 istr(item[i].hier), item[i].data);
+                 istr(hier), data);
          break;
       case COV_ITEM_BRANCH:
          fprintf(f, "%*s<branch hier=\"%s\" data=\"%d\"/>\n", indent + 2, "",
-                 istr(item[i].hier), item[i].data);
+                 istr(hier), data);
          break;
       case COV_ITEM_EXPRESSION:
          fprintf(f, "%*s<expression hier=\"%s\" data=\"%d\"/>\n", indent + 2,
-                 "", istr(item[i].hier), item[i].data);
+                 "", istr(hier), data);
          break;
       case COV_ITEM_TOGGLE:
          fprintf(f, "%*s<toggle hier=\"%s\" data=\"%d\"/>\n", indent + 2, "",
-                 istr(item[i].hier), item[i].data);
+                 istr(hier), data);
          break;
       case COV_ITEM_FUNCTIONAL:
          fprintf(f, "%*s<functional hier=\"%s\" data=\"%d\"/>\n", indent + 2,
-                 "", istr(item[i].hier), item[i].data);
+                 "", istr(hier), data);
          break;
       case COV_ITEM_STATE:
          fprintf(f, "%*s<state hier=\"%s\" data=\"%d\"/>\n", indent + 2,
-                 "", istr(item[i].hier), item[i].data);
+                 "", istr(hier), data);
          break;
       }
    }
 }
 
-static void dump_scope_xml(const cover_scope_t *s, int indent, const loc_t *loc,
-                           const char *relative, FILE *f)
+static void dump_scope_xml(const cover_data_t *db, cover_obj_t scope,
+                           int indent, const loc_t *loc, const char *relative,
+                           FILE *f)
 {
-   fprintf(f, "%*s<scope name=\"%s\"", indent, "", istr(s->name));
+   ident_t name = cover_get_ident(db, scope, COV_ATTR_NAME);
+   loc_t scope_loc = cover_get_loc(db, scope, COV_ATTR_LOC);
 
-   if (s->block_name != NULL)
-      fprintf(f, " block_name=\"%s\"", istr(s->block_name));
+   fprintf(f, "%*s<scope name=\"%s\"", indent, "", istr(name));
 
-   if (s->loc.file_ref != FILE_INVALID && s->loc.file_ref != loc->file_ref) {
+   if (scope_loc.file_ref != FILE_INVALID
+       && scope_loc.file_ref != loc->file_ref) {
       LOCAL_TEXT_BUF tb = tb_new();
-      get_relative_path(tb, relative, loc_file_str(&s->loc));
+      get_relative_path(tb, relative, loc_file_str(&scope_loc));
       fprintf(f, " file=\"%s\"", tb_get(tb));
    }
 
-   if (s->loc.first_line != LINE_INVALID && s->loc.first_line > 0
-       && s->loc.first_line != loc->first_line)
-      fprintf(f, " line=\"%d\"", s->loc.first_line);
+   if (scope_loc.first_line != LINE_INVALID && scope_loc.first_line > 0
+       && scope_loc.first_line != loc->first_line)
+      fprintf(f, " line=\"%d\"", scope_loc.first_line);
 
    fprintf(f, ">\n");
 
-   for (int i = 0; i < s->items.count; i++)
-      dump_item_xml(s->items.items[i], indent, f);
+   cover_iter_t item_it = cover_begin(db, scope, COV_REL_ITEMS);
+   cover_obj_t item;
+   while (cover_next(&item_it, &item))
+      dump_item_xml(db, item, indent, f);
 
-   for (int i = 0; i < s->children.count; i++)
-      dump_scope_xml(s->children.items[i], indent + 2, &s->loc, relative, f);
+   cover_iter_t child_it = cover_begin(db, scope, COV_REL_CHILDREN);
+   cover_obj_t child;
+   while (cover_next(&child_it, &child))
+      dump_scope_xml(db, child, indent + 2, &scope_loc, relative, f);
 
    fprintf(f, "%*s</scope>\n", indent, "");
 }
 
-void cover_export_xml(cover_data_t *data, FILE *f, const char *relative)
+static void dump_inst_xml(const cover_data_t *db, cover_obj_t inst, int indent,
+                          const loc_t *loc, const char *relative, FILE *f)
+{
+   ident_t name = cover_get_ident(db, inst, COV_ATTR_NAME);
+   cover_obj_t root = cover_get_obj(db, inst, COV_ATTR_ROOT);
+   loc_t scope_loc = cover_get_loc(db, root, COV_ATTR_LOC);
+
+   fprintf(f, "%*s<scope name=\"%s\"", indent, "", istr(name));
+
+   ident_t block_name = cover_get_ident(db, inst, COV_ATTR_BLOCK_NAME);
+   if (block_name != NULL)
+      fprintf(f, " block_name=\"%s\"", istr(block_name));
+
+   if (scope_loc.file_ref != FILE_INVALID
+       && scope_loc.file_ref != loc->file_ref) {
+      LOCAL_TEXT_BUF tb = tb_new();
+      get_relative_path(tb, relative, loc_file_str(&scope_loc));
+      fprintf(f, " file=\"%s\"", tb_get(tb));
+   }
+
+   if (scope_loc.first_line != LINE_INVALID && scope_loc.first_line > 0
+       && scope_loc.first_line != loc->first_line)
+      fprintf(f, " line=\"%d\"", scope_loc.first_line);
+
+   fprintf(f, ">\n");
+
+   cover_iter_t scope_it = cover_begin(db, root, COV_REL_CHILDREN);
+   cover_obj_t scope;
+   while (cover_next(&scope_it, &scope))
+      dump_scope_xml(db, scope, indent + 2, &scope_loc, relative, f);
+
+   cover_iter_t child_it = cover_begin(db, inst, COV_REL_CHILDREN);
+   cover_obj_t child;
+   while (cover_next(&child_it, &child))
+      dump_inst_xml(db, child, indent + 2, &scope_loc, relative, f);
+
+   fprintf(f, "%*s</scope>\n", indent, "");
+}
+
+void cover_export_xml(const cover_data_t *db, FILE *f, const char *relative)
 {
    fprintf(f, "<?xml version=\"1.0\"?>\n");
-   dump_scope_xml(data->root_scope, 0, &LOC_INVALID, relative, f);
+
+   cover_obj_t root0 = cover_at(db, COVER_NULL_OBJ, COV_REL_CHILDREN, 0);
+   ident_t work_name = cover_get_ident(db, root0, COV_ATTR_LIB_NAME);
+   fprintf(f, "<scope name=\"%s\">\n", istr(work_name));
+
+   cover_iter_t it = cover_begin(db, COVER_NULL_OBJ, COV_REL_CHILDREN);
+   cover_obj_t root;
+   while (cover_next(&it, &root))
+      dump_inst_xml(db, root, 2, &LOC_INVALID, relative, f);
+
+   fprintf(f, "</scope>\n");
 }

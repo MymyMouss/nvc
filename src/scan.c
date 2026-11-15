@@ -213,7 +213,7 @@ void push_file(const char *file, const loc_t *srcloc)
    if (fd < 0) {
       diag_t *d = diag_new(DIAG_ERROR, srcloc);
       if (errno != ENOENT)
-         diag_printf(d, "opening %s: %s", file, last_os_error());
+         diag_printf(d, "opening %s: %s", file, strerror(errno));
       else {
          char *cwd LOCAL = getcwd(NULL, 0);
          diag_printf(d, "cannot find %s in the current working directory %s",
@@ -460,7 +460,7 @@ const char *token_str(token_t tok)
          "rtranif0", "rtranif1", "`define", "macro end", "macro usage",
          "`ifdef", "`ifndef", "`endif", "text", "`include", "`undef",
          "`undefall", "white space", "newline", "\\", "comment", "$.",
-         "final",
+         "final", "`\"", "`\\`\"", "``", "##", "time literal",
       };
 
       if (tok >= 200 && tok - 200 < ARRAY_LEN(token_strs))
@@ -472,7 +472,7 @@ const char *token_str(token_t tok)
 
 void free_token(token_t tok, yylval_t *lval)
 {
-   if (tok == tBITSTRING || tok == tUNSNUM)
+   if (tok == tBITSTRING || tok == tUNSNUM || tok == tTIMELIT)
       free(lval->str);
    else if (tok == tSTRING)
       tb_free(lval->text);
@@ -764,16 +764,20 @@ static void pp_nvc_pop(void)
 
    const macro_expansion_t top = APOP(macro_stack);
 
-   input_buf.lineno = top.expandloc.first_line - 1;
+   input_buf.lineno = top.expandloc.first_line;
    input_buf.file_ref = top.expandloc.file_ref;
+
+   if (top.include == NULL)
+      input_buf.lineno--;
 
    // Eat the following newline and adjust the next token location
    input_buf.lookahead = yylex();
 
-   yylloc.first_column +=
-      top.expandloc.first_column + top.expandloc.column_delta + 1;
-
-   input_buf.colno = yylloc.first_column + yylloc.column_delta;
+   if (top.include == NULL) {
+      yylloc.first_column +=
+         top.expandloc.first_column + top.expandloc.column_delta + 1;
+      input_buf.colno = yylloc.first_column + yylloc.column_delta;
+   }
 
    free(top.include);
 

@@ -25,10 +25,12 @@
 #include "jit/jit.h"
 #include "lib.h"
 #include "option.h"
+#include "object.h"
 #include "printf.h"
 #include "psl/psl-node.h"
 #include "rt/assert.h"
 #include "rt/copy.h"
+#include "rt/defs.h"
 #include "rt/heap.h"
 #include "rt/model.h"
 #include "rt/random.h"
@@ -566,7 +568,7 @@ static void cleanup_scope(rt_model_t *m, rt_scope_t *scope)
    for (int i = 0; i < scope->procs.count; i++) {
       rt_proc_t *p = scope->procs.items[i];
       mptr_free(m->mspace, &(p->privdata));
-      tlab_release(p->tlab);
+      tlab_release(m->jit, p->tlab);
       free(p);
    }
    ACLEAR(scope->procs);
@@ -622,7 +624,7 @@ void model_free(rt_model_t *m)
    for (int i = 0; i < MAX_THREADS; i++) {
       model_thread_t *thread = m->threads[i];
       if (thread != NULL)
-         tlab_release(thread->tlab);
+         tlab_release(m->jit, thread->tlab);
    }
 
    free(m->procq.tasks);
@@ -883,10 +885,17 @@ static void deltaq_insert_driver(rt_model_t *m, uint64_t delta,
    }
 }
 
-static void deltaq_insert_pseudo_source(rt_model_t *m, rt_source_t *src)
+static void deltaq_insert_pseudo_source(rt_model_t *m, uint64_t delta,
+                                        rt_source_t *src)
 {
-   deferq_do(&m->driverq, async_pseudo_source, src);
-   m->next_is_delta = true;
+   if (delta == 0) {
+      deferq_do(&m->driverq, async_pseudo_source, src);
+      m->next_is_delta = true;
+   }
+   else {
+      void *e = tag_pointer(src, EVENT_PSEUDO);
+      heap_insert(m->eventq_heap, m->now + delta, e);
+   }
 }
 
 static void reset_process(rt_model_t *m, rt_proc_t *proc)
@@ -986,14 +995,14 @@ static void run_process(rt_model_t *m, rt_proc_t *proc)
       m->force_stop = true;
 
    if (proc->tlab != NULL && result.pointer == NULL) {
-      tlab_release(proc->tlab);
+      tlab_release(m->jit, proc->tlab);
       proc->tlab = NULL;
    }
    else if (proc->tlab == NULL && result.pointer != NULL) {
       TRACE("claiming TLAB for private use (used %u/%u)",
             thread->tlab->alloc, thread->tlab->limit);
       proc->tlab = thread->tlab;
-      thread->tlab = tlab_acquire(m->mspace);
+      thread->tlab = tlab_acquire(m->jit);
    }
    else if (proc->tlab == NULL)
       tlab_reset(thread->tlab);   // All data inside the TLAB is dead
@@ -1180,22 +1189,21 @@ static void check_multiple_sources(rt_nexus_t *n, source_kind_t kind)
       for (; is_signal_scope(root->parent); root = root->parent);
 
       d = diag_new(DIAG_FATAL, tree_loc(root->where));
-      diag_printf(d, "element %s of signal %s has multiple sources",
-                  istr(tree_ident(n->signal->where)),
-                  istr(tree_ident(root->where)));
-      diag_hint(d, tree_loc(n->signal->where), "element %s declared here",
-                istr(tree_ident(n->signal->where)));
-      diag_hint(d, tree_loc(root->where), "composite signal %s declared with "
-                "unresolved type %s", istr(tree_ident(root->where)),
-                type_pp(tree_type(root->where)));
+      diag_printf(d, "element %pI of signal %pI has multiple sources",
+                  tree_ident(n->signal->where), tree_ident(root->where));
+      diag_hint(d, tree_loc(n->signal->where), "element %pI declared here",
+                tree_ident(n->signal->where));
+      diag_hint(d, tree_loc(root->where), "composite signal %pI declared with "
+                "unresolved type %pT", tree_ident(root->where),
+                tree_type(root->where));
    }
    else {
       d = diag_new(DIAG_FATAL, tree_loc(n->signal->where));
-      diag_printf(d, "unresolved signal %s has multiple sources",
-                  istr(tree_ident(n->signal->where)));
-      diag_hint(d, tree_loc(n->signal->where), "signal %s declared with "
-                "unresolved type %s", istr(tree_ident(n->signal->where)),
-                type_pp(tree_type(n->signal->where)));
+      diag_printf(d, "unresolved signal %pI has multiple sources",
+                  tree_ident(n->signal->where));
+      diag_hint(d, tree_loc(n->signal->where), "signal %pI declared with "
+                "unresolved type %pT", tree_ident(n->signal->where),
+                tree_type(n->signal->where));
    }
 
    if (n->sources.tag == SOURCE_DRIVER) {
@@ -1254,7 +1262,6 @@ static rt_source_t *add_source(rt_model_t *m, rt_nexus_t *n, source_kind_t kind)
    src->disconnected = 0;
    src->fastqueued   = 0;
    src->sigqueued    = 0;
-   src->pseudoqueued = 0;
 
    switch (kind) {
    case SOURCE_DRIVER:
@@ -1276,7 +1283,9 @@ static rt_source_t *add_source(rt_model_t *m, rt_nexus_t *n, source_kind_t kind)
    case SOURCE_DEPOSIT:
    case SOURCE_FORCING:
       src->u.pseudo.nexus = n;
-      src->u.pseudo.value = alloc_value(m, n);
+      src->u.pseudo.waveforms.when  = TIME_HIGH;
+      src->u.pseudo.waveforms.next  = NULL;
+      src->u.pseudo.waveforms.value = alloc_value(m, n);
       break;
 
    case SOURCE_ACTIVE:
@@ -1510,12 +1519,23 @@ static void clone_source(rt_model_t *m, rt_nexus_t *nexus,
    case SOURCE_FORCING:
    case SOURCE_DEPOSIT:
       {
-         split_value(nexus, &(new->u.pseudo.value), &(old->u.pseudo.value),
-                     offset);
+         waveform_t *w_new = &(new->u.pseudo.waveforms);
+         waveform_t *w_old = &(old->u.pseudo.waveforms);
+         w_new->when = w_old->when;
+         w_new->next = NULL;
 
-         if (old->pseudoqueued) {
-            deltaq_insert_pseudo_source(m, new);
-            new->pseudoqueued = 1;
+         split_value(nexus, &w_new->value, &w_old->value, offset);
+
+         // Future transactions
+         for (w_old = w_old->next; w_old; w_old = w_old->next) {
+            w_new = (w_new->next = alloc_waveform(m));
+            w_new->when = w_old->when;
+            w_new->next = NULL;
+
+            split_value(nexus, &w_new->value, &w_old->value, offset);
+
+            assert(w_old->when >= m->now);
+            deltaq_insert_pseudo_source(m, w_new->when - m->now, new);
          }
       }
       break;
@@ -1725,6 +1745,11 @@ static void setup_process(rt_proc_t *p, const char *path)
          case V_INITIAL:
          case V_FINAL:
             p->name = ident_sprintf("%s:%s", path, istr(tree_ident(p->where)));
+            break;
+         case V_TCHECK:
+            // TODO: Should names here be unique ?
+            p->name = ident_sprintf("%s", path);
+            p->wakeable.postponed = true;
             break;
          default:
             should_not_reach_here();
@@ -1948,7 +1973,7 @@ static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
          // If S is driving-value forced, the driving value of S is
          // unchanged from its previous value; no further steps are
          // required.
-         put_driving(m, n, value_ptr(n, &(s->u.pseudo.value)));
+         put_driving(m, n, value_ptr(n, &(s->u.pseudo.waveforms.value)));
          return;
       }
       else if (s->tag == SOURCE_DEPOSIT) {
@@ -1958,7 +1983,7 @@ static void calculate_driving_value(rt_model_t *m, rt_nexus_t *n)
          // driving deposit value for the signal of which S is a
          // subelement, as appropriate.
          s->disconnected = 1;
-         put_driving(m, n, value_ptr(n, &(s->u.pseudo.value)));
+         put_driving(m, n, value_ptr(n, &(s->u.pseudo.waveforms.value)));
          return;
       }
       else if (s0 == NULL)
@@ -2327,7 +2352,7 @@ void model_reset(rt_model_t *m)
    TRACE("calculate initial signal values");
 
    model_thread_t *thread = model_thread(m);
-   thread->tlab = tlab_acquire(m->mspace);
+   thread->tlab = tlab_acquire(m->jit);
 
    // The signals in the model are updated as follows in an order such
    // that if a given signal R depends upon the current value of another
@@ -2490,9 +2515,9 @@ static rt_source_t *find_driver(rt_nexus_t *nexus, rt_proc_t *proc)
    return NULL;
 }
 
-static inline bool insert_transaction(rt_model_t *m, rt_nexus_t *nexus,
-                                      rt_source_t *source, waveform_t *w,
-                                      uint64_t when, uint64_t reject)
+static bool insert_transaction(rt_model_t *m, rt_nexus_t *nexus,
+                               rt_source_t *source, waveform_t *w,
+                               uint64_t when, uint64_t reject)
 {
    waveform_t *last = &(source->u.driver.waveforms);
    waveform_t *it   = last->next;
@@ -2529,6 +2554,18 @@ static inline bool insert_transaction(rt_model_t *m, rt_nexus_t *nexus,
    }
 
    return already_scheduled;
+}
+
+static void queue_waveform(rt_model_t *m, waveform_t *last, waveform_t *w)
+{
+   waveform_t *it = last->next;
+   while (it != NULL && it->when <= w->when) {
+      assert(it->when >= m->now);
+      last = it;
+      it = it->next;
+   }
+   w->next = last->next;
+   last->next = w;
 }
 
 static bool will_observe_active(rt_nexus_t *n, const void *value, waveform_t *w)
@@ -2860,6 +2897,9 @@ static void notify_event(rt_model_t *m, rt_nexus_t *n)
    n->last_event = m->now;
    n->event_delta = m->iteration;
 
+   // Triggers run synchronously in blocking update phase
+   m->trigger_epoch += m->blocking_update;
+
    if (n->flags & NET_F_CACHE_EVENT)
       n->signal->shared.flags |= SIG_F_EVENT_FLAG;
 
@@ -2940,9 +2980,6 @@ static void update_driving(rt_model_t *m, rt_nexus_t *n, bool safe)
    if (n->n_sources == 1 || safe) {
       n->active_delta = m->iteration;
       n->flags &= ~NET_F_PENDING;
-
-      // TODO: add an event epoch or similar
-      n->event_delta = DELTA_CYCLE_MAX;
 
       calculate_driving_value(m, n);
 
@@ -3031,6 +3068,33 @@ static void fast_update_all_drivers(rt_model_t *m, rt_signal_t *signal)
    }
 }
 
+static void update_pseudo_source(rt_model_t *m, rt_source_t *src)
+{
+   assert(src->tag == SOURCE_FORCING || src->tag == SOURCE_DEPOSIT);
+
+   rt_nexus_t *n = src->u.pseudo.nexus;
+   waveform_t *w_now = &(src->u.pseudo.waveforms);
+
+   if (w_now->next != NULL && w_now->next->when == m->now) {
+      waveform_t *w_next = w_now->next;
+      free_value(n, w_now->value);
+      *w_now = *w_next;
+      free_waveform(m, w_next);
+      src->disconnected = 0;
+   }
+   else {
+      assert(w_now->next == NULL || w_now->next->when > m->now);
+      src->disconnected = !(n->flags & NET_F_FORCED);
+   }
+
+   if (src->tag == SOURCE_DEPOSIT && (n->flags & NET_F_FORCED)) {
+      src->disconnected = 1;
+      return;
+   }
+
+   update_driving(m, n, false);
+}
+
 static void async_update_driver(rt_model_t *m, void *arg)
 {
    rt_source_t *src = arg;
@@ -3052,12 +3116,7 @@ static void async_fast_all_drivers(rt_model_t *m, void *arg)
 static void async_pseudo_source(rt_model_t *m, void *arg)
 {
    rt_source_t *src = arg;
-   assert(src->tag == SOURCE_FORCING || src->tag == SOURCE_DEPOSIT);
-
-   update_driving(m, src->u.pseudo.nexus, false);
-
-   assert(src->pseudoqueued);
-   src->pseudoqueued = 0;
+   update_pseudo_source(m, src);
 }
 
 static void async_transfer_signal(rt_model_t *m, void *arg)
@@ -3405,13 +3464,13 @@ static inline void check_delay(int64_t delay)
    }
 }
 
-void force_signal(rt_model_t *m, rt_signal_t *s, const void *values,
-                  int offset, size_t count)
+void sched_force(rt_model_t *m, rt_signal_t *s, const void *values,
+                 int offset, size_t count)
 {
    RT_LOCK(s->lock);
 
-   TRACE("force signal %s+%d to %s", istr(tree_ident(s->where)), offset,
-         fmt_values(values, count));
+   TRACE("schedule force signal %s+%d to %s", istr(tree_ident(s->where)),
+         offset, fmt_values(values, count));
 
    assert(m->can_create_delta);
 
@@ -3424,23 +3483,30 @@ void force_signal(rt_model_t *m, rt_signal_t *s, const void *values,
       n->flags |= NET_F_FORCED;
 
       rt_source_t *src = get_pseudo_source(m, n, SOURCE_FORCING);
-      copy_value_ptr(n, &(src->u.pseudo.value), vptr);
+      copy_value_ptr(n, &(src->u.pseudo.waveforms.value), vptr);
+      src->u.pseudo.waveforms.when = m->now;
       src->disconnected = 0;
 
-      if (!src->pseudoqueued) {
-         deltaq_insert_pseudo_source(m, src);
-         src->pseudoqueued = 1;
-      }
+      waveform_t *w = alloc_waveform(m);
+      w->when  = m->now;
+      w->next  = NULL;
+      w->value = alloc_value(m, n);
+
+      copy_value_ptr(n, &w->value, vptr);
+
+      queue_waveform(m, &src->u.pseudo.waveforms, w);
+
+      deltaq_insert_pseudo_source(m, 0, src);
 
       vptr += n->width * n->size;
    }
 }
 
-void release_signal(rt_model_t *m, rt_signal_t *s, int offset, size_t count)
+void sched_release(rt_model_t *m, rt_signal_t *s, int offset, size_t count)
 {
    RT_LOCK(s->lock);
 
-   TRACE("release signal %s+%d", istr(tree_ident(s->where)), offset);
+   TRACE("schedule release signal %s+%d", istr(tree_ident(s->where)), offset);
 
    assert(m->can_create_delta);
 
@@ -3452,11 +3518,66 @@ void release_signal(rt_model_t *m, rt_signal_t *s, int offset, size_t count)
       n->flags &= ~NET_F_FORCED;
 
       rt_source_t *src = get_pseudo_source(m, n, SOURCE_FORCING);
+      deltaq_insert_pseudo_source(m, 0, src);
+   }
+}
+
+void force_signal(rt_model_t *m, rt_signal_t *s, const void *values,
+                  int offset, size_t count)
+{
+   RT_LOCK(s->lock);
+
+   TRACE("force signal %s+%d to %s", istr(tree_ident(s->where)), offset,
+         fmt_values(values, count));
+
+   rt_nexus_t *n = split_nexus(m, s, offset, count);
+   const char *vptr = values;
+   for (; count > 0; n = n->chain) {
+      count -= n->width;
+      assert(count >= 0);
+
+      n->flags |= NET_F_FORCED;
+
+      rt_source_t *src = get_pseudo_source(m, n, SOURCE_FORCING);
+      copy_value_ptr(n, &(src->u.pseudo.waveforms.value), vptr);
+      src->u.pseudo.waveforms.when = m->now;
+      src->disconnected = 0;
+
+      update_driving(m, n, true);
+      if (n->flags & NET_F_EFFECTIVE)
+         calculate_effective_value(m, n);
+
+      vptr += n->width * n->size;
+   }
+}
+
+void release_signal(rt_model_t *m, rt_signal_t *s, int offset, size_t count,
+                    release_mode_t mode)
+{
+   RT_LOCK(s->lock);
+
+   TRACE("release signal %s+%d", istr(tree_ident(s->where)), offset);
+
+   rt_nexus_t *n = split_nexus(m, s, offset, count);
+   for (; count > 0; n = n->chain) {
+      count -= n->width;
+      assert(count >= 0);
+
+      n->flags &= ~NET_F_FORCED;
+
+      rt_source_t *src = get_pseudo_source(m, n, SOURCE_FORCING);
       src->disconnected = 1;
 
-      if (!src->pseudoqueued) {
-         deltaq_insert_pseudo_source(m, src);
-         src->pseudoqueued = 1;
+      switch (mode) {
+      case RELEASE_RECOMPUTE:
+         update_driving(m, n, true);
+         if (n->flags & NET_F_EFFECTIVE)
+            calculate_effective_value(m, n);
+         break;
+      case RELEASE_RETAIN:
+         break;
+      default:
+         should_not_reach_here();
       }
    }
 }
@@ -3486,6 +3607,11 @@ void deposit_signal(rt_model_t *m, rt_signal_t *s, const void *values,
       unsigned char *last = nexus_last_value(n);
 
       const size_t valuesz = n->size * n->width;
+
+      if (n->flags & NET_F_FORCED) {
+         vptr += valuesz;
+         continue;
+      }
 
       if (!cmp_bytes(eff, vptr, valuesz)) {
          copy2(last, eff, vptr, valuesz);
@@ -3528,23 +3654,20 @@ void sched_deposit(rt_model_t *m, rt_signal_t *s, const void *values,
       assert(count >= 0);
 
       rt_source_t *src = get_pseudo_source(m, n, SOURCE_DEPOSIT);
-      copy_value_ptr(n, &(src->u.pseudo.value), vptr);
-      src->disconnected = 0;
 
-      if (!src->pseudoqueued) {
-         if (after == 0) {
-            if (nonblock)
-               deferq_do(&m->nonblockq, async_pseudo_source, src);
-            else
-               deltaq_insert_pseudo_source(m, src);
-         }
-         else if (after > 0) {
-            void *e = tag_pointer(src, EVENT_PSEUDO);
-            heap_insert(m->eventq_heap, m->now + after, e);
-         }
+      waveform_t *w = alloc_waveform(m);
+      w->when  = m->now + after;
+      w->next  = NULL;
+      w->value = alloc_value(m, n);
 
-         src->pseudoqueued = 1;  // TODO: should be after == 0 branch
-      }
+      copy_value_ptr(n, &w->value, vptr);
+
+      queue_waveform(m, &src->u.pseudo.waveforms, w);
+
+      if (nonblock && after == 0)
+         deferq_do(&m->nonblockq, async_pseudo_source, src);
+      else
+         deltaq_insert_pseudo_source(m, after, src);
 
       vptr += n->width * n->size;
    }
@@ -3651,8 +3774,8 @@ void watch_free(rt_model_t *m, rt_watch_t *w)
    should_not_reach_here();
 }
 
-rt_watch_t *model_set_event_cb(rt_model_t *m, rt_signal_t *s, int offset,
-                               int count, rt_watch_t *w)
+void model_set_event_cb(rt_model_t *m, rt_signal_t *s, int offset,
+                        int count, rt_watch_t *w)
 {
    assert(!w->wakeable.zombie);
    assert(w->next_slot < w->num_slots);
@@ -3669,8 +3792,6 @@ rt_watch_t *model_set_event_cb(rt_model_t *m, rt_signal_t *s, int offset,
 
       sched_event(m, &(n->pending), &(w->wakeable));
    }
-
-   return w;
 }
 
 static void handle_interrupt_cb(jit_t *j, void *ctx)
@@ -3757,7 +3878,8 @@ void get_forcing_value(rt_signal_t *s, uint8_t *value)
       }
       assert(s != NULL);
 
-      memcpy(p, s->u.pseudo.value.bytes, n->width * n->size);
+      memcpy(p, value_ptr(n, &(s->u.pseudo.waveforms.value)),
+             n->width * n->size);
       p += n->width * n->size;
    }
    assert(p == value + s->shared.size);
@@ -3904,6 +4026,12 @@ void get_instance_name(rt_scope_t *s, text_buf_t *tb)
       tb_printf(tb, ":%s", istr(tree_ident(s->where)));
       break;
 
+   // TODO: Should Verilog hierarchy have the same format as VHDL ?
+   case T_VERILOG:
+      get_instance_name(s->parent, tb);
+      tb_printf(tb, ":%s", istr(tree_ident(s->where)));
+      break;
+
    default:
       should_not_reach_here();
    }
@@ -4033,8 +4161,8 @@ void x_sched_waveform_s(sig_shared_t *ss, uint32_t offset, uint64_t scalar,
    rt_signal_t *s = container_of(ss, rt_signal_t, shared);
    RT_LOCK(s->lock);
 
-   TRACE("_sched_waveform_s %s+%d value=%"PRIi64" after=%s reject=%s",
-         istr(tree_ident(s->where)), offset, scalar, trace_time(after),
+   TRACE("sched waveform %pI+%d value=%"PRIi64" after=%s reject=%s",
+         tree_ident(s->where), offset, scalar, trace_time(after),
          trace_time(reject));
 
    rt_proc_t *proc = get_active_proc();
@@ -4049,14 +4177,31 @@ void x_sched_waveform_s(sig_shared_t *ss, uint32_t offset, uint64_t scalar,
    sched_driver(m, n, after, reject, &scalar, proc);
 }
 
+void x_sched_waveform_s0(sig_shared_t *ss, uint32_t offset, uint64_t scalar)
+{
+   rt_signal_t *s = container_of(ss, rt_signal_t, shared);
+   RT_LOCK(s->lock);
+
+   TRACE("sched waveform %pI+%d value=%"PRIi64" after=0fs reject=0fs",
+         tree_ident(s->where), offset, scalar);
+
+   rt_proc_t *proc = get_active_proc();
+   check_postponed(0, proc);
+
+   rt_model_t *m = get_model();
+   rt_nexus_t *n = split_nexus(m, s, offset, 1);
+
+   sched_driver(m, n, 0, 0, &scalar, proc);
+}
+
 void x_sched_waveform(sig_shared_t *ss, uint32_t offset, void *values,
                       int32_t count, int64_t after, int64_t reject)
 {
    rt_signal_t *s = container_of(ss, rt_signal_t, shared);
    RT_LOCK(s->lock);
 
-   TRACE("_sched_waveform %s+%d value=%s count=%d after=%s reject=%s",
-         istr(tree_ident(s->where)), offset,
+   TRACE("sched waveform %pI+%d value=%s count=%d after=%s reject=%s",
+         tree_ident(s->where), offset,
          fmt_values(values, count * s->nexus.size),
          count, trace_time(after), trace_time(reject));
 
@@ -4567,12 +4712,41 @@ void x_disconnect(sig_shared_t *ss, uint32_t offset, int32_t count,
    }
 }
 
-void x_force(sig_shared_t *ss, uint32_t offset, int32_t count, void *values)
+void x_sched_force(sig_shared_t *ss, uint32_t offset, int32_t count,
+                   void *values)
 {
    rt_signal_t *s = container_of(ss, rt_signal_t, shared);
 
-   TRACE("force signal %s+%d value=%s count=%d", istr(tree_ident(s->where)),
-         offset, fmt_values(values, count), count);
+   TRACE("schedule force signal %s+%d value=%s count=%d",
+         istr(tree_ident(s->where)), offset, fmt_values(values, count), count);
+
+   rt_proc_t *proc = get_active_proc();
+   rt_model_t *m = get_model();
+
+   check_postponed(0, proc);
+
+   sched_force(m, s, values, offset, count);
+}
+
+void x_sched_release(sig_shared_t *ss, uint32_t offset, int32_t count)
+{
+   rt_signal_t *s = container_of(ss, rt_signal_t, shared);
+
+   TRACE("schedule release signal %s+%d count=%d",
+         istr(tree_ident(s->where)), offset, count);
+
+   rt_proc_t *proc = get_active_proc();
+   rt_model_t *m = get_model();
+
+   check_postponed(0, proc);
+
+   sched_release(m, s, offset, count);
+}
+
+void x_force_signal(sig_shared_t *ss, uint32_t offset, int32_t count,
+                    void *values)
+{
+   rt_signal_t *s = container_of(ss, rt_signal_t, shared);
 
    rt_proc_t *proc = get_active_proc();
    rt_model_t *m = get_model();
@@ -4582,19 +4756,17 @@ void x_force(sig_shared_t *ss, uint32_t offset, int32_t count, void *values)
    force_signal(m, s, values, offset, count);
 }
 
-void x_release(sig_shared_t *ss, uint32_t offset, int32_t count)
+void x_release_signal(sig_shared_t *ss, uint32_t offset, int32_t count,
+                      release_mode_t mode)
 {
    rt_signal_t *s = container_of(ss, rt_signal_t, shared);
-
-   TRACE("release signal %s+%d count=%d", istr(tree_ident(s->where)),
-         offset, count);
 
    rt_proc_t *proc = get_active_proc();
    rt_model_t *m = get_model();
 
    check_postponed(0, proc);
 
-   release_signal(m, s, offset, count);
+   release_signal(m, s, offset, count, mode);
 }
 
 void x_deposit_signal(sig_shared_t *ss, uint32_t offset, int32_t count,
@@ -4822,4 +4994,36 @@ int32_t *x_get_counters(jit_handle_t handle)
    ident_t name = jit_get_name(m->jit, handle);
 
    return cover_get_counters(m->cover, name);
+}
+
+void x_timing_check(int64_t stamp, int64_t limit, object_t *where)
+{
+   diag_t *d = diag_new(DIAG_ERROR, &(where->loc));
+
+   vlog_node_t v = vlog_from_object(where);
+   assert(v != NULL);
+   assert(vlog_kind(v) == V_TCHECK);
+
+   static const char *names[] = {
+      [V_TCHECK_SETUP]    = "$setup",
+      [V_TCHECK_HOLD]     = "$hold",
+      [V_TCHECK_RECOVERY] = "$recovery",
+      [V_TCHECK_REMOVAL]  = "$removal",
+   };
+
+   rt_model_t *m = get_model();
+
+   LOCAL_TEXT_BUF tb = tb_new();
+   get_instance_name(get_active_scope(m), tb);
+
+   char stamp_buf[32], now_buf[32], limit_buf[32];
+   fmt_time_r(stamp_buf, sizeof(stamp_buf), stamp, "");
+   fmt_time_r(now_buf, sizeof(now_buf), model_now(m, NULL), "");
+   fmt_time_r(limit_buf, sizeof(limit_buf), limit, "");
+
+   diag_printf(d, "timing check violation: %s(%s, %s, %s)",
+               names[vlog_subkind(v)], stamp_buf, now_buf, limit_buf);
+   diag_hint(d, NULL, "instance '%s'", tb_get(tb));
+
+   emit_vhdl_diag(d, SEVERITY_ERROR);
 }

@@ -23,8 +23,8 @@
 #include "hash.h"
 #include "jit/jit-layout.h"
 #include "option.h"
+#include "rt/defs.h"
 #include "rt/model.h"
-#include "rt/rt.h"
 #include "rt/structs.h"
 #include "rt/wave.h"
 #include "printf.h"
@@ -137,9 +137,9 @@ static bool should_dump_array(tree_t where, unsigned length)
    if (warned || limit > 0)
       return false;
 
-   notef("arrays of composite types such as %s are not dumped by default, "
+   notef("arrays of composite types such as %pT are not dumped by default, "
          "pass $bold$--dump-arrays$$ to include these in the waveform dump",
-         type_pp(tree_type(where)));
+         tree_type(where));
 
    warned = true;
    return false;
@@ -174,7 +174,7 @@ static void fst_close(rt_model_t *m, void *arg)
 #if !defined __CYGWIN__ && !defined __MINGW32__
       char *tmpdir = dirname(wd->tmpfst);
       if (rmdir(tmpdir) != 0)
-         fatal_errno("unlink: %s", tmpdir);
+         fatal_errno("rmdir: %s", tmpdir);
 #endif
 
       free(wd->tmpfst);
@@ -1241,7 +1241,10 @@ void wave_dumper_restart(wave_dumper_t *wd, rt_model_t *m, jit_t *jit)
    wd->model     = m;
    wd->jit       = jit;
 
-   fst_walk_design(wd, tree_stmt(wd->top, 0));
+   const int nroots = tree_stmts(wd->top);
+   for (int i = 0; i < nroots; i++)
+      fst_walk_design(wd, tree_stmt(wd->top, i));
+
    fst_walk_packages(wd);
 
    if (wd->gtkw != NULL) {

@@ -169,7 +169,7 @@ jit_t *get_jit(void)
    return jit;
 }
 
-tree_t run_elab_with_model(rt_model_t *m)
+object_t *analyse_file(void)
 {
    mir_context_t *mc = get_mir();
    unit_registry_t *ur = get_registry();
@@ -203,6 +203,7 @@ tree_t run_elab_with_model(rt_model_t *m)
 
             lib_put_vlog(lib_work(), v);
             vlog_simp(v);
+            vlog_fold(v, mc, j);
             fail_if(error_count() > 0);
 
             const vlog_kind_t kind = vlog_kind(v);
@@ -216,7 +217,18 @@ tree_t run_elab_with_model(rt_model_t *m)
       ck_abort_msg("unsupported source kind");
    }
 
-   return elab(top, j, ur, mc, NULL, NULL, m);
+   return top;
+}
+
+tree_t run_elab_with_model(rt_model_t *m)
+{
+   mir_context_t *mc = get_mir();
+   unit_registry_t *ur = get_registry();
+   jit_t *j = get_jit();
+
+   object_t *top[1] = { analyse_file() };
+
+   return elab(top, 1, j, ur, mc, NULL, NULL, m);
 }
 
 tree_t run_elab(void)

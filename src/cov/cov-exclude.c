@@ -17,9 +17,9 @@
 
 #include "util.h"
 #include "array.h"
-#include "common.h"
 #include "cov/cov-api.h"
-#include "cov/cov-data.h"
+#include "cov/cov-priv.h"
+#include "cov/cov-structs.h"
 #include "ident.h"
 #include "option.h"
 #include "printf.h"
@@ -30,21 +30,11 @@
 
 typedef struct _excl_children excl_children_t;
 typedef struct _excl_trie excl_trie_t;
-typedef struct _excl_glob excl_glob_t;
-
-struct _excl_glob {
-   char       *glob;
-   bool        include;
-   excl_glob_t *next;
-};
 
 typedef struct _cover_spec {
    excl_trie_t *hier_trie;
-   // TODO: convert block_trie and fsm_trie to glob lists so users can write
-   // e.g. "+fsm_type *_fsm_t" matching across name components.
    excl_trie_t *block_trie;
    excl_trie_t *fsm_trie;
-   excl_glob_t *pkg_globs;
 } cover_spec_t;
 
 typedef enum {
@@ -147,43 +137,24 @@ static excl_trie_t *excl_trie_search(excl_trie_t *et, ident_t id)
    return NULL;
 }
 
-static excl_trie_t *excl_trie_for_hier(excl_trie_t *root, ident_t hier)
+static excl_trie_t *excl_trie_for_scope(const cover_data_t *db,
+                                        excl_trie_t *root, cover_obj_t scope)
 {
-   if (hier == NULL)
-      return root;
+   ident_t hier = cover_get_ident(db, scope, COV_ATTR_HIER);
+   excl_trie_t *et = root;
 
-   ident_t prefix = ident_runtil(hier, '.');
-   excl_trie_t *parent;
-   ident_t leaf;
-
-   if (prefix == hier) {
-      // Single-segment hier
-      parent = root;
-      leaf = hier;
-   }
-   else {
-      parent = excl_trie_for_hier(root, prefix);
-      if (parent == NULL)
+   ident_t id;
+   while ((id = ident_walk_selected(&hier)) != NULL) {
+      excl_trie_t *child = excl_trie_search(et, id);
+      if (child != NULL)
+         et = child;
+      else if (et->scope == EXCL_SUBTREE)
+         return et;
+      else
          return NULL;
-      leaf = ident_rfrom(hier, '.');
    }
 
-   excl_trie_t *et = excl_trie_search(parent, leaf);
-   if (et != NULL)
-      return et;
-
-   if (parent->scope == EXCL_SUBTREE)
-      return parent;
-
-   return NULL;
-}
-
-static excl_trie_t *excl_trie_for_scope(excl_trie_t *root,
-                                        const cover_scope_t *cs)
-{
-   if (cs == NULL)
-      return root;
-   return excl_trie_for_hier(root, cs->hier);
+   return et;
 }
 
 static void excl_trie_print(excl_trie_t *et, int indent)
@@ -217,47 +188,67 @@ static void excl_trie_print(excl_trie_t *et, int indent)
 ////////////////////////////////////////////////////////////////////////////////
 // Exclude file
 
-static void cover_exclude_items(cover_ef_t *ef, cover_item_t *item)
+static void cover_exclude_items(cover_data_t *db, cover_obj_t item)
 {
-   for (int i = 0; i < item->consecutive; i++) {
-      ident_t hier = item[i].hier;
+   cover_iter_t it = cover_begin(db, item, COV_REL_BINS);
+   cover_obj_t bin;
+   while (cover_next(&it, &bin)) {
+      ident_t hier = cover_get_ident(db, bin, COV_ATTR_HIER);
 
-      for (int j = 0; j < ef->n_excl_cmds; j++) {
-         cover_excl_cmd_t *excl = &(ef->excl[j]);
+      for (int j = 0; j < db->ef->n_excl_cmds; j++) {
+         cover_excl_cmd_t *excl = &(db->ef->excl[j]);
          const char *excl_hier = istr(excl->hier);
 
          if (ident_glob(hier, excl_hier, strlen(excl_hier))) {
             excl->found = true;
 
-            const char *kind_str = cover_item_kind_str(item[i].kind);
-            if (item[i].data >= item[i].atleast) {
+            uint32_t data = cover_get_u32(db, bin, COV_ATTR_DATA, 0);
+
+            cover_item_kind_t kind = cover_get_kind(db, item);
+            const char *kind_str = cover_item_kind_str(kind);
+            if (data >= cover_get_threshold(db, item)) {
                warn_at(&excl->loc, "%s: '%s' is already covered, "
                                    "it will be reported as covered.",
                                    kind_str, istr(hier));
             }
             else {
                note_at(&excl->loc, "excluding %s: '%s'", kind_str, istr(hier));
-               item[i].flags |= COV_FLAG_EXCLUDED;
+               cover_put_flags(db, bin, COV_FLAG_EXCLUDED);
             }
          }
       }
    }
 }
 
-static void cover_exclude_scope(cover_data_t *data, cover_scope_t *s)
+static void cover_exclude_scope(cover_data_t *db, cover_obj_t scope)
 {
-   for (int i = 0; i < s->items.count; i++)
-      cover_exclude_items(data->ef, AGET(s->items, i));
+   cover_iter_t item_it = cover_begin(db, scope, COV_REL_ITEMS);
+   cover_obj_t item;
+   while (cover_next(&item_it, &item))
+      cover_exclude_items(db, item);
 
-   for (int i = 0; i < s->children.count; i++)
-      cover_exclude_scope(data, s->children.items[i]);
+   cover_iter_t child_it = cover_begin(db, scope, COV_REL_CHILDREN);
+   cover_obj_t child;
+   while (cover_next(&child_it, &child))
+      cover_exclude_scope(db, child);
+}
+
+static void cover_exclude_inst(cover_data_t *db, cover_obj_t inst)
+{
+   cover_obj_t root = cover_get_obj(db, inst, COV_ATTR_ROOT);
+   cover_exclude_scope(db, root);
+
+   cover_iter_t child_it = cover_begin(db, inst, COV_REL_CHILDREN);
+   cover_obj_t child;
+   while (cover_next(&child_it, &child))
+      cover_exclude_inst(db, child);
 }
 
 static void cover_parse_exclude_file(const char *path, cover_data_t *data)
 {
    FILE *ef = fopen(path, "r");
    if (ef == NULL)
-      fatal_errno("failed to open exclude file: %s\n", path);
+      fatal_errno("failed to open exclude file: %s", path);
 
    char *delim = " ";
    ssize_t read;
@@ -351,110 +342,183 @@ static void cover_parse_exclude_file(const char *path, cover_data_t *data)
    fclose(ef);
 }
 
-static void cover_apply_exclude_cmds(cover_data_t *data)
+static void cover_apply_exclude_cmds(cover_data_t *db)
 {
-   assert (data->ef != NULL);
+   assert(db->ef != NULL);
 
-   for (int i = 0; i < data->ef->n_excl_cmds; i++)
-      data->ef->excl[i].found = false;
+   for (int i = 0; i < db->ef->n_excl_cmds; i++)
+      db->ef->excl[i].found = false;
 
-   cover_exclude_scope(data, data->root_scope);
+   cover_iter_t it = cover_begin(db, COVER_NULL_OBJ, COV_REL_CHILDREN);
+   cover_obj_t root;
+   while (cover_next(&it, &root))
+      cover_exclude_inst(db, root);
 
-   for (int i = 0; i < data->ef->n_excl_cmds; i++)
-      if (!data->ef->excl[i].found)
-         warn_at(&data->ef->excl[i].loc, "excluded hierarchy does not match any "
-                 "coverage item: '%s'", istr(data->ef->excl[i].hier));
+   for (int i = 0; i < db->ef->n_excl_cmds; i++)
+      if (!db->ef->excl[i].found)
+         warn_at(&db->ef->excl[i].loc, "excluded hierarchy does not match "
+                 "any coverage item: %pQ", db->ef->excl[i].hier);
 }
 
-static void cover_fold_scopes(cover_scope_t *tgt_scope, cover_scope_t *src_scope)
+static void cover_fold_scopes(cover_data_t *db, cover_obj_t tgt_scope,
+                              cover_obj_t src_scope)
 {
-   int tgt_prefix_len = ident_len(tgt_scope->hier);
-   int src_prefix_len = ident_len(src_scope->hier);
+   ident_t tgt_scope_hier = cover_get_ident(db, tgt_scope, COV_ATTR_HIER);
+   ident_t src_scope_hier = cover_get_ident(db, src_scope, COV_ATTR_HIER);
+
+   int tgt_prefix_len = ident_len(tgt_scope_hier);
+   int src_prefix_len = ident_len(src_scope_hier);
 
    // Process items
-   for (int i = 0; i < src_scope->items.count; i++) {
-      cover_item_t *src = AGET(src_scope->items, i);
+   cover_iter_t src_it = cover_begin(db, src_scope, COV_REL_ITEMS);
+   cover_obj_t src;
+   while (cover_next(&src_it, &src)) {
+      cover_item_kind_t src_kind = cover_get_kind(db, src);
+      int src_nbins = cover_count(db, src, COV_REL_BINS);
 
-      for (int j = 0; j < tgt_scope->items.count; j++) {
-         cover_item_t *tgt = AGET(tgt_scope->items, j);
-         ident_t tgt_suffix_hier = NULL;
-         ident_t src_suffix_hier = NULL;
+      cover_iter_t tgt_it = cover_begin(db, tgt_scope, COV_REL_ITEMS);
+      cover_obj_t tgt;
+      while (cover_next(&tgt_it, &tgt)) {
+         cover_item_kind_t tgt_kind = cover_get_kind(db, tgt);
+         int tgt_nbins = cover_count(db, tgt, COV_REL_BINS);
 
-         // Compare hierarchical paths, but strip "tgt_scope" prefix from "tgt",
-         // and "src_scope" from "src". Only hierarchy suffix needs to be the same.
-         if (ident_len(tgt->hier) > tgt_prefix_len)
-            tgt_suffix_hier = ident_new(istr(tgt->hier) + tgt_prefix_len);
-         if (ident_len(src->hier) > src_prefix_len)
-            src_suffix_hier = ident_new(istr(src->hier) + src_prefix_len);
+         if (tgt_kind != src_kind)
+            continue;
 
-         if ((tgt_suffix_hier == src_suffix_hier) && (tgt->flags == src->flags)) {
-            assert(tgt->kind == src->kind);
-            cover_merge_one_item(tgt, src->data);
-            break;
+         for (int k = 0; k < src_nbins; k++) {
+            cover_obj_t sbin = cover_at(db, src, COV_REL_BINS, k);
+            ident_t src_hier = cover_get_ident(db, sbin, COV_ATTR_HIER);
+            cover_flags_t src_flags = cover_get_flags(db, sbin);
+
+            ident_t src_suffix_hier = NULL;
+            if (ident_len(src_hier) > src_prefix_len)
+               src_suffix_hier = ident_new(istr(src_hier) + src_prefix_len);
+
+            for (int l = 0; l < tgt_nbins; l++) {
+               cover_obj_t tbin = cover_at(db, tgt, COV_REL_BINS, l);
+               ident_t tgt_hier = cover_get_ident(db, tbin, COV_ATTR_HIER);
+               cover_flags_t tgt_flags = cover_get_flags(db, tbin);
+
+               ident_t tgt_suffix_hier = NULL;
+               if (ident_len(tgt_hier) > tgt_prefix_len)
+                  tgt_suffix_hier =
+                     ident_new(istr(tgt_hier) + tgt_prefix_len);
+
+               if (tgt_suffix_hier == src_suffix_hier
+                   && tgt_flags == src_flags) {
+                  uint32_t src_data = cover_get_u32(db, sbin, COV_ATTR_DATA, 0);
+                  cover_merge_bin(db, tbin, src_data);
+                  break;
+               }
+            }
          }
       }
    }
 
    // Process sub-scopes
-   for (int i = 0; i < src_scope->children.count; i++) {
-      cover_scope_t *src = src_scope->children.items[i];
+   src_it = cover_begin(db, src_scope, COV_REL_CHILDREN);
+   while (cover_next(&src_it, &src)) {
+      ident_t src_hier = cover_get_ident(db, src, COV_ATTR_HIER);
 
-      for (int j = 0; j < tgt_scope->children.count; j++) {
-         cover_scope_t *tgt = tgt_scope->children.items[j];
-
+      cover_iter_t tgt_it = cover_begin(db, tgt_scope, COV_REL_CHILDREN);
+      cover_obj_t tgt;
+      while (cover_next(&tgt_it, &tgt)) {
          // Compare hierarchical paths, but strip "tgt_scope" prefix from "tgt",
          // and "src_scope" from "src". Only suffix of hierarchy needs to be the same!
          ident_t tgt_suffix_hier = NULL;
          ident_t src_suffix_hier = NULL;
 
-         if (ident_len(tgt->hier) > tgt_prefix_len)
-            tgt_suffix_hier = ident_new(istr(tgt->hier) + tgt_prefix_len);
-         if (ident_len(src->hier) > src_prefix_len)
-            src_suffix_hier = ident_new(istr(src->hier) + src_prefix_len);
+         ident_t tgt_hier = cover_get_ident(db, tgt, COV_ATTR_HIER);
+
+         if (ident_len(tgt_hier) > tgt_prefix_len)
+            tgt_suffix_hier = ident_new(istr(tgt_hier) + tgt_prefix_len);
+         if (ident_len(src_hier) > src_prefix_len)
+            src_suffix_hier = ident_new(istr(src_hier) + src_prefix_len);
 
          if (tgt_suffix_hier == src_suffix_hier) {
-            cover_fold_scopes(tgt, src);
+            cover_fold_scopes(db, tgt, src);
             break;
          }
       }
    }
 }
 
-static void cover_iterate_fold_source(cover_data_t *data, cover_scope_t *tgt_scope,
-                                      cover_scope_t *src_scope, cover_fold_cmd_t *cmd)
+static void cover_iterate_fold_source_scope(cover_data_t *db,
+                                            cover_obj_t tgt_scope,
+                                            cover_obj_t src_scope,
+                                            cover_fold_cmd_t *cmd)
 {
-   for (int i = 0; i < src_scope->children.count; i++) {
-      cover_scope_t *curr_scp = src_scope->children.items[i];
+   ident_t tgt_hier = cover_get_ident(db, tgt_scope, COV_ATTR_HIER);
+   ident_t src_hier = cover_get_ident(db, src_scope, COV_ATTR_HIER);
 
-      if (curr_scp->hier == cmd->source) {
-         cmd->found_source = true;
-         diag_t *d = diag_new(DIAG_DEBUG, NULL);
-         diag_printf(d, "folding coverage scopes:");
-         diag_hint(d, NULL, "        Target - %s", istr(tgt_scope->hier));
-         diag_hint(d, NULL, "        Source - %s", istr(curr_scp->hier));
-         diag_emit(d);
-         cover_fold_scopes(tgt_scope, curr_scp);
-      }
-
-      cover_iterate_fold_source(data, tgt_scope, curr_scp, cmd);
+   if (src_hier == cmd->source) {
+      cmd->found_source = true;
+      diag_t *d = diag_new(DIAG_DEBUG, NULL);
+      diag_printf(d, "folding coverage scopes:");
+      diag_hint(d, NULL, "        Target - %s", istr(tgt_hier));
+      diag_hint(d, NULL, "        Source - %s", istr(src_hier));
+      diag_emit(d);
+      cover_fold_scopes(db, tgt_scope, src_scope);
    }
+
+   cover_iter_t it = cover_begin(db, src_scope, COV_REL_CHILDREN);
+   cover_obj_t src_child;
+   while (cover_next(&it, &src_child))
+      cover_iterate_fold_source_scope(db, tgt_scope, src_child, cmd);
 }
 
-static void cover_iterate_fold_target(cover_data_t *data, cover_scope_t *tgt_scope,
-                                      cover_fold_cmd_t *cmd)
+static void cover_iterate_fold_source_inst(cover_data_t *db,
+                                           cover_obj_t tgt_scope,
+                                           cover_obj_t src_inst,
+                                           cover_fold_cmd_t *cmd)
 {
-   for (int i = 0; i < tgt_scope->children.count; i++) {
-      cover_scope_t *curr_scp = tgt_scope->children.items[i];
+   cover_obj_t src_root = cover_get_obj(db, src_inst, COV_ATTR_ROOT);
+   cover_iterate_fold_source_scope(db, tgt_scope, src_root, cmd);
 
-      // On target scope name match, go and search for all source scopes and collapse them
-      // into the target scope!
-      if (curr_scp->hier == cmd->target) {
-         cmd->found_target = true;
-         cover_iterate_fold_source(data, curr_scp, data->root_scope, cmd);
-      }
+   cover_iter_t it = cover_begin(db, src_inst, COV_REL_CHILDREN);
+   cover_obj_t src_child;
+   while (cover_next(&it, &src_child))
+      cover_iterate_fold_source_inst(db, tgt_scope, src_child, cmd);
+}
 
-      cover_iterate_fold_target(data, curr_scp, cmd);
+static void cover_iterate_fold_sources(cover_data_t *db,
+                                       cover_obj_t tgt_scope,
+                                       cover_fold_cmd_t *cmd)
+{
+   cover_iter_t it = cover_begin(db, COVER_NULL_OBJ, COV_REL_CHILDREN);
+   cover_obj_t src_inst;
+   while (cover_next(&it, &src_inst))
+      cover_iterate_fold_source_inst(db, tgt_scope, src_inst, cmd);
+}
+
+static void cover_iterate_fold_target_scope(cover_data_t *db,
+                                            cover_obj_t tgt_scope,
+                                            cover_fold_cmd_t *cmd)
+{
+   // On target scope name match, go and search for all source scopes
+   // and collapse them into the target scope
+   if (cover_get_ident(db, tgt_scope, COV_ATTR_HIER) == cmd->target) {
+      cmd->found_target = true;
+      cover_iterate_fold_sources(db, tgt_scope, cmd);
    }
+
+   cover_iter_t it = cover_begin(db, tgt_scope, COV_REL_CHILDREN);
+   cover_obj_t child;
+   while (cover_next(&it, &child))
+      cover_iterate_fold_target_scope(db, child, cmd);
+}
+
+static void cover_iterate_fold_target_inst(cover_data_t *db,
+                                           cover_obj_t tgt_inst,
+                                           cover_fold_cmd_t *cmd)
+{
+   cover_obj_t tgt_root = cover_get_obj(db, tgt_inst, COV_ATTR_ROOT);
+   cover_iterate_fold_target_scope(db, tgt_root, cmd);
+
+   cover_iter_t it = cover_begin(db, tgt_inst, COV_REL_CHILDREN);
+   cover_obj_t child;
+   while (cover_next(&it, &child))
+      cover_iterate_fold_target_inst(db, child, cmd);
 }
 
 static void cover_apply_fold_cmds(cover_data_t *data)
@@ -469,7 +533,10 @@ static void cover_apply_fold_cmds(cover_data_t *data)
       cmd->found_source = false;
       cmd->found_target = false;
 
-      cover_iterate_fold_target(data, data->root_scope, cmd);
+      cover_iter_t it = cover_begin(data, COVER_NULL_OBJ, COV_REL_CHILDREN);
+      cover_obj_t root_inst;
+      while (cover_next(&it, &root_inst))
+         cover_iterate_fold_target_inst(data, root_inst, cmd);
 
       if (cmd->found_target == false)
          warn_at(&(cmd->loc), "fold target does not match any "
@@ -538,41 +605,26 @@ void cover_load_spec_file(cover_data_t *db, const char *path)
 
       tok++;
 
-      const char *kind = tok;
-      excl_trie_t *root = NULL;
-      if (strcmp(kind, "hierarchy") == 0)
+      excl_trie_t *root;
+      if (strcmp(tok, "hierarchy") == 0)
          root = spec->hier_trie;
-      else if (strcmp(kind, "block") == 0)
+      else if (strcmp(tok, "block") == 0)
          root = spec->block_trie;
-      else if (strcmp(kind, "fsm_type") == 0)
+      else if (!strcmp(tok, "fsm_type"))
          root = spec->fsm_trie;
-      else if (strcmp(kind, "package") != 0) {
-         error_at(&loc, "invalid command $bold$%s$$", kind);
-         continue;
-      }
-
-      char *arg = strtok(NULL, delim);
-      if (arg == NULL) {
-         error_at(&loc, "%s name missing", kind);
-         continue;
-      }
-
-      if (root != NULL) {
-         excl_trie_t *et = excl_trie_get(db, root, arg);
-         et->action = include ? ACTION_INCLUDE : ACTION_EXCLUDE;
-      }
       else {
-         // Package patterns are stored as a linked list of globs since
-         // they need glob matching against the package's name.
-         excl_glob_t *p = pool_calloc(db->pool, sizeof(excl_glob_t));
-         const size_t len = strlen(arg) + 1;
-         p->glob = pool_calloc(db->pool, len);
-         memcpy(p->glob, arg, len);
-         to_upper_str(p->glob);
-         p->include = include;
-         p->next = spec->pkg_globs;
-         spec->pkg_globs = p;
+         error_at(&loc, "invalid command $bold$%s$$", tok);
+         continue;
       }
+
+      char *hier = strtok(NULL, delim);
+      if (!hier) {
+         error_at(&loc, "%s name missing", tok);
+         continue;
+      }
+
+      excl_trie_t *et = excl_trie_get(db, root, hier);
+      et->action = include ? ACTION_INCLUDE : ACTION_EXCLUDE;
 
       if ((tok = strtok(NULL, delim)) != NULL)
          error_at(&loc, "unexpected '%s' after coverage specification "
@@ -598,71 +650,31 @@ void cover_load_spec_file(cover_data_t *db, const char *path)
    }
 }
 
-static bool cover_match_package(cover_spec_t *spec, ident_t pkg_name,
-                                ident_t pkg_hier)
-{
-   // -package always overrides anything else.
-   for (excl_glob_t *p = spec->pkg_globs; p != NULL; p = p->next) {
-      if (!p->include && ident_glob(pkg_name, p->glob, strlen(p->glob)))
-         return false;
-   }
-
-   excl_trie_t *hier_et = excl_trie_for_hier(spec->hier_trie, pkg_hier);
-   if (hier_et != NULL && hier_et->action == ACTION_EXCLUDE)
-      return false;
-
-   for (excl_glob_t *p = spec->pkg_globs; p != NULL; p = p->next) {
-      if (p->include && ident_glob(pkg_name, p->glob, strlen(p->glob)))
-         return true;
-   }
-
-   if (hier_et != NULL && hier_et->action == ACTION_INCLUDE)
-      return true;
-
-   return false;
-}
-
-bool cover_should_emit_package(cover_data_t *db, tree_t pack)
-{
-   // Packages are not collected by default; the user must opt-in via a
-   // coverage spec file with +package or +hierarchy directives.
-   if (db == NULL || db->spec == NULL)
-      return false;
-
-   // Standard libraries are never instrumented even when the spec would
-   // match them: several IEEE subprograms are replaced by intrinsics so
-   // coverage data would not be representative anyway.
-   ident_t pack_hier = tree_ident(pack);
-   ident_t pack_lib = ident_until(pack_hier, '.');
-   if (pack_lib == well_known(W_STD) || pack_lib == well_known(W_IEEE)
-       || pack_lib == well_known(W_NVC))
-      return false;
-
-   ident_t pack_name = ident_rfrom(pack_hier, '.');
-   return cover_match_package(db->spec, pack_name, pack_hier);
-}
-
-bool cover_should_emit_scope(cover_data_t *db, cover_scope_t *cs)
+bool cover_should_emit_scope(const cover_data_t *db, cover_obj_t scope)
 {
    if (db->spec == NULL)
       return true;
 
-   cover_scope_t *blk = cs;
-   for (; blk != NULL && blk->block_name == NULL; blk = blk->parent);
+   ident_t block_name = NULL;
+   cover_obj_t inst = cover_get_obj(db, scope, COV_ATTR_INST);
+   while (!cover_is_null(inst)) {
+      if ((block_name = cover_get_ident(db, inst, COV_ATTR_BLOCK_NAME)) != NULL)
+         break;
 
-   if (blk == NULL)
+      inst = cover_get_obj(db, inst, COV_ATTR_PARENT);
+   }
+
+   if (block_name == NULL)
       return true;
 
-   if (blk->kind == CSCOPE_PACKAGE)
-      return cover_match_package(db->spec, blk->block_name, blk->hier);
-
-   ident_t ename = ident_until(blk->block_name, '-');
+   ident_t ename = ident_until(block_name, '-');
 
    const excl_trie_t *et_block = excl_trie_search(db->spec->block_trie, ename);
    if (et_block != NULL)
       return et_block->action == ACTION_INCLUDE;
 
-   const excl_trie_t *et_hier = excl_trie_for_scope(db->spec->hier_trie, cs);
+   const excl_trie_t *et_hier =
+      excl_trie_for_scope(db, db->spec->hier_trie, scope);
    if (et_hier != NULL)
       return et_hier->action == ACTION_INCLUDE;
 
@@ -690,53 +702,22 @@ bool cover_should_emit_fsm_type(cover_data_t *db, ident_t name)
    return true;
 }
 
-bool cover_compatible_spec(cover_data_t *db, const cover_scope_t *a,
-                           const cover_scope_t *b)
+bool cover_should_emit_array_toggle(cover_data_t *db, int width)
 {
+   return db->array_limit == 0 || width < db->array_limit;
+}
+
+bool cover_compatible_spec(cover_data_t *db, cover_obj_t a, cover_obj_t b)
+{
+   assert(a.tag == COVER_TAG_SCOPE);
+   assert(b.tag == COVER_TAG_SCOPE);
+
    if (db->spec == NULL)
       return true;
 
-   excl_trie_t *et_a = excl_trie_for_scope(db->spec->hier_trie, a);
-   excl_trie_t *et_b = excl_trie_for_scope(db->spec->hier_trie, b);
+   excl_trie_t *et_a = excl_trie_for_scope(db, db->spec->hier_trie, a);
+   excl_trie_t *et_b = excl_trie_for_scope(db, db->spec->hier_trie, b);
 
    // TODO: this is overly strict since two rules may have the same effect
    return et_a == et_b;
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// Pragma handling
-///////////////////////////////////////////////////////////////////////////////
-
-void cover_ignore_from_pragmas(cover_data_t *data, cover_scope_t *cs,
-                               tree_t unit)
-{
-   if (!is_design_unit(unit))
-      return;   // Generate block, etc.
-
-   ignore_array_t *excl = &(cs->ignore_lines);
-   bool state = true;
-   const int npragmas = tree_pragmas(unit);
-   for (int i = 0; i < npragmas; i++) {
-      tree_t p = tree_pragma(unit, i);
-      const pragma_kind_t kind = tree_subkind(p);
-      if (kind != PRAGMA_COVERAGE_OFF && kind != PRAGMA_COVERAGE_ON)
-         continue;
-
-      if (kind == PRAGMA_COVERAGE_OFF && state) {
-         const loc_t *loc = tree_loc(p);
-         ignore_range_t ir = {
-            loc->file_ref,
-            loc->first_line,
-            INT_MAX
-         };
-         APUSH(*excl, ir);
-         state = false;
-      }
-      else if (kind == PRAGMA_COVERAGE_ON && !state) {
-         assert(excl->count > 0);
-         assert(excl->items[excl->count - 1].end == INT_MAX);
-         excl->items[excl->count - 1].end = tree_loc(p)->first_line;
-         state = true;
-      }
-   }
 }

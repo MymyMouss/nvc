@@ -243,18 +243,18 @@ static void type_set_describe(nametab_t *tab, diag_t *d, const loc_t *loc,
          else if (n > 0)
             tb_cat(tb, ", ");
 
-         tb_cat(tb, type_pp(tt.type));
+         tb_printf(tb, "%pT", tt.type);
          poss++;
       }
       else if (hint != NULL && *hint != '\0')
-         diag_hint(d, NULL, "context contains type %s which is not %s",
-                   type_pp(tt.type), hint);
+         diag_hint(d, NULL, "context contains type %pT which is not %s",
+                   tt.type, hint);
       else
-         diag_hint(d, NULL, "context contains type %s", type_pp(tt.type));
+         diag_hint(d, NULL, "context contains type %pT", tt.type);
 
       if (tt.src != NULL && is_subprogram(tt.src))
-         diag_hint(d, tree_loc(tt.src), "context contains overload %s",
-                   type_pp(tree_type(tt.src)));
+         diag_hint(d, tree_loc(tt.src), "context contains overload %pT",
+                   tree_type(tt.src));
    }
 
    if (poss > 0)
@@ -632,6 +632,8 @@ static bool compare_name(ident_t a, ident_t b)
 {
    if (a == b)
       return true;
+   else if (a == NULL || b == NULL)
+      return false;
    else if (isalpha_iso88591(ident_char(a, 0)))
       return ident_casecmp(a, b);
    else
@@ -997,7 +999,7 @@ static symbol_t *make_visible(scope_t *s, ident_t name, tree_t decl,
          else if ((dd->kind == T_FUNC_BODY && tkind == T_FUNC_BODY)
                   || (dd->kind == T_PROC_BODY && tkind == T_PROC_BODY)) {
             diag_t *d = diag_new(DIAG_ERROR, tree_loc(decl));
-            diag_printf(d, "duplicate subprogram body %s", type_pp(type));
+            diag_printf(d, "duplicate subprogram body %pT", type);
             diag_hint(d, tree_loc(decl), "duplicate definition here");
             diag_hint(d, tree_loc(dd->tree), "previous definition was here");
             diag_suppress(d, s->suppress || type_has_error(type));
@@ -1016,11 +1018,10 @@ static symbol_t *make_visible(scope_t *s, ident_t name, tree_t decl,
          else if (dd->origin == origin) {
             diag_t *d = diag_new(DIAG_ERROR, tree_loc(decl));
             if (type_strict_eq(tree_type(dd->tree), type))
-               diag_printf(d, "%s already declared in this region",
-                           type_pp(type));
+               diag_printf(d, "%pT already declared in this region", type);
             else {
-               diag_printf(d, "homograph of %s already declared in this region",
-                           type_pp(type));
+               diag_printf(d, "homograph of %pT already declared in this "
+                           "region", type);
                diag_hint(d, NULL, "only the base type is considered when "
                          "determining if two overloads have the same parameter "
                          "type profile");
@@ -1188,15 +1189,14 @@ static void missing_record_field_cb(diag_t *d, ident_t name, void *arg)
 {
    type_t type = arg;
 
-   diag_printf(d, "record type %s has no field named %s",
-               type_pp(type), istr(name));
+   diag_printf(d, "record type %pT has no field named %pI", type, name);
 
    ident_t best = NULL;
    int bestd = INT_MAX;
 
    LOCAL_TEXT_BUF tb = tb_new();
    int nfields = type_fields(type), i;
-   tb_printf(tb, "type %s has field%s ", type_pp(type), nfields > 1 ? "s" : "");
+   tb_printf(tb, "type %pT has field%s ", type, nfields > 1 ? "s" : "");
    for (i = 0; i < nfields; i++) {
       ident_t id = tree_ident(type_field(type, i));
       const int d = ident_distance(id, name);
@@ -1541,7 +1541,7 @@ void insert_spec(nametab_t *tab, tree_t spec, spec_kind_t kind,
 
    spec_t **p;
    for (p = &(scope->specs); *p != NULL; p = &((*p)->next)) {
-      if (kind == SPEC_EXACT && (*p)->ident == ident) {
+      if (kind == SPEC_EXACT && compare_name((*p)->ident, ident)) {
          diag_t *d = diag_new(DIAG_ERROR, tree_loc(spec));
          diag_printf(d, "duplicate specification for instance %s", istr(ident));
          diag_hint(d, tree_loc((*p)->tree), "previous specification was here");
@@ -1674,7 +1674,7 @@ tree_t query_spec(nametab_t *tab, tree_t object)
             others = it;
          break;
       case SPEC_EXACT:
-         if (it->ident == tree_ident(object)) {
+         if (compare_name(it->ident, tree_ident(object))) {
             it->matches++;
             return it->tree;
          }
@@ -1986,7 +1986,8 @@ static tree_t try_resolve_name(nametab_t *tab, const symbol_t *sym)
       for (int i = 0; i < m.count; i++) {
          if (is_container(m.items[i]) && is_enclosing(tab, m.items[i]))
             enclosing = m.items[i];
-         else if (is_subprogram(m.items[i])) {
+
+         if (is_subprogram(m.items[i])) {
             // Remove subprograms that cannot be called with zero
             // arguments
             if (!can_call_no_args(m.items[i]))
@@ -2071,11 +2072,11 @@ tree_t resolve_name(nametab_t *tab, const loc_t *loc, ident_t name)
             const int nports = tree_ports(t);
             if (nports > 0) {
                LOCAL_TEXT_BUF tb = tb_new();
-               tb_printf(tb, "subprogram %s has argument%s ",
-                         type_pp(tree_type(t)), nports > 1 ? "s" : "");
+               tb_printf(tb, "subprogram %pT has argument%s ",
+                         tree_type(t), nports > 1 ? "s" : "");
                for (int j = 0; j < nports; j++)
-                  tb_printf(tb, "%s%s", j > 0 ? ", " : "",
-                            istr(tree_ident(tree_port(t, j))));
+                  tb_printf(tb, "%s%pI", j > 0 ? ", " : "",
+                            tree_ident(tree_port(t, j)));
                diag_hint(d, tree_loc(t), "%s", tb_get(tb));
             }
          }
@@ -2089,7 +2090,7 @@ tree_t resolve_name(nametab_t *tab, const loc_t *loc, ident_t name)
          if (tab->top_scope->formal_fn != NULL)
             (*tab->top_scope->formal_fn)(d, name, tab->top_scope->formal_arg);
          else
-            diag_printf(d, "invalid formal name %s", istr(name));
+            diag_printf(d, "invalid formal name %pI", name);
 
          diag_emit(d);
       }
@@ -2194,7 +2195,7 @@ tree_t resolve_name(nametab_t *tab, const loc_t *loc, ident_t name)
 
       type_t type = get_type_or_null(dd->tree);
       if (type != NULL && !is_type_decl(dd->tree))
-         tb_printf(tb, " as %s", type_pp(tree_type(dd->tree)));
+         tb_printf(tb, " as %pT", tree_type(dd->tree));
 
       const bool has_named_origin =
          dd->origin->container != NULL
@@ -2234,7 +2235,7 @@ tree_t resolve_subprogram_name(nametab_t *tab, const loc_t *loc, ident_t name,
          if (dd->visibility == HIDDEN)
             continue;
          else if (dd->mask & N_SUBPROGRAM) {
-            type_t signature = tree_type(dd->tree);
+            type_t signature = get_alias_type(dd->tree);
             if (type_eq_map(constraint, signature, tab->top_scope->gmap))
                APUSH(matching, dd->tree);
          }
@@ -2270,21 +2271,6 @@ tree_t resolve_field_name(nametab_t *tab, const loc_t *loc, ident_t name,
 
    tab->top_scope = tmp;
    return decl;
-}
-
-static tree_t resolve_ref(nametab_t *tab, tree_t t)
-{
-   const loc_t *loc = tree_loc(t);
-   ident_t name = tree_ident(t);
-
-   type_t signature = get_signature(tab);
-   if (signature != NULL) {
-      // Reference to subprogram or enumeration literal with signature
-      return resolve_subprogram_name(tab, loc, name, signature);
-   }
-
-   // Ordinary reference
-   return resolve_name(tab, loc, name);
 }
 
 static tree_t resolve_record_ref_or_call(nametab_t *tab, tree_t t, bool pcall)
@@ -2466,7 +2452,16 @@ static tree_t resolve_selected_name(nametab_t *tab, tree_t t)
       if (sel == NULL)
          should_not_reach_here();
 
-      if (is_subprogram(sel) && can_call_no_args(sel)) {
+      bool is_fcall = false;
+      if (is_subprogram(sel))
+         is_fcall = can_call_no_args(sel);
+      else if (tree_kind(sel) == T_ALIAS) {
+         tree_t sub = get_aliased_subprogram(sel);
+         if (sub != NULL)
+            is_fcall = can_call_no_args(sub);
+      }
+
+      if (is_fcall) {
          tree_t fcall = tree_new(T_FCALL);
          tree_set_ident(fcall, qual);
          tree_set_loc(fcall, tree_loc(t));
@@ -2668,11 +2663,11 @@ tree_t resolve_resolution(nametab_t *tab, tree_t rname, type_t type)
          error_at(tree_loc(rname), "sorry, record element resolution is not "
                   "supported yet");
       else if (!type_is_array(type))
-         error_at(tree_loc(rname), "non-composite type %s may not have element "
-                  "resolution indication", type_pp(type));
+         error_at(tree_loc(rname), "non-composite type %pT may not have "
+                  "element resolution indication", type);
       else if (tree_assocs(rname) != 1)
-         error_at(tree_loc(rname), "non-record type %s may not have record "
-                  "element resolution indication", type_pp(type));
+         error_at(tree_loc(rname), "non-record type %pT may not have record "
+                  "element resolution indication", type);
       else {
          tree_t a0 = tree_value(tree_assoc(rname, 0));
          resolve_resolution(tab, a0, type_elem(type));
@@ -3060,8 +3055,8 @@ static void overload_trace_candidates(overload_t *o, const char *phase)
       printf("%s: %s\n", istr(o->name), phase);
       for (unsigned i = 0; i < o->candidates.count; i++) {
          tree_t d = o->candidates.items[i];
-         printf("  %s%s\n", type_pp(tree_type(d)),
-                (tree_flags(d) & TREE_F_PREDEFINED) ? " (predefined)" : "");
+         nvc_printf("  %pT%s\n", tree_type(d),
+                    (tree_flags(d) & TREE_F_PREDEFINED) ? " (predefined)" : "");
       }
    }
 }
@@ -3070,9 +3065,9 @@ static void overload_prune_candidate(overload_t *o, int index)
 {
    if (o->trace) {
       tree_t d = o->candidates.items[index];
-      printf("%s: prune candidate %s%s\n", istr(o->name),
-             type_pp(tree_type(o->candidates.items[index])),
-             (tree_flags(d) & TREE_F_PREDEFINED) ? " (predefined)" : "");
+      nvc_printf("%pI: prune candidate %pT%s\n", o->name,
+                 tree_type(o->candidates.items[index]),
+                 (tree_flags(d) & TREE_F_PREDEFINED) ? " (predefined)" : "");
    }
 
    o->candidates.items[index] = NULL;
@@ -3185,12 +3180,12 @@ static void begin_overload_resolution(overload_t *o)
    overload_trace_candidates(o, "initial candidates");
 
    if (o->trace && o->nametab->top_type_set->members.count > 0) {
-      printf("%s: context ", istr(o->name));
+      nvc_printf("%pI: context ", o->name);
       for (unsigned n = 0; n < o->nametab->top_type_set->members.count; n++) {
          if (n > 0) printf(", ");
-         printf("%s", type_pp(o->nametab->top_type_set->members.items[n].type));
+         nvc_printf("%pT", o->nametab->top_type_set->members.items[n].type);
       }
-      printf("\n");
+      nvc_printf("\n");
    }
 
    o->initial = o->candidates.count;
@@ -3303,35 +3298,34 @@ static void begin_overload_resolution(overload_t *o)
          for (int i = 0; i < o->symbol->ndecls; i++) {
             const decl_t *dd = get_decl(o->symbol, i);
             if ((dd->mask & N_SUBPROGRAM) && dd->visibility == HIDDEN)
-               diag_hint(d, tree_loc(dd->tree), "subprogram %s is hidden",
-                         type_pp(tree_type(dd->tree)));
+               diag_hint(d, tree_loc(dd->tree), "subprogram %pT is hidden",
+                         tree_type(dd->tree));
          }
 
          if (!hinted)
-            diag_hint(d, tree_loc(o->tree), "%s called here", istr(o->name));
+            diag_hint(d, tree_loc(o->tree), "%pI called here", o->name);
       }
 
       type_t ptype = o->prefix ? get_type_or_null(o->prefix) : NULL;
       if (ptype != NULL && type_is_protected(ptype)) {
-         diag_printf(d, "protected type %s has no method named %s",
-                     type_pp(ptype), istr(o->name));
+         diag_printf(d, "protected type %pT has no method named %pI",
+                     ptype, o->name);
 
          scope_t *s = scope_for_type(o->nametab, ptype);
          hint_for_typo(s, d, o->name, N_SUBPROGRAM);
       }
       else if (o->initial > 0) {
-         diag_printf(d, "no applicable subprogram declaration for %s",
-                     istr(o->name));
+         diag_printf(d, "no applicable subprogram declaration for %pI",
+                     o->name);
 
          type_set_describe(o->nametab, d, tree_loc(o->tree),
                            o->nametab->top_type_set->pred, NULL);
 
-         diag_hint(d, NULL, "there are %d visible overloads of %s but none "
-                   "can be called in this context", o->initial, istr(o->name));
+         diag_hint(d, NULL, "there are %d visible overloads of %pI but none "
+                   "can be called in this context", o->initial, o->name);
       }
       else {
-         diag_printf(d, "no visible subprogram declaration for %s",
-                     istr(o->name));
+         diag_printf(d, "no visible subprogram declaration for %pI", o->name);
          hint_for_typo(o->nametab->top_scope, d, o->name, N_SUBPROGRAM);
       }
 
@@ -3449,7 +3443,7 @@ static tree_t finish_overload_resolution(overload_t *o)
                   {
                      tree_t ref = name_to_ref(tree_name(param));
                      if (ref != NULL)
-                        match = ident_casecmp(tree_ident(ref), tree_ident(port));
+                        match = compare_name(tree_ident(ref), tree_ident(port));
                   }
                   break;
                }
@@ -3516,15 +3510,15 @@ static tree_t finish_overload_resolution(overload_t *o)
       for (unsigned i = 0; i < o->candidates.count; i++) {
          const loc_t *cloc = tree_loc(o->candidates.items[i]);
          if (cloc->file_ref == loc->file_ref)
-            diag_hint(d, cloc, "candidate %s",
-                      type_pp(tree_type(o->candidates.items[i])));
+            diag_hint(d, cloc, "candidate %pT",
+                      tree_type(o->candidates.items[i]));
          else {
             tree_t container = tree_container(o->candidates.items[i]);
             tree_t primary = primary_unit_of(container);
 
-            diag_hint(d, NULL, "candidate %s from %s%s",
-                      type_pp(tree_type(o->candidates.items[i])),
-                      istr(tree_ident(primary)),
+            diag_hint(d, NULL, "candidate %pT from %pI%s",
+                      tree_type(o->candidates.items[i]),
+                      tree_ident(primary),
                       primary != container ? " body" : "");
          }
 
@@ -3546,15 +3540,15 @@ static tree_t finish_overload_resolution(overload_t *o)
       tb_printf(tb, "%s [", istr(o->name));
       qsort(o->params.items, o->params.count, sizeof(tree_t), param_compar);
       for (unsigned i = 0; i < o->params.count; i++)
-         tb_printf(tb, "%s%s", i > 0 ? ", " : "",
-                   type_pp(tree_type(tree_value(o->params.items[i]))));
+         tb_printf(tb, "%s%pT", i > 0 ? ", " : "",
+                   tree_type(tree_value(o->params.items[i])));
 
       type_set_t *ts = o->nametab->top_type_set;
       if (ts != NULL && ts->members.count > 0) {
          tb_printf(tb, "%sreturn ", o->params.count > 0 ? " " : "");
          for (unsigned i = 0; i < ts->members.count; i++)
-            tb_printf(tb, "%s%s", i > 0 ? " | " : "",
-                      type_pp(ts->members.items[i].type));
+            tb_printf(tb, "%s%pT", i > 0 ? " | " : "",
+                      ts->members.items[i].type);
       }
 
       tb_append(tb, ']');
@@ -3841,8 +3835,7 @@ static void overload_next_argument(overload_t *o, tree_t p)
    }
 
    if (o->trace)
-      printf("%s: next argument %s %s\n", istr(o->name),
-             tree_kind_str(tree_kind(value)), type_pp(type));
+      nvc_printf("%pI: next argument %pK %pT\n", o->name, value, type);
 
    const bool is_partial =
       tree_subkind(p) == P_NAMED
@@ -3919,7 +3912,7 @@ static void overload_cancel_argument(overload_t *o, tree_t p)
          printf("%s: restrict to: ", istr(o->name));
          for (unsigned n = 0; n < ts->members.count; n++) {
             if (n > 0) printf(", ");
-            printf("%s", type_pp(ts->members.items[n].type));
+            nvc_printf("%pT", ts->members.items[n].type);
          }
          printf("\n");
       }
@@ -4052,7 +4045,6 @@ static bool is_unambiguous(tree_t t)
       || kind == T_TYPE_CONV
       || kind == T_ALL
       || kind == T_PSL_FCALL
-      || kind == T_RECORD_REF
       || (kind == T_REF && tree_has_ref(t));
 }
 
@@ -4196,6 +4188,16 @@ static tree_t resolve_fcall_or_index(nametab_t *tab, tree_t fcall, tree_t decl)
 
    if (!is_slice && !type_set_contains(tab, etype))
       return fcall;
+   else if (!is_slice) {
+      // Prefer the function call interpretation if the array index
+      // types do not match
+      for (int i = 0; i < nparams; i++) {
+         type_t index_type = index_type_of(rtype, i);
+         type_t atype = tree_type(tree_value(tree_param(fcall, i)));
+         if (index_type == NULL || !type_eq(atype, index_type))
+            return fcall;
+      }
+   }
 
    const tree_kind_t kind = tree_kind(fcall);
 
@@ -4638,7 +4640,28 @@ static tree_t solve_ref(nametab_t *tab, tree_t ref)
    if (tree_has_type(ref))
       return ref;
 
-   tree_t decl = resolve_ref(tab, ref);
+   ident_t name = tree_ident(ref);
+   const loc_t *loc = tree_loc(ref);
+
+   tree_t decl;
+   type_t signature = get_signature(tab);
+   if (signature != NULL) {
+      // Reference to subprogram or enumeration literal with signature
+      decl = resolve_subprogram_name(tab, loc, name, signature);
+
+      // Resolve chains of aliased subprograms
+      // TODO: revisit get_aliased_subprogram handling of T_PROT_REF
+      while (decl != NULL && tree_kind(decl) == T_ALIAS) {
+         tree_t value = tree_value(decl);
+         if (tree_kind(value) != T_REF || !tree_has_ref(value))
+            break;
+
+         decl = tree_ref(value);
+      }
+   }
+   else
+      decl = resolve_name(tab, loc, name);
+
    if (decl == NULL) {
       tree_set_type(ref, type_new(T_NONE));
       return ref;
@@ -4646,17 +4669,16 @@ static tree_t solve_ref(nametab_t *tab, tree_t ref)
 
    type_t type = get_alias_type(decl);
 
-   if (type != NULL && type_is_subprogram(type)) {
-      const bool want_ref = get_signature(tab) != NULL
-         || tab->top_scope->formal_kind != F_NONE;
+   const bool is_zero_args_fcall =
+      signature == NULL && type != NULL && type_is_subprogram(type)
+      && can_call_no_args(decl) && tab->top_scope->formal_kind == F_NONE;
 
-      if (can_call_no_args(decl) && !want_ref) {
-         tree_t fcall = tree_new(T_FCALL);
-         tree_set_loc(fcall, tree_loc(ref));
-         tree_set_ident(fcall, tree_ident(ref));
+   if (is_zero_args_fcall) {
+      tree_t fcall = tree_new(T_FCALL);
+      tree_set_loc(fcall, loc);
+      tree_set_ident(fcall, name);
 
-         return solve_fcall(tab, fcall);
-      }
+      return solve_fcall(tab, fcall);
    }
 
    tree_set_type(ref, type);
@@ -4679,6 +4701,15 @@ static type_t solve_field_subtype(type_t rtype, tree_t field)
    }
 
    return ftype;
+}
+
+static tree_t try_solve_record_ref(nametab_t *tab, tree_t t)
+{
+   tree_t call = resolve_record_ref_or_call(tab, t, false);
+   if (call != NULL)
+      return try_solve_type(tab, call);
+
+   return _solve_types(tab, t);
 }
 
 static tree_t solve_record_ref(nametab_t *tab, tree_t t)
@@ -4782,12 +4813,21 @@ static tree_t solve_array_ref(nametab_t *tab, tree_t t)
    if (conv != NULL)
       return _solve_types(tab, conv);
 
+   if (!tree_has_type(deref)) {
+      error_at(tree_loc(deref), "%pC %pI cannot be indexed", deref,
+               tree_ident(deref));
+      tree_set_type(deref, type_new(T_NONE));
+   }
+
    type_t base_type = tree_type(deref);
 
    const int nparams = tree_params(t);
    for (int i = 0; i < nparams; i++) {
       tree_t p = tree_param(t, i);
-      assert(tree_subkind(p) == P_POS);
+      if (tree_subkind(p) != P_POS) {
+         error_at(tree_loc(p), "named association not allowed in indexed name");
+         tree_set_subkind(p, P_POS);
+      }
 
       type_t index_type = index_type_of(base_type, i);
       if (index_type == NULL)
@@ -4803,8 +4843,7 @@ static tree_t solve_array_ref(nametab_t *tab, tree_t t)
    else if (type_is_none(base_type))
       elem_type = base_type;
    else {
-      error_at(tree_loc(t), "cannot index non-array type %s",
-               type_pp(base_type));
+      error_at(tree_loc(t), "cannot index non-array type %pT", base_type);
       elem_type = type_new(T_NONE);
    }
 
@@ -4820,6 +4859,12 @@ static tree_t solve_array_slice(nametab_t *tab, tree_t t)
    tree_t value = _solve_types(tab, tree_value(t));
    tree_t deref = implicit_dereference(tab, value);
    tree_set_value(t, deref);
+
+   if (!tree_has_type(deref)) {
+      error_at(tree_loc(deref), "%pC %pI cannot be sliced", deref,
+               tree_ident(deref));
+      tree_set_type(deref, type_new(T_NONE));
+   }
 
    type_t type = tree_type(deref);
    type_t index_type = index_type_of(type, 0);
@@ -4863,7 +4908,8 @@ static tree_t try_solve_attr_ref(nametab_t *tab, tree_t t)
             tree_t decl;
             if (tree_has_ref(name))
                decl = tree_ref(name);
-            else if ((decl = resolve_ref(tab, name)))
+            else if ((decl = resolve_name(tab, tree_loc(name),
+                                          tree_ident(name))))
                tree_set_ref(name, decl);
 
             if (decl != NULL && class_has_type(class_of(decl))
@@ -4941,7 +4987,7 @@ static tree_t try_solve_attr_ref(nametab_t *tab, tree_t t)
 
          if ((type = index_type_of(prefix_type, dim - 1)) == NULL) {
             error_at(tree_loc(t), "dimension index %"PRIi64" out of range "
-                     "for type %s", dim, type_pp(prefix_type));
+                     "for type %pT", dim, prefix_type);
             type = type_new(T_NONE);
          }
       }
@@ -5494,8 +5540,8 @@ static tree_t solve_all(nametab_t *tab, tree_t t)
       type = type_designated(type);
       if (type_is_incomplete(type)
           && (type = resolve_type(tab, type)) == NULL) {
-         error_at(tree_loc(prefix), "object with incomplete type %s "
-                  "cannot be dereferenced", type_pp(type));
+         error_at(tree_loc(prefix), "object with incomplete type %pT "
+                  "cannot be dereferenced", type);
          type = type_new(T_NONE);
       }
    }
@@ -5825,6 +5871,8 @@ static tree_t try_solve_type(nametab_t *tab, tree_t t)
       return try_solve_new(tab, t);
    case T_ARRAY_REF:
       return try_solve_array_ref(tab, t);
+   case T_RECORD_REF:
+      return try_solve_record_ref(tab, t);
    default:
       CANNOT_HANDLE(t);
    }

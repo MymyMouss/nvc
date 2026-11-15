@@ -31,6 +31,18 @@ START_TEST(test_sanity)
    fail_unless(shell_eval(sh, "expr 1 + 2", &result));
    ck_assert_str_eq(result, "3");
 
+   fail_unless(shell_eval(sh, "set tcl_interactive", &result));
+   ck_assert_str_eq(result, "0");
+
+   fail_unless(shell_eval(sh, "set argv0", &result));
+   ck_assert_str_eq(result, "nvc");
+
+   fail_unless(shell_eval(sh, "set argc", &result));
+   ck_assert_str_eq(result, "0");
+
+   fail_unless(shell_eval(sh, "set argv", &result));
+   ck_assert_str_eq(result, "");
+
    shell_free(sh);
 }
 END_TEST
@@ -54,7 +66,8 @@ START_TEST(test_examine1)
 
    rt_model_t *m = model_new(j, NULL);
 
-   tree_t top = elab(tree_to_object(arch), j, ur, mc, NULL, NULL, m);
+   object_t *tops[1] = { tree_to_object(arch) };
+   tree_t top = elab(tops, 1, j, ur, mc, NULL, NULL, m);
    fail_if(top == NULL);
 
    tcl_shell_t *sh = shell_new(top, j, m);
@@ -199,7 +212,8 @@ START_TEST(test_force1)
 
    rt_model_t *m = model_new(j, NULL);
 
-   tree_t top = elab(tree_to_object(arch), j, ur, mc, NULL, NULL, m);
+   object_t *tops[1] = { tree_to_object(arch) };
+   tree_t top = elab(tops, 1, j, ur, mc, NULL, NULL, m);
    fail_if(top == NULL);
 
    tcl_shell_t *sh = shell_new(top, j, m);
@@ -219,12 +233,18 @@ START_TEST(test_force1)
 
    shell_eval(sh, "force /x '1'", &result);
    ck_assert_str_eq(result, "");
+   shell_eval(sh, "examine /x", &result);
+   ck_assert_str_eq(result, "'1'");
 
    shell_eval(sh, "force /y 42", &result);
    ck_assert_str_eq(result, "");
+   shell_eval(sh, "examine /y", &result);
+   ck_assert_str_eq(result, "42");
 
    shell_eval(sh, "force /z \"110\"", &result);
    ck_assert_str_eq(result, "");
+   shell_eval(sh, "examine /z", &result);
+   ck_assert_str_eq(result, "\"110\"");
 
    shell_eval(sh, "force", &result);
    ck_assert_str_eq(result, "");
@@ -238,12 +258,16 @@ START_TEST(test_force1)
 
    shell_eval(sh, "noforce /x", &result);
    ck_assert_str_eq(result, "");
+   shell_eval(sh, "examine /x", &result);
+   ck_assert_str_eq(result, "'0'");
 
    shell_eval(sh, "run 1 ns", &result);
    ck_assert_str_eq(result, "");
 
    shell_eval(sh, "noforce *", &result);
    ck_assert_str_eq(result, "");
+   shell_eval(sh, "examine /y /z", &result);
+   ck_assert_str_eq(result, "55 {\"001\"}");
 
    shell_eval(sh, "noforce /x", &result);
 
@@ -305,7 +329,8 @@ START_TEST(test_describe1)
 
    rt_model_t *m = model_new(j, NULL);
 
-   tree_t top = elab(tree_to_object(arch), j, ur, mc, NULL, NULL, m);
+   object_t *tops[1] = { tree_to_object(arch) };
+   tree_t top = elab(tops, 1, j, ur, mc, NULL, NULL, m);
    fail_if(top == NULL);
 
    tcl_shell_t *sh = shell_new(top, j, m);

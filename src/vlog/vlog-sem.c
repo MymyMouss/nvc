@@ -48,7 +48,6 @@ static void vlog_check_decls(vlog_node_t v);
 static void vlog_check_stmts(vlog_node_t v);
 static void vlog_check_ranges(vlog_node_t v);
 static type_mask_t vlog_check_expr(vlog_node_t v);
-static type_mask_t vlog_check_const_expr(vlog_node_t v);
 
 static void name_for_diag(diag_t *d, vlog_node_t v, const char *alt)
 {
@@ -87,6 +86,7 @@ static type_mask_t get_type_mask(vlog_node_t v)
    case V_TF_PORT_DECL:
    case V_TYPE_DECL:
    case V_FUNC_DECL:
+   case V_LOCAL_DECL:
       return get_type_mask(vlog_type(v));
    default:
       CANNOT_HANDLE(v);
@@ -122,6 +122,8 @@ static void vlog_check_variable_lvalue(vlog_node_t v, vlog_node_t where)
    case V_ENUM_DECL:
    case V_UNION_DECL:
    case V_GENVAR_DECL:
+   case V_LOCAL_DECL:
+   case V_TF_PORT_DECL:
       return;
    case V_REF:
       if (vlog_has_ref(v))
@@ -141,10 +143,6 @@ static void vlog_check_variable_lvalue(vlog_node_t v, vlog_node_t where)
          }
       }
       return;
-   case V_TF_PORT_DECL:
-      if (vlog_subkind(v) != V_PORT_INPUT)
-         return;
-      break;
    case V_PORT_DECL:
       if (vlog_has_ref(v)) {
          vlog_check_variable_lvalue(vlog_ref(v), where);
@@ -153,6 +151,8 @@ static void vlog_check_variable_lvalue(vlog_node_t v, vlog_node_t where)
       else if (!is_implicit_data_type(vlog_type(v)))
          return;
       break;
+   case V_HIER_REF:
+      return;   // Cannot check now
    default:
       break;
    }
@@ -253,11 +253,13 @@ static void vlog_check_ranges(vlog_node_t v)
       vlog_check(vlog_range(v, i));
 }
 
-static void vlog_check_params(vlog_node_t v)
+static type_mask_t vlog_check_params(vlog_node_t v)
 {
+   type_mask_t mask = TM_CONST;
    const int nparams = vlog_params(v);
    for (int i = 0; i < nparams; i++)
-      vlog_check_expr(vlog_param(v, i));
+      mask &= vlog_check_expr(vlog_param(v, i));
+   return mask;
 }
 
 static void vlog_check_nbassign(vlog_node_t v)
@@ -320,6 +322,20 @@ static void vlog_check_release(vlog_node_t v)
    vlog_check_net_lvalue(target, target);
 }
 
+static void vlog_check_type(vlog_node_t v)
+{
+   vlog_node_t type = vlog_type(v);
+
+   switch (vlog_kind(type)) {
+   case V_CLASS_DECL:
+      return;   // Checked at original declaration
+   default:
+      break;
+   }
+
+   vlog_check(type);
+}
+
 static void vlog_check_consistent(vlog_node_t a, vlog_node_t b)
 {
    vlog_node_t at = vlog_type(a);
@@ -374,6 +390,10 @@ static void vlog_check_port_decl(vlog_node_t v)
          diag_emit(d);
       }
    }
+   else {
+      vlog_check_type(v);
+      vlog_check_ranges(v);
+   }
 
    if (vlog_has_value(v))
       vlog_check_expr(vlog_value(v));
@@ -381,7 +401,7 @@ static void vlog_check_port_decl(vlog_node_t v)
 
 static void vlog_check_net_decl(vlog_node_t v)
 {
-   vlog_check(vlog_type(v));
+   vlog_check_type(v);
    vlog_check_ranges(v);
 
    if (vlog_has_value(v))
@@ -390,7 +410,7 @@ static void vlog_check_net_decl(vlog_node_t v)
 
 static void vlog_check_var_decl(vlog_node_t v)
 {
-   vlog_check(vlog_type(v));
+   vlog_check_type(v);
    vlog_check_ranges(v);
 
    if (vlog_has_value(v))
@@ -432,7 +452,54 @@ static void vlog_check_union_decl(vlog_node_t v)
    vlog_check_decls(v);
 }
 
-static void vlog_check_tf_decl(vlog_node_t v)
+static void vlog_const_func_cb(vlog_node_t v, void *ctx)
+{
+   switch (vlog_kind(v)) {
+   case V_REF:
+      {
+         vlog_node_t decl = vlog_ref(v);
+         switch (vlog_kind(decl)) {
+         case V_PARAM_DECL:
+         case V_LOCALPARAM:
+         case V_GENVAR_DECL:
+         case V_ENUM_NAME:
+         case V_LOCAL_DECL:
+         case V_FUNC_DECL:
+         case V_TF_PORT_DECL:
+            break;
+         default:
+            vlog_clear_flags(ctx, VLOG_F_CONST);
+            break;
+         }
+      }
+      break;
+   case V_USER_FCALL:
+      if (!(vlog_flags(vlog_ref(v)) & VLOG_F_CONST))
+         vlog_clear_flags(ctx, VLOG_F_CONST);
+      break;
+   case V_HIER_REF:
+      vlog_clear_flags(ctx, VLOG_F_CONST);
+      break;
+   default:
+      break;
+   }
+}
+
+static void vlog_check_func_decl(vlog_node_t v)
+{
+   vlog_set_flags(v, VLOG_F_CONST);
+
+   const int nports = vlog_ports(v);
+   for (int i = 0; i < nports; i++)
+      vlog_check(vlog_port(v, i));
+
+   vlog_check_decls(v);
+   vlog_check_stmts(v);
+
+   vlog_visit(v, vlog_const_func_cb, v);
+}
+
+static void vlog_check_task_decl(vlog_node_t v)
 {
    const int nports = vlog_ports(v);
    for (int i = 0; i < nports; i++)
@@ -496,10 +563,10 @@ static void vlog_check_dimension(vlog_node_t v)
       return;
 
    vlog_node_t left = vlog_left(v);
-   vlog_check_const_expr(left);
+   vlog_check_expr(left);
 
    vlog_node_t right = vlog_right(v);
-   vlog_check_const_expr(right);
+   vlog_check_expr(right);
 }
 
 static void vlog_check_localparam(vlog_node_t v)
@@ -509,6 +576,11 @@ static void vlog_check_localparam(vlog_node_t v)
    else
       error_at(vlog_loc(v), "local parameter declaration must have a "
                "default value");
+}
+
+static void vlog_check_defparam(vlog_node_t v)
+{
+   vlog_check_expr(vlog_value(v));
 }
 
 static void vlog_check_case(vlog_node_t v)
@@ -586,9 +658,9 @@ static void vlog_check_call_args(vlog_node_t v, vlog_node_t sub)
          diag_printf(d, "at most %d ", nports);
       else
          diag_printf(d, "%d ", nports);
-      diag_printf(d, "argument%s for '%pi' but have %d",
+      diag_printf(d, "argument%s for %pQ but have %d",
                   minargs != 1 ? "s" : "", vlog_ident(sub), nparams);
-      diag_hint(d, vlog_loc(sub), "'%pi' declared here", vlog_ident(sub));
+      diag_hint(d, vlog_loc(sub), "%pQ declared here", vlog_ident(sub));
       diag_emit(d);
       return;
    }
@@ -602,19 +674,19 @@ static void vlog_check_call_args(vlog_node_t v, vlog_node_t sub)
 
          if (vlog_kind(p) == V_EMPTY && !vlog_has_value(port)) {
             diag_t *d = diag_new(DIAG_ERROR, vlog_loc(v));
-            diag_printf(d, "'%pi' argument '%pi' cannot be empty as it does "
+            diag_printf(d, "%pQ argument %pQ cannot be empty as it does "
                         "not have a default value", vlog_ident(sub),
                         vlog_ident(port));
-            diag_hint(d, vlog_loc(port), "'%pi' declared here",
+            diag_hint(d, vlog_loc(port), "%pQ declared here",
                       vlog_ident(port));
             diag_emit(d);
          }
       }
       else if (!mask_test(&optmask, i)) {
          diag_t *d = diag_new(DIAG_ERROR, vlog_loc(v));
-         diag_printf(d, "missing '%pi' argument '%pi' without a default value",
+         diag_printf(d, "missing %pQ argument %pQ without a default value",
                      vlog_ident(sub), vlog_ident(port));
-         diag_hint(d, vlog_loc(port), "'%pi' declared here", vlog_ident(port));
+         diag_hint(d, vlog_loc(port), "%pQ declared here", vlog_ident(port));
          diag_emit(d);
       }
    }
@@ -642,9 +714,10 @@ static void vlog_check_super_call(vlog_node_t v)
 
 static void vlog_check_deassign(vlog_node_t v)
 {
-   error_at(vlog_loc(v), "procedural deassign statements are not supported "
-            "as they are being considered for removal from the System Verilog "
-            "standard");
+   vlog_node_t target = vlog_target(v);
+
+   vlog_check_expr(target);
+   vlog_check_variable_lvalue(target, target);
 }
 
 static void vlog_check_return(vlog_node_t v)
@@ -690,7 +763,7 @@ static void vlog_check_if_generate(vlog_node_t v)
 
       if (vlog_has_value(c)) {
          vlog_node_t value = vlog_value(c);
-         vlog_check_const_expr(value);
+         vlog_check_expr(value);
       }
 
       vlog_check_stmts(c);
@@ -763,13 +836,13 @@ static void vlog_check_port_conn(vlog_node_t v)
 static void vlog_check_param_assign(vlog_node_t v)
 {
    if (vlog_has_value(v))
-      vlog_check_const_expr(vlog_value(v));
+      vlog_check_expr(vlog_value(v));
 }
 
 static void vlog_check_enum_name(vlog_node_t v)
 {
    if (vlog_has_value(v))
-      vlog_check_const_expr(vlog_value(v));
+      vlog_check_expr(vlog_value(v));
 }
 
 static void vlog_check_wait(vlog_node_t v)
@@ -777,14 +850,23 @@ static void vlog_check_wait(vlog_node_t v)
    // TODO
 }
 
-static type_mask_t vlog_check_hier_ref(vlog_node_t v)
+static type_mask_t vlog_check_mod_ref(vlog_node_t v)
 {
-   vlog_node_t inst = vlog_ref(v);
-   if (vlog_kind(inst) != V_MOD_INST)
-      error_at(vlog_loc(v), "prefix of hierarchical identifier is not an "
-               "instance");
+   if (vlog_has_ref(v)) {
+      vlog_node_t inst = vlog_ref(v);
+      if (vlog_kind(inst) != V_MOD_INST) {
+         error_at(vlog_loc(v), "prefix of hierarchical identifier is not an "
+                  "instance");
+         return TM_ERROR;
+      }
+   }
 
    return TM_INTEGRAL;
+}
+
+static type_mask_t vlog_check_hier_ref(vlog_node_t v)
+{
+   return vlog_check_expr(vlog_value(v));
 }
 
 static type_mask_t vlog_check_member_ref(vlog_node_t v)
@@ -824,11 +906,11 @@ static type_mask_t vlog_check_part_select(vlog_node_t v)
 {
    if (vlog_subkind(v) == V_RANGE_CONST) {
       vlog_node_t left = vlog_left(v);
-      vlog_check_const_expr(left);
+      vlog_check_expr(left);
    }
 
    vlog_node_t right = vlog_right(v);
-   vlog_check_const_expr(right);
+   vlog_check_expr(right);
 
    return vlog_check_index(v);
 }
@@ -870,7 +952,7 @@ static type_mask_t vlog_check_concat(vlog_node_t v)
 {
    if (vlog_has_value(v)) {
       vlog_node_t repeat = vlog_value(v);
-      vlog_check_const_expr(repeat);
+      vlog_check_expr(repeat);
    }
 
    type_mask_t mask = TM_ANY;
@@ -1000,12 +1082,19 @@ static type_mask_t vlog_check_cond_expr(vlog_node_t v)
 
 static type_mask_t vlog_check_sys_fcall(vlog_node_t v)
 {
-   vlog_check_params(v);
+   type_mask_t mask = vlog_check_params(v);
 
    // See 1800-2023 section 11.2.1 for list of constant system functions
-   switch (is_well_known(vlog_ident(v))) {
-   case W_DLR_CLOG2:
-      return TM_INTEGRAL | TM_CONST;
+   switch (vlog_subkind(v)) {
+   case V_SYSTF_CLOG2:
+   case V_SYSTF_SIGNED:
+   case V_SYSTF_UNSIGNED:
+   case V_SYSTF_RTOI:
+   case V_SYSTF_FLOOR:
+      return TM_INTEGRAL | (TM_CONST & mask);
+   case V_SYSTF_SQRT:
+   case V_SYSTF_CEIL:
+      return TM_REAL | (TM_CONST & mask);
    default:
       return TM_INTEGRAL;
    }
@@ -1022,7 +1111,11 @@ static type_mask_t vlog_check_class_new(vlog_node_t v)
 
 static type_mask_t vlog_check_dynamic_new(vlog_node_t v)
 {
-   vlog_check_expr(vlog_value(v));
+   vlog_check_expr(vlog_left(v));
+
+   if (vlog_has_value(v))
+      vlog_check_expr(vlog_value(v));
+
    return get_type_mask(vlog_type(v));
 }
 
@@ -1048,45 +1141,25 @@ static type_mask_t vlog_check_prefix_postfix(vlog_node_t v)
    return tmask;
 }
 
-static void vlog_non_const_diag_cb(vlog_node_t v, void *ctx)
+static type_mask_t vlog_check_min_typ_max(vlog_node_t v)
 {
-   vlog_node_t *pdecl = ctx;
-
-   vlog_node_t decl = vlog_ref(v);
-   switch (vlog_kind(decl)) {
-   case V_PARAM_DECL:
-   case V_LOCALPARAM:
-   case V_GENVAR_DECL:
-   case V_ENUM_NAME:
-      break;
-   default:
-      *pdecl = decl;
-      break;
-   }
+   vlog_check_expr(vlog_left(v));
+   vlog_check_expr(vlog_right(v));
+   return vlog_check_expr(vlog_value(v));
 }
 
-static type_mask_t vlog_check_const_expr(vlog_node_t v)
+static type_mask_t vlog_check_pattern_expr(vlog_node_t v)
 {
-   type_mask_t tmask = vlog_check_expr(v);
+   if (!vlog_has_type(v))
+      return TM_ERROR;
 
-   if (!(tmask & TM_CONST)) {
-      vlog_node_t decl = NULL;
-      vlog_visit_only(v, vlog_non_const_diag_cb, &decl, V_REF);
+   return get_type_mask(vlog_type(v));
+}
 
-      if (decl == NULL)
-         error_at(vlog_loc(v), "expression is not a constant");
-      else {
-         diag_t *d = diag_new(DIAG_ERROR, vlog_loc(v));
-         diag_printf(d, "cannot reference %s '%s' in constant expression",
-                     vlog_is_net(decl) ? "net" : "variable",
-                     istr(vlog_ident(decl)));
-         diag_hint(d, vlog_loc(decl), "%s declared here",
-                   istr(vlog_ident(decl)));
-         diag_emit(d);
-      }
-   }
-
-   return tmask;
+static type_mask_t vlog_check_cast(vlog_node_t v)
+{
+   vlog_check_expr(vlog_left(v));
+   return vlog_check_expr(vlog_value(v));
 }
 
 static type_mask_t vlog_check_expr(vlog_node_t v)
@@ -1098,12 +1171,16 @@ static type_mask_t vlog_check_expr(vlog_node_t v)
       return vlog_check_unary(v);
    case V_COND_EXPR:
       return vlog_check_cond_expr(v);
+   case V_MIN_TYP_MAX:
+      return vlog_check_min_typ_max(v);
    case V_SYS_FCALL:
       return vlog_check_sys_fcall(v);
    case V_USER_FCALL:
       return vlog_check_user_fcall(v);
    case V_REF:
       return vlog_check_ref(v);
+   case V_MOD_REF:
+      return vlog_check_mod_ref(v);
    case V_HIER_REF:
       return vlog_check_hier_ref(v);
    case V_MEMBER_REF:
@@ -1123,6 +1200,10 @@ static type_mask_t vlog_check_expr(vlog_node_t v)
    case V_PREFIX:
    case V_POSTFIX:
       return vlog_check_prefix_postfix(v);
+   case V_PATTERN_EXPR:
+      return vlog_check_pattern_expr(v);
+   case V_CAST:
+      return vlog_check_cast(v);
    case V_NUMBER:
    case V_STRENGTH:
       return TM_INTEGRAL | TM_CONST;
@@ -1136,6 +1217,83 @@ static type_mask_t vlog_check_expr(vlog_node_t v)
       return TM_CLASS | TM_CONST;
    default:
       CANNOT_HANDLE(v);
+   }
+}
+
+static void vlog_check_tcheck_event(vlog_node_t v)
+{
+   assert(vlog_kind(v) == V_TCHECK_EVENT);
+
+   vlog_node_t val = vlog_param(v, 0);
+   vlog_node_t cond = (vlog_params(v) > 1) ? vlog_param(v, 1) : NULL;
+
+   if (vlog_kind(val) == V_EVENT)
+      val = vlog_value(val);
+
+   assert(vlog_kind(val) == V_REF);
+   vlog_node_t ref = vlog_ref(val);
+   vlog_kind_t ref_kind = vlog_kind(ref);
+
+   switch (ref_kind) {
+   case V_PORT_DECL:
+   case V_VAR_DECL:
+   case V_NET_DECL:
+      break;
+   default:
+      {
+         diag_t *d = diag_new(DIAG_ERROR, vlog_loc(val));
+         diag_printf(d, "invalid specify terminal descriptor kind: %s",
+                     vlog_kind_str(ref_kind));
+         diag_emit(d);
+      }
+   }
+
+   if (cond != NULL)
+      vlog_check_expr(cond);
+}
+
+static void vlog_check_tcheck(vlog_node_t v)
+{
+   vlog_tcheck_kind_t kind = vlog_subkind(v);
+
+   switch (kind) {
+   case V_TCHECK_SETUP:
+   case V_TCHECK_HOLD:
+      {
+         vlog_check_tcheck_event(vlog_param(v, 0));
+         vlog_check_tcheck_event(vlog_param(v, 1));
+
+         vlog_node_t limit = vlog_param(v, 2);
+         type_mask_t tmask = vlog_check_expr(limit);
+
+         if ((tmask & TM_CONST) == 0) {
+            diag_t *d = diag_new(DIAG_ERROR, vlog_loc(limit));
+            diag_printf(d, "not a constant expression");
+            diag_hint(d, vlog_loc(limit), "have '%s'", type_mask_str(tmask));
+            diag_emit(d);
+         }
+      }
+      break;
+
+   default:
+      break;
+   }
+}
+
+static void vlog_check_specify(vlog_node_t v)
+{
+   const int n_stmts = vlog_stmts(v);
+
+   for (int i = 0; i < n_stmts; i++) {
+      vlog_node_t stmt = vlog_stmt(v, i);
+
+      switch (vlog_kind(stmt)) {
+      case V_TCHECK:
+         vlog_check_tcheck(stmt);
+         break;
+      default:
+         break;
+      }
    }
 }
 
@@ -1154,6 +1312,7 @@ void vlog_check(vlog_node_t v)
       vlog_check_net_decl(v);
       break;
    case V_VAR_DECL:
+   case V_LOCAL_DECL:
       vlog_check_var_decl(v);
       break;
    case V_PORT_DECL:
@@ -1190,7 +1349,8 @@ void vlog_check(vlog_node_t v)
    case V_FOREVER:
       vlog_check_stmts(v);
       break;
-   case V_BLOCK:
+   case V_SEQ_BLOCK:
+   case V_GEN_BLOCK:
    case V_PROGRAM:
    case V_CONSTRUCTOR:
       vlog_check_decls(v);
@@ -1209,8 +1369,10 @@ void vlog_check(vlog_node_t v)
       vlog_check_param_assign(v);
       break;
    case V_FUNC_DECL:
+      vlog_check_func_decl(v);
+      break;
    case V_TASK_DECL:
-      vlog_check_tf_decl(v);
+      vlog_check_task_decl(v);
       break;
    case V_TIMING:
       vlog_check_timing(v);
@@ -1299,7 +1461,15 @@ void vlog_check(vlog_node_t v)
       vlog_check_wait(v);
       break;
    case V_SPECIFY:
+      vlog_check_specify(v);
+      break;
    case V_IMPORT_DECL:
+   case V_DISABLE:
+   case V_ASSERT:
+   case V_ASSUME:
+      break;
+   case V_DEFPARAM:
+      vlog_check_defparam(v);
       break;
    default:
       CANNOT_HANDLE(v);

@@ -43,6 +43,9 @@ BOOTSTRAPLIBS =
 LIBDIRS =
 lib_LIBRARIES =
 pkglib_LIBRARIES =
+EXTRA_all_local =
+EXTRA_install_exec_local =
+EXTRA_uninstall_local =
 
 include thirdparty/Makemodule.am
 include src/Makemodule.am
@@ -73,10 +76,17 @@ include lib/vital/Makemodule.am
 include lib/synopsys/Makemodule.am
 include contrib/Makemodule.am
 include contrib/msi/Makemodule.am
+include contrib/plugins/Makemodule.am
 
 clean-local: clean-libs
 	rm -f src/vlog/vlog-parse.c
 	-test ! -d logs || rm -r logs
+
+all-local: $(EXTRA_all_local)
+
+install-exec-local: $(EXTRA_install_exec_local)
+
+uninstall-local: $(EXTRA_uninstall_local)
 
 everything: $(BUILT_SOURCES) config.h
 	$(MAKE) $(AM_MAKEFLAGS) all-am $(check_PROGRAMS) $(EXTRA_PROGRAMS)
@@ -90,6 +100,7 @@ compile-commands:
 release: update-test-dist
 	echo $(PACKAGE_VERSION) | grep -E "^[[:digit:]]+\.[[:digit:]]+\.[[:digit:]]+$$"
 	$(AM_V_GEN)( \
+	  set -e; \
 	  v=$(PACKAGE_VERSION); d=$$(date '+%Y-%m-%d'); \
 	  b=$$(echo $(PACKAGE_VERSION) | sed 's/.[0-9]$$//'); \
 	  n=$$(date '+%-d'); l=$$(date '+%B %Y'); \
@@ -124,11 +135,11 @@ sync-branch:
 	git show $$branch:NEWS.md >/tmp/NEWS.md; \
 	new=$$(awk '/## Version/ { print($$3); exit }' /tmp/NEWS.md); \
 	echo "new version was $$new"; \
-	awk '/Version '$$last'/ { exit; } /Version/ { x=1 } x==1,/./ { print($$0); }' \
+	$(AWK) '/Version '$$last'/ { exit; } /Version/ { x=1 } x==1,/./ { print($$0); }' \
 	  /tmp/NEWS.md > /tmp/trimmed.md; \
-	sed -i -e '/Version/,$$ b;' -e '/^$$/ r /tmp/trimmed.md' $(top_srcdir)/NEWS.md; \
+	$(SED) -i -e '/Version/,$$ b;' -e '/^$$/ r /tmp/trimmed.md' $(top_srcdir)/NEWS.md; \
 	git checkout $$branch $(top_srcdir)/www/defs.m4; \
-	sed -i 's/'$$last'/'$$new'/g' $(top_srcdir)/README.md
+	$(SED) -i 's/'$$last'/'$$new'/g' $(top_srcdir)/README.md
 
 upload-artifacts:
 	tag=$$(git describe --tags $$(git rev-list --tags --max-count=1)) && \

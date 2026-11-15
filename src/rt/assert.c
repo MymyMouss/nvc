@@ -24,7 +24,6 @@
 #include "psl/psl-node.h"
 #include "rt/assert.h"
 #include "rt/model.h"
-#include "rt/rt.h"
 #include "rt/structs.h"
 #include "tree.h"
 
@@ -193,7 +192,7 @@ static format_part_t *check_format(const char *str)
 }
 
 DLLEXPORT
-void _std_env_set_assert_format_valid(jit_scalar_t *args)
+void _std_env_set_assert_format_valid(jit_scalar_t *args, tlab_t *tlab)
 {
    uint8_t level = args[2].integer;
    const uint8_t *format_ptr = args[3].pointer;
@@ -214,7 +213,7 @@ void _std_env_set_assert_format_valid(jit_scalar_t *args)
 }
 
 DLLEXPORT
-void _std_env_set_assert_format(jit_scalar_t *args)
+void _std_env_set_assert_format(jit_scalar_t *args, tlab_t *tlab)
 {
    uint8_t level = args[2].integer;
    const uint8_t *format_ptr = args[3].pointer;
@@ -388,10 +387,10 @@ void emit_vhdl_diag(diag_t *d, vhdl_severity_t severity)
 
    diag_emit(d);
 
-   relaxed_add(&counts[severity], 1);
-
    if (severity >= exit_severity)
       jit_abort_with_status(EXIT_FAILURE);
+   else
+      relaxed_add(&counts[severity], 1);
 }
 
 void x_report(const uint8_t *msg, int32_t msg_len, int8_t severity,

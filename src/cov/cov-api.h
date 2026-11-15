@@ -1,5 +1,5 @@
 //
-//  Copyright (C) 2013-2023  Nick Gasson
+//  Copyright (C) 2013-2026  Nick Gasson
 //
 //  This program is free software: you can redistribute it and/or modify
 //  it under the terms of the GNU General Public License as published by
@@ -20,6 +20,35 @@
 
 #include "prim.h"
 #include "diag.h"
+
+#define COVER_TAG_NULL  0
+#define COVER_TAG_ITEM  1
+#define COVER_TAG_BIN   2
+#define COVER_TAG_RANGE 3
+#define COVER_TAG_SCOPE 4
+#define COVER_TAG_INST  5
+
+#define _COVER_TAG_BITS   3
+#define _COVER_ID_BITS    29
+
+STATIC_ASSERT(_COVER_TAG_BITS + _COVER_ID_BITS == 32);
+
+#define COVER_ID_MAX ((1 << _COVER_ID_BITS) - 1)
+
+typedef union _cover_obj {
+   struct {
+      unsigned tag : _COVER_TAG_BITS;
+      unsigned id : _COVER_ID_BITS;
+   };
+   uint32_t bits;
+} cover_obj_t;
+
+STATIC_ASSERT(sizeof(cover_obj_t) == 4);
+
+#define COVER_NULL_OBJ ((cover_obj_t){ .tag = COVER_TAG_NULL })
+
+#define cover_is_null(o) ((o).tag == COVER_TAG_NULL)
+#define cover_equals(a, b) ((a).bits == (b).bits)
 
 typedef enum {
    // Statement/Line coverage
@@ -72,6 +101,49 @@ typedef enum {
 #define NUM_COVER_KINDS (COV_ITEM_FUNCTIONAL + 1)
 
 typedef enum {
+   CSCOPE_NONE,
+   CSCOPE_INSTANCE,
+   CSCOPE_SUBPROG,
+   CSCOPE_PACKAGE,
+   CSCOPE_PROCESS,
+   CSCOPE_USER,
+   CSCOPE_PROPERTY,
+} cover_scope_kind_t;
+
+typedef enum {
+   COV_REL_BINS,
+   COV_REL_ITEMS,
+   COV_REL_CHILDREN,
+   COV_REL_RANGES,
+} cover_rel_t;
+
+typedef enum {
+   COV_ATTR_FLAGS,
+   COV_ATTR_TAG,
+   COV_ATTR_FIELD_IDX,
+   COV_ATTR_HIER,
+   COV_ATTR_DATA,
+   COV_ATTR_MAX,
+   COV_ATTR_MIN,
+   COV_ATTR_LOC,
+   COV_ATTR_KIND,
+   COV_ATTR_METADATA,
+   COV_ATTR_FUNC_NAME,
+   COV_ATTR_LHS_LOC,
+   COV_ATTR_RHS_LOC,
+   COV_ATTR_SOURCE,
+   COV_ATTR_ATLEAST,
+   COV_ATTR_NAME,
+   COV_ATTR_PARENT,
+   COV_ATTR_BLOCK_NAME,
+   COV_ATTR_INST,
+   COV_ATTR_ROOT,
+   COV_ATTR_MASK,
+   COV_ATTR_QUAL_NAME,
+   COV_ATTR_LIB_NAME,
+} cover_attr_t;
+
+typedef enum {
    COV_SRC_IF_CONDITION,
    COV_SRC_CASE_CHOICE,
    COV_SRC_LOOP_CONTROL,
@@ -88,74 +160,6 @@ typedef enum {
    COV_SRC_USER_COVER,
    COV_SRC_UNKNOWN,
 } cover_src_t;
-
-typedef struct {
-   int64_t min;
-   int64_t max;
-} cover_range_t;
-
-typedef struct _cover_item {
-   // Type of coverage
-   cover_item_kind_t kind;
-
-   // Index of the tag of given kind.
-   //    - 0 ... 2^31 - 1 - Valid tag entry, Index to run-time arrays with
-   //            coverage data
-   //    - -1 - Invalid tag
-   int32_t           tag;
-
-   // Coverage data:
-   //    Number of times covrage item was executed / passed.
-   int32_t           data;
-
-   // Flags for coverage item
-   int32_t           flags;
-
-   // Location of the item in the source file
-   loc_t             loc;
-
-   // Locations of LHS/RHS operands
-   loc_t             loc_rhs;
-   loc_t             loc_lhs;
-
-   // Hierarchy path of the covered object
-   ident_t           hier;
-
-   // Additional name for cover item:
-   //    COV_ITEM_EXPRESSION     Name of expression (e.g. OR, AND, XOR)
-   //    COV_ITEM_STATE          Name of FSM state
-   //    COV_ITEM_FUNCTIONAL     Name of user-defined functional over point
-   ident_t           func_name;
-
-   // Type of source statement or expression
-   cover_src_t       source;
-
-   // Number of consecutive cover items that belong to the same RTL "object"
-   //    COV_ITEM_STMT           Always 1
-   //    COV_ITEM_TOGGLE         All items belonging to the same signal / port
-   //    COV_ITEM_STATE          Number of FSM states (single item = single state)
-   //    COV_ITEM_BRANCH         T_IF - 2 for if tag, 1 for else tag, T_CASE - 1
-   //    COV_ITEM_EXPRESSION     Number of Bins for single expression:
-   //                               2 - For unary expression evaluated to True / False
-   //                               3 - For binary expresssions AND,NAND,OR,NOR
-   //                               4 - For binary expressions XOR, XNOR
-   //    COV_ITEM_FUNCTIONAL     Always 1
-   int               consecutive;
-
-   // Threshold for being covered
-   int               atleast;
-
-   // Secondary numeric data:
-   //    COV_ITEM_TOGGLE - Start position of signal name
-   //    COV_ITEM_STATE  - Value of low-index of enum sub-type
-   int64_t           metadata;
-
-   // Ranges for functional coverage bins
-   int               n_ranges;
-   cover_range_t    *ranges;
-
-   unsigned          field_idx;
-} cover_item_t;
 
 typedef enum {
    COV_FLAG_TRUE           = (1 << 0),
@@ -223,6 +227,16 @@ typedef enum {
    MERGE_UNION,
 } merge_mode_t;
 
+typedef struct {
+   const cover_data_t *data;
+   cover_obj_t         obj;
+   cover_rel_t         rel;
+   uint32_t            pos;
+   uint16_t            next;
+   uint16_t            count;
+   cover_obj_t         batch[8];
+} cover_iter_t;
+
 cover_data_t *cover_data_init(cover_mask_t mask, int array_limit, int threshold);
 void cover_data_free(cover_data_t *db);
 bool cover_enabled(cover_data_t *data, cover_mask_t mask);
@@ -231,20 +245,74 @@ void cover_write(cover_data_t *db, fbuf_t *f, cover_dump_t dt);
 cover_data_t *cover_read(fbuf_t *f, uint32_t pre_mask);
 void cover_merge(cover_data_t *dst, const cover_data_t *src, merge_mode_t mode);
 
-int32_t *cover_get_counters(cover_data_t *db, ident_t name);
-cover_scope_t *cover_get_scope(cover_data_t *db, ident_t name);
+int32_t *cover_get_counters(cover_data_t *db, ident_t qual);
+cover_obj_t cover_find(const cover_data_t *db, ident_t qual);
 
-cover_scope_t *cover_get_child(cover_scope_t *s, ident_t name);
-cover_item_t *cover_get_item(cover_scope_t *s, cover_item_kind_t kind, int nth);
+cover_obj_t cover_get_child(const cover_data_t *db, cover_obj_t scope,
+                            ident_t name);
+cover_obj_t cover_get_item(const cover_data_t *db, cover_obj_t scope,
+                           cover_item_kind_t kind, int nth);
+
+cover_obj_t cover_item_new(cover_data_t *db, cover_obj_t scope,
+                           cover_item_kind_t kind, loc_t loc, int nbins);
+cover_obj_t cover_scope_new(cover_data_t *db, cover_obj_t inst,
+                            cover_obj_t parent, cover_scope_kind_t kind,
+                            ident_t name, loc_t loc);
+cover_obj_t cover_inst_new(cover_data_t *db, ident_t name, cover_obj_t parent,
+                           ident_t block_name, ident_t qual_name,
+                           ident_t lib_name);
+
+void cover_add_ranges(cover_data_t *db, cover_obj_t obj, unsigned count);
+
+size_t cover_count(const cover_data_t *db, cover_obj_t obj, cover_rel_t rel);
+size_t cover_rel(const cover_data_t *db, cover_obj_t obj, cover_rel_t rel,
+                 unsigned first, cover_obj_t *out, size_t max);
+cover_obj_t cover_at(const cover_data_t *db, cover_obj_t obj, cover_rel_t rel,
+                     unsigned index);
+void cover_append(cover_data_t *db, cover_obj_t parent, cover_rel_t rel,
+                  cover_obj_t obj);
+
+cover_iter_t cover_begin(const cover_data_t *db, cover_obj_t obj,
+                         cover_rel_t rel);
+bool cover_next(cover_iter_t *it, cover_obj_t *obj);
+
+uint32_t cover_get_u32(const cover_data_t *db, cover_obj_t obj,
+                       cover_attr_t attr, uint32_t def);
+int64_t cover_get_i64(const cover_data_t *db, cover_obj_t obj,
+                      cover_attr_t attr, int64_t def);
+ident_t cover_get_ident(const cover_data_t *db, cover_obj_t obj,
+                        cover_attr_t attr);
+loc_t cover_get_loc(const cover_data_t *db, cover_obj_t obj, cover_attr_t attr);
+cover_obj_t cover_get_obj(const cover_data_t *db, cover_obj_t obj,
+                          cover_attr_t attr);
+
+cover_flags_t cover_get_flags(const cover_data_t *db, cover_obj_t obj);
+uint32_t cover_get_tag(const cover_data_t *db, cover_obj_t obj);
+unsigned cover_get_kind(const cover_data_t *db, cover_obj_t obj);
+unsigned cover_get_threshold(const cover_data_t *db, cover_obj_t obj);
+
+void cover_put_u32(cover_data_t *db, cover_obj_t obj, cover_attr_t attr,
+                   uint32_t value);
+void cover_put_i64(cover_data_t *db, cover_obj_t obj, cover_attr_t attr,
+                   int64_t value);
+void cover_put_ident(cover_data_t *db, cover_obj_t obj, cover_attr_t attr,
+                     ident_t value);
+void cover_put_loc(cover_data_t *db, cover_obj_t obj, cover_attr_t attr,
+                   loc_t value);
+void cover_put_obj(cover_data_t *db, cover_obj_t obj, cover_attr_t attr,
+                   cover_obj_t value);
+
+void cover_put_flags(cover_data_t *db, cover_obj_t obj, cover_flags_t flags);
 
 //
 // Spec and exclude file handling
 //
 
-void cover_ignore_from_pragmas(cover_data_t *data, cover_scope_t *cs,
-                               tree_t unit);
 void cover_load_spec_file(cover_data_t *db, const char *path);
 void cover_load_exclude_file(const char *path, cover_data_t *data);
+
+bool cover_should_emit_fsm_type(cover_data_t *db, ident_t name);
+bool cover_should_emit_array_toggle(cover_data_t *db, int width);
 
 //
 // Report generation and export
@@ -254,28 +322,16 @@ cover_rpt_t *cover_report_new(cover_data_t *db, int item_limit);
 void cover_report_free(cover_rpt_t *rpt);
 
 void cover_report(const char *path, cover_data_t *data, int item_limit);
-void cover_export_cobertura(cover_data_t *data, FILE *f,
+void cover_export_cobertura(const cover_data_t *db, FILE *f,
                             const char *relative);
-void cover_export_xml(cover_data_t *data, FILE *f, const char *relative);
+void cover_export_xml(const cover_data_t *db, FILE *f, const char *relative);
 
 //
 // Interface to code generator
 //
 
-cover_scope_t *cover_get_root_scope(cover_data_t *db);
-cover_scope_t *cover_create_block(cover_data_t *db, ident_t qual,
-                                  cover_scope_t *parent, tree_t inst,
-                                  tree_t unit);
-cover_scope_t *cover_create_scope(cover_data_t *db, cover_scope_t *parent,
-                                  tree_t t, ident_t name);
-cover_scope_t *cover_create_user_scope(cover_data_t *db, cover_scope_t *parent,
-                                       loc_t loc, ident_t name);
-cover_item_t *cover_add_items_for(cover_data_t *data, cover_scope_t *cscope,
-                                  object_t *obj, cover_item_kind_t kind);
+bool cover_compatible_spec(cover_data_t *db, cover_obj_t a, cover_obj_t b);
 
-bool cover_compatible_spec(cover_data_t *db, const cover_scope_t *a,
-                           const cover_scope_t *b);
-
-bool cover_should_emit_package(cover_data_t *db, tree_t pack);
+const char *cover_bmask_to_bin_str(uint32_t bmask);
 
 #endif   // _COV_API_H

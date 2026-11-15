@@ -26,7 +26,7 @@
 #include "mir/mir-node.h"
 #include "mir/mir-unit.h"
 #include "option.h"
-#include "rt/rt.h"
+#include "rt/defs.h"
 #include "tree.h"
 
 #include <assert.h>
@@ -916,9 +916,12 @@ static jit_value_t irgen_sign_extend(jit_irgen_t *g, jit_value_t value,
    assert(size >= 0 && size <= 64);
 
    if (size < 64) {
+      // The input may be the register of a live MIR value
+      jit_value_t result = irgen_alloc_temp(g);
       jit_value_t shift = jit_value_from_int64(64 - size);
-      j_shl(g, value, value, shift);
-      j_asr(g, value, value, shift);
+      j_shl(g, result, value, shift);
+      j_asr(g, result, result, shift);
+      return result;
    }
 
    return value;
@@ -2296,7 +2299,6 @@ static void irgen_op_cast(jit_irgen_t *g, mir_value_t n)
       else
          bbits = jit_value_from_int64(0);
 
-      const bool result_signed = mir_get_signed(g->mu, result_type);
       const int result_size = mir_get_size(g->mu, result_type);
 
       bool arg_signed;
@@ -2316,7 +2318,7 @@ static void irgen_op_cast(jit_irgen_t *g, mir_value_t n)
          j_send(g, 1, bbits);
          j_send(g, 2, jit_value_from_int64(arg_size));
 
-         if (arg_signed || result_signed)
+         if (arg_signed)
             macro_vec4op(g, JIT_VEC_SEXT, result_size);
          else
             macro_vec4op(g, JIT_VEC_ZEXT, result_size);
@@ -2344,7 +2346,12 @@ static void irgen_op_cast(jit_irgen_t *g, mir_value_t n)
             j_and(g, abits, abits, irgen_vector_mask(result_size));
 
             jit_value_t btmp = irgen_alloc_temp(g);
-            j_mov(g, btmp, bbits);
+            if (arg_class == MIR_TYPE_VEC4) {
+               bbits = irgen_sign_extend(g, bbits, arg_size);
+               j_and(g, btmp, bbits, irgen_vector_mask(result_size));
+            }
+            else
+               j_mov(g, btmp, bbits);
             bbits = btmp;
          }
 
@@ -3243,6 +3250,18 @@ static void irgen_op_report(jit_irgen_t *g, mir_value_t n)
    macro_exit(g, JIT_EXIT_REPORT);
 }
 
+static void irgen_op_tcheck(jit_irgen_t *g, mir_value_t n)
+{
+   jit_value_t stamp = irgen_get_arg(g, n, 0);
+   jit_value_t limit = irgen_get_arg(g, n, 1);
+   jit_value_t locus = irgen_get_arg(g, n, 2);
+
+   j_send(g, 0, stamp);
+   j_send(g, 1, limit);
+   j_send(g, 2, locus);
+   macro_exit(g, JIT_EXIT_TCHECK);
+}
+
 static void irgen_op_assert(jit_irgen_t *g, mir_value_t n)
 {
    jit_value_t severity = irgen_get_arg(g, n, 1);
@@ -3523,11 +3542,23 @@ static void irgen_op_sched_waveform(jit_irgen_t *g, mir_value_t n)
    j_send(g, 1, offset);
    j_send(g, 2, count);
    j_send(g, 3, value);
-   j_send(g, 4, after);
-   j_send(g, 5, reject);
-   j_send(g, 6, scalar);
 
-   macro_exit(g, JIT_EXIT_SCHED_WAVEFORM);
+   const bool zero_delay =
+      reject.kind == JIT_VALUE_INT64 && reject.int64 == 0
+      && after.kind == JIT_VALUE_INT64 && after.int64 == 0;
+
+   if (zero_delay) {
+      j_send(g, 4, scalar);
+
+      macro_exit(g, JIT_EXIT_SCHED_ZERO);
+   }
+   else {
+      j_send(g, 4, after);
+      j_send(g, 5, reject);
+      j_send(g, 6, scalar);
+
+      macro_exit(g, JIT_EXIT_SCHED_WAVEFORM);
+   }
 }
 
 static void irgen_op_disconnect(jit_irgen_t *g, mir_value_t n)
@@ -3547,7 +3578,7 @@ static void irgen_op_disconnect(jit_irgen_t *g, mir_value_t n)
    macro_exit(g, JIT_EXIT_DISCONNECT);
 }
 
-static void irgen_op_force(jit_irgen_t *g, mir_value_t n)
+static void irgen_op_force(jit_irgen_t *g, mir_value_t n, jit_exit_t exit)
 {
    jit_value_t shared = irgen_get_arg_slot(g, n, 0, 0);
    jit_value_t offset = irgen_get_arg_slot(g, n, 0, 1);
@@ -3562,10 +3593,10 @@ static void irgen_op_force(jit_irgen_t *g, mir_value_t n)
    j_send(g, 3, value);
    j_send(g, 4, scalar);
 
-   macro_exit(g, JIT_EXIT_FORCE);
+   macro_exit(g, exit);
 }
 
-static void irgen_op_release(jit_irgen_t *g, mir_value_t n)
+static void irgen_op_sched_release(jit_irgen_t *g, mir_value_t n)
 {
    jit_value_t shared = irgen_get_arg_slot(g, n, 0, 0);
    jit_value_t offset = irgen_get_arg_slot(g, n, 0, 1);
@@ -3575,7 +3606,22 @@ static void irgen_op_release(jit_irgen_t *g, mir_value_t n)
    j_send(g, 1, offset);
    j_send(g, 2, count);
 
-   macro_exit(g, JIT_EXIT_RELEASE);
+   macro_exit(g, JIT_EXIT_SCHED_RELEASE);
+}
+
+static void irgen_op_release_signal(jit_irgen_t *g, mir_value_t n)
+{
+   jit_value_t shared = irgen_get_arg_slot(g, n, 0, 0);
+   jit_value_t offset = irgen_get_arg_slot(g, n, 0, 1);
+   jit_value_t count  = irgen_get_arg(g, n, 1);
+   jit_value_t mode = jit_value_from_int64(irgen_get_enum(g, n, 2));
+
+   j_send(g, 0, shared);
+   j_send(g, 1, offset);
+   j_send(g, 2, count);
+   j_send(g, 3, mode);
+
+   macro_exit(g, JIT_EXIT_RELEASE_SIGNAL);
 }
 
 static void irgen_op_deposit_signal(jit_irgen_t *g, mir_value_t n)
@@ -3946,15 +3992,18 @@ static void irgen_op_bind_foreign(jit_irgen_t *g, mir_value_t n)
    jit_value_t spec   = irgen_get_arg(g, n, 0);
    jit_value_t length = irgen_get_arg(g, n, 1);
 
-   jit_value_t locus;
-   if (mir_count_args(g->mu, n) > 2)
-      locus = irgen_get_arg(g, n, 2);
+   jit_value_t locus, region;
+   if (mir_count_args(g->mu, n) > 2) {
+      locus  = irgen_get_arg(g, n, 2);
+      region = irgen_get_arg(g, n, 3);
+   }
    else
-      locus = jit_value_from_int64(0);
+      locus = region = jit_value_from_int64(0);
 
    j_send(g, 0, spec);
    j_send(g, 1, length);
    j_send(g, 2, locus);
+   j_send(g, 3, region);
    macro_exit(g, JIT_EXIT_BIND_FOREIGN);
 
    int pslot = 0;
@@ -3993,7 +4042,11 @@ static void irgen_op_instance_name(jit_irgen_t *g, mir_value_t n)
 static void irgen_op_bind_external(jit_irgen_t *g, mir_value_t n)
 {
    jit_value_t locus = irgen_get_arg(g, n, 0);
-   jit_handle_t handle = irgen_get_handle(g, n, 1);
+   mir_value_t scope = mir_get_arg(g->mu, n, 1);
+
+   jit_handle_t handle = JIT_HANDLE_INVALID;
+   if (!mir_is_null(scope))
+      handle = irgen_get_handle(g, n, 1);
 
    j_send(g, 0, locus);
    j_send(g, 1, jit_value_from_handle(handle));
@@ -4463,16 +4516,19 @@ static void irgen_op_binary(jit_irgen_t *g, mir_value_t n)
       break;
    case MIR_VEC_SLL:
       j_shl(g, abits, aleft, aright);
+      j_and(g, abits, abits, mask);
       xbits = irgen_arith_xbits(g, bleft, bright, mask);
       break;
    case MIR_VEC_SRL:
       j_shr(g, abits, aleft, aright);
+      j_and(g, abits, abits, mask);
       xbits = irgen_arith_xbits(g, bleft, bright, mask);
       break;
    case MIR_VEC_SRA:
       assert(issigned);
       aleft = irgen_sign_extend(g, aleft, size);
       j_asr(g, abits, aleft, aright);
+      j_and(g, abits, abits, mask);
       xbits = irgen_arith_xbits(g, bleft, bright, mask);
       break;
    default:
@@ -4512,7 +4568,9 @@ static void irgen_op_unary(jit_irgen_t *g, mir_value_t n)
          [MIR_VEC_BIT_NOT] = JIT_VEC_NOT,
          [MIR_VEC_BIT_AND] = JIT_VEC_AND1,
          [MIR_VEC_BIT_OR] = JIT_VEC_OR1,
+         [MIR_VEC_BIT_XOR] = JIT_VEC_XOR1,
          [MIR_VEC_LOG_NOT] = JIT_VEC_LOG_NOT,
+         [MIR_VEC_SUB] = JIT_VEC_NEGATE,
       };
       assert(op < ARRAY_LEN(map) && map[op] != 0);
 
@@ -4732,11 +4790,35 @@ static void irgen_op_extract(jit_irgen_t *g, mir_value_t n)
    jit_value_t full = irgen_get_value(g, arg0);
    jit_value_t pos = irgen_get_arg(g, n, 1);
 
-   const int arg_size = mir_get_size(g->mu, mir_get_type(g->mu, arg0));
-   assert(arg_size <= 64);  // TODO
+   jit_value_t abits = irgen_get_slot(g, n, 0);
+
+   jit_value_t bfull, bbits = { .kind = JIT_VALUE_INVALID };
+   if (mir_is(g->mu, n, MIR_TYPE_VEC4)) {
+      bfull = irgen_get_slot(g, arg0, 1);
+      bbits = irgen_get_slot(g, n, 1);
+   }
+   else
+      bfull = jit_value_from_int64(0);
 
    mir_type_t type = mir_get_type(g->mu, n);
    const int size = mir_get_size(g->mu, type);
+
+   const int arg_size = mir_get_size(g->mu, mir_get_type(g->mu, arg0));
+   if (arg_size > 64) {
+      j_send(g, 0, full);
+      j_send(g, 1, bfull);
+      j_send(g, 2, jit_value_from_int64(arg_size));
+      j_send(g, 3, pos);
+
+      macro_vec4op(g, JIT_VEC_EXTRACT, size);
+
+      j_recv(g, abits, 0);
+
+      if (bbits.kind != JIT_VALUE_INVALID)
+         j_recv(g, bbits, 1);
+
+      return;
+   }
 
    jit_value_t bitpos = irgen_alloc_temp(g);
    j_sub(g, bitpos, jit_value_from_int64(arg_size - size), pos);
@@ -4744,26 +4826,20 @@ static void irgen_op_extract(jit_irgen_t *g, mir_value_t n)
    jit_value_t mask = irgen_vector_mask(size);
    jit_value_t ashift = irgen_alloc_temp(g);
    j_shr(g, ashift, full, bitpos);
-
-   jit_value_t abits = irgen_get_slot(g, n, 0);
    j_and(g, abits, ashift, mask);
 
-   if (mir_is(g->mu, n, MIR_TYPE_VEC4)) {
-      jit_value_t bfull = irgen_get_slot(g, arg0, 1);
-
+   if (bbits.kind != JIT_VALUE_INVALID) {
       jit_value_t bshift = irgen_alloc_temp(g);
       j_shr(g, bshift, bfull, bitpos);
-
-      jit_value_t bbits = irgen_get_slot(g, n, 1);
       j_and(g, bbits, bshift, mask);
    }
 }
 
 static void irgen_op_get_counters(jit_irgen_t *g, mir_value_t n)
 {
-   jit_value_t handle = jit_value_from_handle(g->func->handle);
+   jit_handle_t handle = irgen_get_handle(g, n, 0);
 
-   j_send(g, 0, handle);
+   j_send(g, 0, jit_value_from_handle(handle));
    macro_exit(g, JIT_EXIT_GET_COUNTERS);
    j_recv(g, g->map[n.id], 0);
 }
@@ -5016,6 +5092,9 @@ static void irgen_block(jit_irgen_t *g, mir_block_t block)
       case MIR_OP_REPORT:
          irgen_op_report(g, n);
          break;
+      case MIR_OP_TCHECK:
+         irgen_op_tcheck(g, n);
+         break;
       case MIR_OP_ASSERT:
          irgen_op_assert(g, n);
          break;
@@ -5073,11 +5152,17 @@ static void irgen_block(jit_irgen_t *g, mir_block_t block)
       case MIR_OP_DISCONNECT:
          irgen_op_disconnect(g, n);
          break;
-      case MIR_OP_FORCE:
-         irgen_op_force(g, n);
+      case MIR_OP_SCHED_FORCE:
+         irgen_op_force(g, n, JIT_EXIT_SCHED_FORCE);
          break;
-      case MIR_OP_RELEASE:
-         irgen_op_release(g, n);
+      case MIR_OP_SCHED_RELEASE:
+         irgen_op_sched_release(g, n);
+         break;
+      case MIR_OP_FORCE_SIGNAL:
+         irgen_op_force(g, n, JIT_EXIT_FORCE_SIGNAL);
+         break;
+      case MIR_OP_RELEASE_SIGNAL:
+         irgen_op_release_signal(g, n);
          break;
       case MIR_OP_DEPOSIT_SIGNAL:
          irgen_op_deposit_signal(g, n);
@@ -5192,88 +5277,92 @@ static void irgen_block(jit_irgen_t *g, mir_block_t block)
    DEBUG_ONLY(if (nops == 0) j_trap(g));
 }
 
-static void irgen_locals(jit_irgen_t *g)
+static void irgen_stack_vars(jit_irgen_t *g)
 {
-   const int nvars = mir_count_vars(g->mu);
-   g->vars = xmalloc_array(nvars, sizeof(jit_value_t));
-
-   bool on_stack;
-   const mir_unit_kind_t kind = mir_get_kind(g->mu);
-   switch (kind) {
+   bool all_on_stack;
+   switch (mir_get_kind(g->mu)) {
    case MIR_UNIT_PROCESS:
    case MIR_UNIT_PROPERTY:
-      on_stack = g->stateless;
+      all_on_stack = g->stateless;
       break;
    case MIR_UNIT_INSTANCE:
    case MIR_UNIT_PROCEDURE:
    case MIR_UNIT_PACKAGE:
    case MIR_UNIT_PROTECTED:
-      on_stack = false;
+      all_on_stack = false;
       break;
    default:
-      on_stack = !g->needs_context;
+      all_on_stack = !g->needs_context;
       break;
    }
 
-   if (on_stack) {
-      // Local variables on stack
-      for (int i = 0; i < nvars; i++) {
-         g->vars[i] = irgen_alloc_reg(g, 1);
+   const int nvars = mir_count_vars(g->mu);
+   for (int i = 0; i < nvars; i++) {
+      mir_value_t var = mir_get_var(g->mu, i);
+      const mir_var_flags_t flags = mir_get_var_flags(g->mu, var);
+      if (!all_on_stack && !(flags & MIR_VAR_TEMP))
+         continue;
 
-         mir_value_t var = mir_get_var(g->mu, i);
-         mir_type_t type = mir_get_var_type(g->mu, var);
-         const int sz = irgen_size_bytes(g, type);
-         if ((mir_get_var_flags(g->mu, var) & MIR_VAR_HEAP)
-             || sz > MAX_STACK_ALLOC) {
-            macro_lalloc(g, g->vars[i], jit_value_from_int64(sz));
-            g->used_tlab = true;
-         }
-         else
-            macro_salloc(g, g->vars[i], sz);
+      g->vars[i] = irgen_alloc_reg(g, 1);
+
+      mir_type_t type = mir_get_var_type(g->mu, var);
+      const int sz = irgen_size_bytes(g, type);
+      if ((flags & MIR_VAR_HEAP) || sz > MAX_STACK_ALLOC) {
+         macro_lalloc(g, g->vars[i], jit_value_from_int64(sz));
+         g->used_tlab = true;
       }
+      else
+         macro_salloc(g, g->vars[i], sz);
    }
-   else {
-      // Local variables on heap
-      size_t sz = 0;
-      sz += sizeof(void *);   // Context parameter
-      if (kind == MIR_UNIT_PROCESS || kind == MIR_UNIT_PROCEDURE) {
-         sz += sizeof(void *);   // Suspended procedure state
-         sz += sizeof(int32_t);  // State number
+}
+
+static void irgen_context_struct(jit_irgen_t *g)
+{
+   const mir_unit_kind_t kind = mir_get_kind(g->mu);
+   size_t sz = 0;
+   sz += sizeof(void *);   // Context parameter
+   if (kind == MIR_UNIT_PROCESS || kind == MIR_UNIT_PROCEDURE) {
+      sz += sizeof(void *);   // Suspended procedure state
+      sz += sizeof(int32_t);  // State number
+   }
+
+   const int nvars = mir_count_vars(g->mu);
+   link_tab_t *linktab = xmalloc_array(nvars, sizeof(link_tab_t));
+
+   if (g->statereg.kind == JIT_VALUE_INVALID)
+      g->statereg = irgen_alloc_reg(g, 1);
+
+   for (int i = 0; i < nvars; i++) {
+      mir_value_t var = mir_get_var(g->mu, i);
+      if (mir_get_var_flags(g->mu, var) & MIR_VAR_TEMP) {
+         linktab[i].name = NULL;
+         linktab[i].offset = PTRDIFF_MAX;
       }
-
-      link_tab_t *linktab = xmalloc_array(nvars, sizeof(link_tab_t));
-
-      for (int i = 0; i < nvars; i++) {
-         mir_value_t var = mir_get_var(g->mu, i);
+      else {
          mir_type_t type = mir_get_var_type(g->mu, var);
          const int align = irgen_align_of(g, type);
          sz = ALIGN_UP(sz, align);
          linktab[i].name = mir_get_name(g->mu, var);
          linktab[i].offset = sz;
+         g->vars[i] = jit_addr_from_value(g->statereg, sz);
          sz += irgen_size_bytes(g, type);
       }
-
-      if (g->statereg.kind == JIT_VALUE_INVALID)
-         g->statereg = irgen_alloc_reg(g, 1);
-
-      if (kind == MIR_UNIT_PROTECTED) {
-         // Protected types must always be allocated on the global heap
-         // as the result may be stored in an access
-         macro_galloc(g, g->statereg, jit_value_from_int64(sz));
-      }
-      else {
-         macro_lalloc(g, g->statereg, jit_value_from_int64(sz));
-         g->used_tlab = true;
-      }
-
-      for (int i = 0; i < nvars; i++)
-         g->vars[i] = jit_addr_from_value(g->statereg, linktab[i].offset);
-
-      // Publish the variable offset table early to handle circular references
-      // This may be read by another thread while in the COMPILING state
-      g->func->nvars = nvars;
-      store_release(&(g->func->linktab), linktab);
    }
+
+   if (kind == MIR_UNIT_PROTECTED) {
+      // Protected types must always be allocated on the global heap
+      // as the result may be stored in an access
+      macro_galloc(g, g->statereg, jit_value_from_int64(sz));
+   }
+   else {
+      macro_lalloc(g, g->statereg, jit_value_from_int64(sz));
+      g->used_tlab = true;
+   }
+
+   // Publish the variable offset table early to handle circular references
+   // This may be read by another thread while in the COMPILING state
+   g->func->nvars = nvars;
+   store_release(&(g->func->linktab), linktab);
 }
 
 static void irgen_params(jit_irgen_t *g, int first)
@@ -5453,7 +5542,8 @@ static void irgen_instance_entry(jit_irgen_t *g)
    g->func->spec = ffi_spec_new(types, ARRAY_LEN(types));
 
    irgen_params(g, 1);
-   irgen_locals(g);
+   irgen_stack_vars(g);
+   irgen_context_struct(g);
 
    // Stash context pointer
    jit_value_t context = irgen_alloc_temp(g);
@@ -5467,11 +5557,7 @@ static void irgen_process_entry(jit_irgen_t *g)
    g->func->spec = ffi_spec_new(types, ARRAY_LEN(types));
 
    irgen_params(g, 1);
-
-   if (!g->stateless)
-      irgen_jump_table(g);
-
-   irgen_locals(g);
+   irgen_stack_vars(g);
 
    if (g->stateless) {
       g->contextarg = irgen_alloc_reg(g, 1);
@@ -5483,6 +5569,9 @@ static void irgen_process_entry(jit_irgen_t *g)
       j_jump(g, JIT_CC_F, g->blocks[1]);
    }
    else {
+      irgen_jump_table(g);
+      irgen_context_struct(g);
+
       // Stash context pointer
       jit_value_t context = irgen_alloc_temp(g);
       j_recv(g, context, 0);
@@ -5493,9 +5582,7 @@ static void irgen_process_entry(jit_irgen_t *g)
 static void irgen_property_entry(jit_irgen_t *g)
 {
    irgen_params(g, 1);
-
-   if (g->stateless)
-      irgen_locals(g);
+   irgen_stack_vars(g);
 
    jit_value_t state = irgen_alloc_reg(g, 1);
    j_recv(g, state, 0);
@@ -5504,11 +5591,10 @@ static void irgen_property_entry(jit_irgen_t *g)
 
    if (g->stateless)
       g->contextarg = g->params[0];
-   else
+   else {
       g->statereg = state;
 
-   if (!g->stateless) {
-      irgen_locals(g);
+      irgen_context_struct(g);
 
       // Stash context pointer
       jit_value_t context = jit_addr_from_value(g->statereg, 0);
@@ -5522,7 +5608,10 @@ static void irgen_function_entry(jit_irgen_t *g)
    const int first_param = is_procedure ? 1 : 0;
    irgen_params(g, first_param);
 
-   irgen_locals(g);
+   irgen_stack_vars(g);
+
+   if (g->needs_context)
+      irgen_context_struct(g);
 
    if (g->statereg.kind != JIT_VALUE_INVALID && mir_get_parent(g->mu) != NULL) {
       // Stash context pointer
@@ -5532,9 +5621,10 @@ static void irgen_function_entry(jit_irgen_t *g)
 
 static void irgen_procedure_entry(jit_irgen_t *g)
 {
+   irgen_stack_vars(g);
    irgen_jump_table(g);
    irgen_params(g, 1);
-   irgen_locals(g);
+   irgen_context_struct(g);
 
    // Stash context pointer
    j_store(g, JIT_SZ_PTR, g->params[0], jit_addr_from_value(g->statereg, 0));
@@ -5544,7 +5634,10 @@ static void irgen_thunk_entry(jit_irgen_t *g)
 {
    g->contextarg = irgen_alloc_reg(g, 1);
    j_recv(g, g->contextarg, 0);
-   irgen_locals(g);
+   irgen_stack_vars(g);
+
+   if (g->needs_context)
+      irgen_context_struct(g);
 }
 
 static void irgen_package_entry(jit_irgen_t *g)
@@ -5560,7 +5653,8 @@ static void irgen_package_entry(jit_irgen_t *g)
    j_ret(g);
    irgen_bind_label(g, cont);
 
-   irgen_locals(g);
+   irgen_stack_vars(g);
+   irgen_context_struct(g);
 
    // Stash context pointer
    jit_value_t context = irgen_alloc_temp(g);
@@ -5576,7 +5670,8 @@ static void irgen_protected_entry(jit_irgen_t *g)
    g->func->spec = ffi_spec_new(types, ARRAY_LEN(types));
 
    irgen_params(g, 1);
-   irgen_locals(g);
+   irgen_stack_vars(g);
+   irgen_context_struct(g);
 
    // Stash context pointer
    jit_value_t context = irgen_alloc_temp(g);
@@ -5664,6 +5759,12 @@ void jit_irgen(jit_func_t *f, mir_unit_t *mu)
 
    for (int i = 0; i < nblocks; i++)
       irgen_preallocate(g, mir_get_block(g->mu, i));
+
+   const int nvars = mir_count_vars(g->mu);
+   g->vars = xmalloc_array(nvars, sizeof(jit_value_t));
+
+   for (int i = 0; i < nvars; i++)
+      g->vars[i].kind = JIT_VALUE_INVALID;
 
    irgen_analyse(g);
 

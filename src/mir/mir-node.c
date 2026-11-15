@@ -20,6 +20,7 @@
 #include "mir/mir-node.h"
 #include "mir/mir-structs.h"
 #include "mir/mir-priv.h"
+#include "rt/defs.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -291,31 +292,42 @@ static node_data_t *mir_alloc_node(mir_unit_t *mu)
 {
    assert(!mir_is_null(mu->cursor.block));
 
-   node_data_t *n;
    block_data_t *bd = mir_block_data(mu, mu->cursor.block);
+   if (mu->cursor.pos < bd->num_nodes) {
+      node_data_t *n = &(mu->nodes[bd->nodes[mu->cursor.pos]]);
+      if (n->op == _MIR_DELETED_OP) {
+         mu->cursor.pos++;
+         return n;
+      }
+   }
+
+   if (bd->num_nodes == bd->max_nodes) {
+      bd->max_nodes = MAX(4, bd->num_nodes * 2);
+      bd->nodes = xrealloc_array(bd->nodes, bd->max_nodes,
+                                 sizeof(node_id_t));
+   }
+
+   if (mu->num_nodes == mu->max_nodes) {
+      mu->max_nodes = MAX(8, mu->num_nodes * 2);
+      mu->nodes = xrealloc_array(mu->nodes, mu->max_nodes,
+                                 sizeof(node_data_t));
+   }
+
+   const node_id_t id = mu->num_nodes++;
    if (mu->cursor.pos >= bd->num_nodes) {
-      // Append new node
-      if (bd->num_nodes == bd->max_nodes) {
-         bd->max_nodes = MAX(4, bd->num_nodes * 2);
-         bd->nodes = xrealloc_array(bd->nodes, bd->max_nodes,
-                                    sizeof(node_id_t));
-      }
-
-      if (mu->num_nodes == mu->max_nodes) {
-         mu->max_nodes = MAX(8, mu->num_nodes * 2);
-         mu->nodes = xrealloc_array(mu->nodes, mu->max_nodes,
-                                    sizeof(node_data_t));
-      }
-
-      bd->nodes[bd->num_nodes++] = mu->num_nodes;
-      n = &(mu->nodes[mu->num_nodes++]);
+      bd->nodes[bd->num_nodes++] = id;
+      if (mu->cursor.pos != MIR_APPEND)
+         mu->cursor.pos = bd->num_nodes;
    }
    else {
-      n = &(mu->nodes[bd->nodes[mu->cursor.pos]]);
-      assert(n->op == _MIR_DELETED_OP);
+      memmove(bd->nodes + mu->cursor.pos + 1,
+              bd->nodes + mu->cursor.pos,
+              (bd->num_nodes - mu->cursor.pos) * sizeof(node_id_t));
+      bd->nodes[mu->cursor.pos++] = id;
+      bd->num_nodes++;
    }
 
-   return n;
+   return &(mu->nodes[id]);
 }
 
 static size_t mir_spill_args(mir_unit_t *mu, unsigned num)
@@ -578,6 +590,28 @@ bool mir_get_const_real(mir_unit_t *mu, mir_value_t value, double *result)
    }
 }
 
+bool mir_within_int(mir_unit_t *mu, mir_value_t value, int64_t low,
+                    int64_t high)
+{
+   if (low > high)
+      return false;
+
+   int64_t cval;
+   if (mir_get_const(mu, value, &cval))
+      return cval >= low && cval <= high;
+
+   mir_stamp_t stamp = mir_get_stamp(mu, value);
+   if (mir_is_null(stamp))
+      return false;
+
+   const stamp_data_t *sd = mir_stamp_data(mu, stamp);
+   if (sd->kind != MIR_STAMP_INT)
+      return false;
+
+   assert(sd->u.intg.low <= sd->u.intg.high);
+   return sd->u.intg.low >= low && sd->u.intg.high <= high;
+}
+
 mir_type_t mir_get_type(mir_unit_t *mu, mir_value_t value)
 {
    switch (value.tag) {
@@ -636,7 +670,7 @@ mir_mem_t mir_get_mem(mir_unit_t *mu, mir_value_t value)
    if (sd->kind == MIR_STAMP_POINTER)
       return sd->u.pointer.memory;
 
-   return MIR_MEM_NONE;
+   return MIR_MEM_TOP;
 }
 
 ident_t mir_get_name(mir_unit_t *mu, mir_value_t value)
@@ -1118,25 +1152,6 @@ static mir_value_t mir_build_arith(mir_unit_t *mu, mir_op_t op, mir_type_t type,
                     "arguments to %s are not the same type", mir_op_string(op));
       }
       break;
-
-   case MIR_TYPE_VEC2:
-   case MIR_TYPE_VEC4:
-      {
-         const type_data_t *td = mir_type_data(mu, type);
-         const type_data_t *ltd = mir_type_data(mu, mir_get_type(mu, left));
-         const type_data_t *rtd = mir_type_data(mu, mir_get_type(mu, right));
-
-         MIR_ASSERT(td->class == ltd->class && td->class == rtd->class,
-                    "cannot mix vector types");
-         MIR_ASSERT(td->u.vec.issigned == ltd->u.vec.issigned
-                    && td->u.vec.issigned == rtd->u.vec.issigned,
-                    "cannot mix vector signedness");
-         MIR_ASSERT(td->u.vec.size >= ltd->u.vec.size
-                    && td->u.vec.size >= rtd->u.vec.size,
-                    "implicit narrowing conversions are not allowed");
-      }
-      break;
-
    default:
       MIR_ASSERT(false, "arithmetic is not allowed on this type");
       break;
@@ -2646,7 +2661,8 @@ mir_value_t mir_build_resolved(mir_unit_t *mu, mir_value_t signal)
 {
    mir_type_t type = mir_get_type(mu, signal);
    mir_type_t pointer = mir_get_pointer(mu, type);
-   mir_stamp_t stamp = mir_get_stamp(mu, signal);
+   mir_stamp_t elem = mir_get_stamp(mu, signal);
+   mir_stamp_t stamp = mir_pointer_stamp(mu, MIR_MEM_SIGNAL, elem);
 
    mir_value_t result = mir_build_1(mu, MIR_OP_RESOLVED, pointer,
                                     stamp, signal);
@@ -2687,23 +2703,47 @@ mir_value_t mir_build_driving_value(mir_unit_t *mu, mir_value_t signal,
    return result;
 }
 
-void mir_build_force(mir_unit_t *mu, mir_value_t target, mir_value_t count,
-                     mir_value_t values)
+void mir_build_sched_force(mir_unit_t *mu, mir_value_t target,
+                           mir_value_t count, mir_value_t values)
 {
-   mir_build_3(mu, MIR_OP_FORCE, MIR_NULL_TYPE, MIR_NULL_STAMP,
+   mir_build_3(mu, MIR_OP_SCHED_FORCE, MIR_NULL_TYPE, MIR_NULL_STAMP,
                target, count, values);
 
    MIR_ASSERT(mir_is_signal(mu, target), "force target is not signal");
    MIR_ASSERT(mir_is_offset(mu, count), "force count is not offset type");
 }
 
-void mir_build_release(mir_unit_t *mu, mir_value_t target, mir_value_t count)
+void mir_build_sched_release(mir_unit_t *mu, mir_value_t target,
+                             mir_value_t count)
 {
-   mir_build_2(mu, MIR_OP_RELEASE, MIR_NULL_TYPE, MIR_NULL_STAMP,
+   mir_build_2(mu, MIR_OP_SCHED_RELEASE, MIR_NULL_TYPE, MIR_NULL_STAMP,
                target, count);
 
    MIR_ASSERT(mir_is_signal(mu, target), "release target is not signal");
    MIR_ASSERT(mir_is_offset(mu, count), "release net count is not offset type");
+}
+
+void mir_build_force_signal(mir_unit_t *mu, mir_value_t target,
+                            mir_value_t count, mir_value_t values)
+{
+   mir_build_3(mu, MIR_OP_FORCE_SIGNAL, MIR_NULL_TYPE, MIR_NULL_STAMP,
+               target, count, values);
+
+   MIR_ASSERT(mir_is_signal(mu, target), "force target is not signal");
+   MIR_ASSERT(mir_is_offset(mu, count), "force count is not offset type");
+}
+
+void mir_build_release_signal(mir_unit_t *mu, mir_value_t target,
+                              mir_value_t count, mir_value_t mode)
+{
+   mir_build_3(mu, MIR_OP_RELEASE_SIGNAL, MIR_NULL_TYPE, MIR_NULL_STAMP,
+               target, count, mode);
+
+   MIR_ASSERT(mir_is_signal(mu, target), "release target is not signal");
+   MIR_ASSERT(mir_is_offset(mu, count), "release net count is not offset type");
+   MIR_ASSERT(mode.tag == MIR_TAG_ENUM, "release mode is not an enum");
+   MIR_ASSERT(mode.id == RELEASE_RECOMPUTE || mode.id == RELEASE_RETAIN,
+              "invalid release mode");
 }
 
 void mir_build_disconnect(mir_unit_t *mu, mir_value_t target, mir_value_t count,
@@ -3106,14 +3146,15 @@ mir_value_t mir_build_link_var(mir_unit_t *mu, mir_value_t context,
 }
 
 void mir_build_bind_foreign(mir_unit_t *mu, mir_value_t spec,
-                            mir_value_t length, mir_value_t locus)
+                            mir_value_t length, mir_value_t locus,
+                            mir_value_t region)
 {
    if (mir_is_null(locus))
       mir_build_2(mu, MIR_OP_BIND_FOREIGN, MIR_NULL_TYPE, MIR_NULL_STAMP,
                   spec, length);
    else
-      mir_build_3(mu, MIR_OP_BIND_FOREIGN, MIR_NULL_TYPE, MIR_NULL_STAMP,
-                  spec, length, locus);
+      mir_build_4(mu, MIR_OP_BIND_FOREIGN, MIR_NULL_TYPE, MIR_NULL_STAMP,
+                  spec, length, locus, region);
 
    MIR_ASSERT(mir_is(mu, spec, MIR_TYPE_POINTER),
               "spec argument to bind foreign must be a pointer");
@@ -3121,6 +3162,8 @@ void mir_build_bind_foreign(mir_unit_t *mu, mir_value_t spec,
               "legnth argument to bind foreign must be offset");
    MIR_ASSERT(mir_is_null(locus) || mir_is(mu, locus, MIR_TYPE_LOCUS),
               "locus argument to bind foreign value must be a debug locus");
+   MIR_ASSERT(mir_is_null(region) || mir_is(mu, region, MIR_TYPE_LOCUS),
+              "region argument to bind foreign value must be a debug locus");
 }
 
 mir_value_t mir_build_bind_external(mir_unit_t *mu, mir_value_t locus,
@@ -3129,7 +3172,10 @@ mir_value_t mir_build_bind_external(mir_unit_t *mu, mir_value_t locus,
                                     int nargs)
 {
    mir_type_t pointer = mir_get_var_pointer(mu, type);
-   mir_value_t link = mir_add_linkage(mu, scope);
+
+   mir_value_t link = MIR_NULL_VALUE;
+   if (scope != NULL)
+      link = mir_add_linkage(mu, scope);
 
    node_data_t *n = mir_add_node(mu, MIR_OP_BIND_EXTERNAL, pointer, stamp,
                                  nargs + 2);
@@ -3339,6 +3385,18 @@ void mir_build_report(mir_unit_t *mu, mir_value_t message, mir_value_t length,
               "locus argument to report must be a debug locus");
 }
 
+void mir_build_tcheck(mir_unit_t *mu, mir_value_t stamp,
+                      mir_value_t limit, mir_value_t locus)
+{
+   mir_build_3(mu, MIR_OP_TCHECK, MIR_NULL_TYPE, MIR_NULL_STAMP,
+               stamp, limit, locus);
+
+   MIR_ASSERT(mir_is_time(mu, stamp), "stamp must be time");
+   MIR_ASSERT(mir_is_time(mu, limit), "limit must be time");
+   MIR_ASSERT(mir_is(mu, locus, MIR_TYPE_LOCUS),
+              "locus argument to report must be a debug locus");
+}
+
 mir_value_t mir_build_instance_name(mir_unit_t *mu, mir_value_t kind)
 {
    mir_type_t type = mir_string_type(mu);
@@ -3421,15 +3479,16 @@ mir_value_t mir_build_cast(mir_unit_t *mu, mir_type_t type, mir_value_t value)
          node_data_t *n = mir_node_data(mu, value);
          if (n->op == MIR_OP_CONST_VEC && mir_get_size(mu, type) <= 64) {
             uint64_t abits = n->bits[0];
+            uint64_t bbits = class == MIR_TYPE_VEC2 ? 0 : n->bits[1];
             if (mir_get_signed(mu, n->type)) {
                const int arg_size = mir_get_size(mu, n->type);
                if (arg_size > 0 && arg_size < 64) {
                   const int shift = 64 - arg_size;
                   abits = ((int64_t)abits << shift) >> shift;
+                  bbits = ((int64_t)bbits << shift) >> shift;
                }
             }
 
-            const uint64_t bbits = (class == MIR_TYPE_VEC2 ? 0 : n->bits[1]);
             return mir_const_vec(mu, type, abits, bbits);
          }
       }

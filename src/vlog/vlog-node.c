@@ -24,6 +24,8 @@
 #include <inttypes.h>
 #include <stdlib.h>
 
+STATIC_ASSERT(V_LAST_NODE_KIND < 256);
+
 static const imask_t has_map[V_LAST_NODE_KIND] = {
    // V_MODULE
    (I_IDENT | I_PORTS | I_STMTS | I_DECLS | I_IDENT2),
@@ -49,11 +51,11 @@ static const imask_t has_map[V_LAST_NODE_KIND] = {
    // V_INITIAL
    (I_IDENT | I_STMTS),
 
-   // V_BLOCK
+   // V_SEQ_BLOCK
    (I_IDENT | I_DECLS | I_STMTS),
 
    // V_SYS_TCALL
-   (I_IDENT | I_PARAMS),
+   (I_IDENT | I_PARAMS | I_SUBKIND),
 
    // V_STRING
    (I_NUMBER),
@@ -104,13 +106,13 @@ static const imask_t has_map[V_LAST_NODE_KIND] = {
    (I_VALUE | I_PARAMS),
 
    // V_SYS_FCALL
-   (I_IDENT | I_PARAMS),
+   (I_IDENT | I_PARAMS | I_SUBKIND),
 
    // V_FOREVER
    (I_STMTS),
 
    // V_SPECIFY
-   (I_DECLS),
+   (I_DECLS | I_STMTS),
 
    // V_PRIMITIVE
    (I_IDENT | I_IDENT2 | I_PORTS | I_DECLS | I_STMTS),
@@ -158,7 +160,7 @@ static const imask_t has_map[V_LAST_NODE_KIND] = {
    (I_IDENT | I_IDENT2 | I_STMTS | I_DECLS | I_PORTS),
 
    // V_FUNC_DECL
-   (I_IDENT | I_IDENT2 | I_STMTS | I_DECLS | I_TYPE | I_PORTS),
+   (I_IDENT | I_IDENT2 | I_STMTS | I_DECLS | I_TYPE | I_PORTS | I_FLAGS),
 
    // V_WAIT
    (I_VALUE | I_STMTS),
@@ -263,7 +265,7 @@ static const imask_t has_map[V_LAST_NODE_KIND] = {
    (I_IDENT),
 
    // V_HIER_REF
-   (I_IDENT | I_IDENT2 | I_REF),
+   (I_IDENT | I_VALUE | I_REF),
 
    // V_TF_PORT_DECL
    (I_IDENT | I_SUBKIND | I_RANGES | I_TYPE | I_VALUE | I_REF),
@@ -296,7 +298,7 @@ static const imask_t has_map[V_LAST_NODE_KIND] = {
    (I_TYPE | I_PARAMS),
 
    // V_DYNAMIC_NEW
-   (I_TYPE | I_VALUE),
+   (I_TYPE | I_LEFT | I_VALUE),
 
    // V_CONSTRUCTOR
    (I_IDENT | I_PARAMS | I_STMTS | I_DECLS),
@@ -314,38 +316,77 @@ static const imask_t has_map[V_LAST_NODE_KIND] = {
    (I_TARGET | I_VALUE),
 
    // V_PORT_MAP
-   (I_REF | I_VALUE),
+   (I_IDENT | I_REF | I_VALUE),
 
    // V_FINAL
    (I_IDENT | I_STMTS),
+
+   // V_LOCAL_DECL
+   (I_IDENT | I_TYPE | I_RANGES | I_VALUE),
+
+   // V_GEN_BLOCK
+   (I_IDENT | I_DECLS | I_STMTS),
+
+   // V_METHOD_CALL
+   (I_IDENT | I_VALUE | I_REF | I_SUBKIND | I_PARAMS),
+
+   // V_MOD_REF
+   (I_IDENT | I_PARAMS | I_VALUE | I_REF),
+
+   // V_ASSERT
+   (I_IDENT | I_VALUE | I_CONDS),
+
+   // V_ASSUME
+   (I_IDENT | I_VALUE | I_CONDS),
+
+   // V_COVER
+   (I_IDENT | I_VALUE | I_CONDS),
+
+   // V_PATTERN_EXPR
+   (I_TYPE | I_PARAMS),
+
+   // V_PATTERN_ITEM
+   (I_LEFT | I_RIGHT),
+
+   // V_CAST
+   (I_SUBKIND | I_LEFT | I_VALUE),
+
+   // V_TCHECK
+   (I_SUBKIND | I_PARAMS),
+
+   // V_TCHECK_EVENT
+   (I_PARAMS)
 };
 
 static const char *kind_text_map[V_LAST_NODE_KIND] = {
-   "V_MODULE",        "V_PORT_DECL",   "V_REF",           "V_ALWAYS",
-   "V_TIMING",        "V_NBASSIGN",    "V_EVENT",         "V_INITIAL",
-   "V_BLOCK",         "V_SYS_TCALL",   "V_STRING",        "V_NUMBER",
-   "V_NET_DECL",      "V_ASSIGN",      "V_DIMENSION",     "V_IF",
-   "V_COND",          "V_VAR_DECL",    "V_DELAY_CONTROL", "V_BINARY",
-   "V_BASSIGN",       "V_UNARY",       "V_GATE_INST",     "V_STRENGTH",
-   "V_MOD_INST",      "V_BIT_SELECT",  "V_SYS_FCALL",     "V_FOREVER",
-   "V_SPECIFY",       "V_PRIMITIVE",   "V_UDP_TABLE",     "V_UDP_ENTRY",
-   "V_DATA_TYPE",     "V_TYPE_DECL",   "V_ENUM_DECL",     "V_ENUM_NAME",
-   "V_UNION_DECL",    "V_STRUCT_DECL", "V_EVENT_CONTROL", "V_EMPTY",
-   "V_REPEAT",        "V_WHILE",       "V_DO_WHILE",      "V_TASK_DECL",
-   "V_FUNC_DECL",     "V_WAIT",        "V_PARAM_DECL",    "V_COND_EXPR",
-   "V_REAL",          "V_CONCAT",      "V_FOR_LOOP",      "V_FOR_INIT",
-   "V_FOR_STEP",      "V_PREFIX",      "V_POSTFIX",       "V_LOCALPARAM",
-   "V_CASE",          "V_CASE_ITEM",   "V_INST_LIST",     "V_PARAM_ASSIGN",
-   "V_INST_BODY",     "V_PORT_CONN",   "V_PART_SELECT",   "V_IF_GENERATE",
-   "V_EVENT_TRIGGER", "V_USER_FCALL",  "V_UDP_LEVEL",     "V_UDP_EDGE",
-   "V_SPECPARAM",     "V_FORK",        "V_ATTR_INST",     "V_USER_TCALL",
-   "V_VOID_CALL",     "V_GENVAR_DECL", "V_FOR_GENERATE",  "V_DEASSIGN",
-   "V_FORCE",         "V_RELEASE",     "V_DISABLE",       "V_HIER_REF",
-   "V_TF_PORT_DECL",  "V_RETURN",      "V_OP_ASSIGN",     "V_MEMBER_REF",
-   "V_PACKAGE",       "V_MIN_TYP_MAX", "V_PROGRAM",       "V_CLASS_DECL",
-   "V_NULL",          "V_CLASS_NEW",   "V_DYNAMIC_NEW",   "V_CONSTRUCTOR",
-   "V_SUPER_CALL",    "V_IMPORT_DECL", "V_NAMESPACE",     "V_DEFPARAM",
-   "V_PORT_MAP",      "V_FINAL",
+   "V_MODULE",        "V_PORT_DECL",    "V_REF",           "V_ALWAYS",
+   "V_TIMING",        "V_NBASSIGN",     "V_EVENT",         "V_INITIAL",
+   "V_SEQ_BLOCK",     "V_SYS_TCALL",    "V_STRING",        "V_NUMBER",
+   "V_NET_DECL",      "V_ASSIGN",       "V_DIMENSION",     "V_IF",
+   "V_COND",          "V_VAR_DECL",     "V_DELAY_CONTROL", "V_BINARY",
+   "V_BASSIGN",       "V_UNARY",        "V_GATE_INST",     "V_STRENGTH",
+   "V_MOD_INST",      "V_BIT_SELECT",   "V_SYS_FCALL",     "V_FOREVER",
+   "V_SPECIFY",       "V_PRIMITIVE",    "V_UDP_TABLE",     "V_UDP_ENTRY",
+   "V_DATA_TYPE",     "V_TYPE_DECL",    "V_ENUM_DECL",     "V_ENUM_NAME",
+   "V_UNION_DECL",    "V_STRUCT_DECL",  "V_EVENT_CONTROL", "V_EMPTY",
+   "V_REPEAT",        "V_WHILE",        "V_DO_WHILE",      "V_TASK_DECL",
+   "V_FUNC_DECL",     "V_WAIT",         "V_PARAM_DECL",    "V_COND_EXPR",
+   "V_REAL",          "V_CONCAT",       "V_FOR_LOOP",      "V_FOR_INIT",
+   "V_FOR_STEP",      "V_PREFIX",       "V_POSTFIX",       "V_LOCALPARAM",
+   "V_CASE",          "V_CASE_ITEM",    "V_INST_LIST",     "V_PARAM_ASSIGN",
+   "V_INST_BODY",     "V_PORT_CONN",    "V_PART_SELECT",   "V_IF_GENERATE",
+   "V_EVENT_TRIGGER", "V_USER_FCALL",   "V_UDP_LEVEL",     "V_UDP_EDGE",
+   "V_SPECPARAM",     "V_FORK",         "V_ATTR_INST",     "V_USER_TCALL",
+   "V_VOID_CALL",     "V_GENVAR_DECL",  "V_FOR_GENERATE",  "V_DEASSIGN",
+   "V_FORCE",         "V_RELEASE",      "V_DISABLE",       "V_HIER_REF",
+   "V_TF_PORT_DECL",  "V_RETURN",       "V_OP_ASSIGN",     "V_MEMBER_REF",
+   "V_PACKAGE",       "V_MIN_TYP_MAX",  "V_PROGRAM",       "V_CLASS_DECL",
+   "V_NULL",          "V_CLASS_NEW",    "V_DYNAMIC_NEW",   "V_CONSTRUCTOR",
+   "V_SUPER_CALL",    "V_IMPORT_DECL",  "V_NAMESPACE",     "V_DEFPARAM",
+   "V_PORT_MAP",      "V_FINAL",        "V_LOCAL_DECL",    "V_GEN_BLOCK",
+   "V_METHOD_CALL",   "V_MOD_REF",      "V_ASSERT",        "V_ASSUME",
+   "V_COVER",         "V_PATTERN_EXPR", "V_PATTERN_ITEM",  "V_CAST",
+   "V_TCHECK",        "V_TCHECK_EVENT"
 };
 
 static const change_allowed_t change_allowed[] = {
@@ -684,6 +725,11 @@ vlog_node_t vlog_left(vlog_node_t v)
    return container_of(item->object, struct _vlog_node, object);
 }
 
+bool vlog_has_left(vlog_node_t v)
+{
+   return lookup_item(&vlog_object, v, I_LEFT)->object != NULL;
+}
+
 void vlog_set_left(vlog_node_t v, vlog_node_t e)
 {
    lookup_item(&vlog_object, v, I_LEFT)->object = &(e->object);
@@ -733,6 +779,11 @@ void vlog_set_flags(vlog_node_t v, vlog_flags_t mask)
    lookup_item(&vlog_object, v, I_FLAGS)->ival |= mask;
 }
 
+void vlog_clear_flags(vlog_node_t v, vlog_flags_t mask)
+{
+   lookup_item(&vlog_object, v, I_FLAGS)->ival &= ~mask;
+}
+
 void vlog_visit(vlog_node_t v, vlog_visit_fn_t fn, void *context)
 {
    vlog_visit_only(v, fn, context, V_LAST_NODE_KIND);
@@ -757,7 +808,8 @@ void vlog_visit_only(vlog_node_t v, vlog_visit_fn_t fn, void *context,
    object_visit(&(v->object), &ctx);
 }
 
-vlog_node_t vlog_rewrite(vlog_node_t v, vlog_rewrite_fn_t fn, void *context)
+vlog_node_t vlog_rewrite(vlog_node_t v, vlog_rewrite_pre_fn_t pre_fn,
+                         vlog_rewrite_post_fn_t post_fn, void *context)
 {
    object_arena_t *arena = object_arena(&(v->object));
    if (arena_frozen(arena))
@@ -769,7 +821,8 @@ vlog_node_t vlog_rewrite(vlog_node_t v, vlog_rewrite_fn_t fn, void *context)
       .arena      = arena,
    };
 
-   ctx.post_fn[OBJECT_TAG_VLOG] = (object_rewrite_post_fn_t)fn;
+   ctx.pre_fn[OBJECT_TAG_VLOG] = (object_rewrite_pre_fn_t)pre_fn;
+   ctx.post_fn[OBJECT_TAG_VLOG] = (object_rewrite_post_fn_t)post_fn;
 
    object_t *result = object_rewrite(&(v->object), &ctx);
    free(ctx.cache);
@@ -804,4 +857,14 @@ vlog_node_t vlog_from_object(object_t *obj)
       return container_of(obj, struct _vlog_node, object);
    else
       return NULL;
+}
+
+vlog_global_flags_t vlog_global_flags(vlog_node_t v)
+{
+   return arena_flags(object_arena(&(v->object)));
+}
+
+void vlog_set_global_flags(vlog_node_t v, vlog_global_flags_t flags)
+{
+   arena_set_flags(object_arena(&(v->object)), flags);
 }

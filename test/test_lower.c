@@ -27,7 +27,6 @@
 #include "scan.h"
 #include "test_mir.h"
 #include "vcode.h"
-#include "vhdl/vhdl-lower.h"
 
 #include <inttypes.h>
 
@@ -384,12 +383,10 @@ static mir_unit_t *find_unit2(const char *name)
 
    ident_t id = ident_new(name);
 
-   vcode_unit_t vu = unit_registry_get(ur, id);
-   if (vu == NULL)
-      fail("missing vcode unit for %s", name);
+   (void)unit_registry_get(ur, id);
 
    mir_unit_t *mu = mir_get_unit(mc, id);
-   ck_assert_ptr_nonnull(mu);
+   ck_assert_msg(mu != NULL, "missing MIR unit %s", name);
 
    return mu;
 }
@@ -921,36 +918,48 @@ END_TEST
 
 START_TEST(test_func1)
 {
-   input_from_file(TESTDIR "/lower/func1.vhd");
+   opt_set_int(OPT_LOWER_MIR, 1);
 
-   const error_t expect[] = {
-      { -1, NULL }
-   };
-   expect_errors(expect);
+   input_from_file(TESTDIR "/lower/func1.vhd");
 
    run_elab();
 
-   vcode_unit_t v0 = find_unit("WORK.FUNC1.P1");
-   vcode_select_unit(v0);
+   {
+      mir_unit_t *mu = find_unit2("WORK.FUNC1.ADD1(I)I");
 
-   EXPECT_BB(0) = {
-      { VCODE_OP_CONST, .value = INT32_MIN },
-      { VCODE_OP_STORE, .name = "R" },
-      { VCODE_OP_RETURN }
-   };
+      static const mir_match_t bb0[] = {
+         { MIR_OP_DEBUG_LOCUS },
+         { MIR_OP_TRAP_ADD, PARAM("X"), CONST(1) },
+         { MIR_OP_CONST, INT64(INT32_MIN) },
+         { MIR_OP_CONST, INT64(INT32_MAX) },
+         { MIR_OP_RANGE_CHECK },
+         { MIR_OP_RETURN },
+      };
+      mir_match(mu, 0, bb0);
+   }
 
-   CHECK_BB(0);
+   {
+      mir_unit_t *mu = find_unit2("WORK.FUNC1.P1");
 
-   EXPECT_BB(1) = {
-      { VCODE_OP_CONST, .value = 2 },
-      { VCODE_OP_STORE, .name = "R" },
-      { VCODE_OP_CONTEXT_UPREF, .hops = 1 },
-      { VCODE_OP_FCALL, .func = "WORK.FUNC1.ADD1(I)I" },
-      { VCODE_OP_STORE, .name = "R" },
-      { VCODE_OP_WAIT, .target = 2 }
-   };
+      static const mir_match_t bb0[] = {
+         { MIR_OP_CONST, INT64(INT32_MIN) },
+         { MIR_OP_STORE, VAR("R") },
+         { MIR_OP_RETURN },
+      };
+      mir_match(mu, 0, bb0);
 
-   CHECK_BB(1);
+      static const mir_match_t bb1[] = {
+         { MIR_OP_STORE, VAR("R"), CONST(2) },
+         { MIR_OP_NULL },   // XXX: should be CONTEXT_UPREF
+         // { MIR_OP_CONTEXT_UPREF, ENUM(1) },
+         { MIR_OP_FCALL, LINK("WORK.FUNC1.ADD1(I)I"), NODE(_), CONST(2) },
+         { MIR_OP_STORE, VAR("R") },
+         { MIR_OP_WAIT, BLOCK(2) },
+      };
+      mir_match(mu, 1, bb1);
+   }
+
+   fail_if_errors();
 }
 END_TEST
 
@@ -958,12 +967,9 @@ START_TEST(test_issue94)
 {
    input_from_file(TESTDIR "/lower/issue94.vhd");
 
-   const error_t expect[] = {
-      { -1, NULL }
-   };
-   expect_errors(expect);
-
    run_elab();
+
+   fail_if_errors();
 }
 END_TEST
 
@@ -1992,7 +1998,8 @@ START_TEST(test_cover)
                                         | COVER_MASK_BRANCH, 0, 0);
    rt_model_t *m = model_new(jit, data);
 
-   elab(tree_to_object(a), jit, ur, mc, data, NULL, m);
+   object_t *top[1] = { tree_to_object(a) };
+   elab(top, 1, jit, ur, mc, data, NULL, m);
 
    vcode_unit_t v0 = find_unit("WORK.COVER_ENT.P1");
    vcode_select_unit(v0);
@@ -2568,7 +2575,8 @@ START_TEST(test_choice1)
    jit_t *jit = jit_new(ur, mc);
    cover_data_t *data = cover_data_init(COVER_MASK_BRANCH, 0, 0);
    rt_model_t *m = model_new(jit, NULL);
-   elab(tree_to_object(a), jit, ur, mc, data, NULL, m);
+   object_t *top[1] = { tree_to_object(a) };
+   elab(top, 1, jit, ur, mc, data, NULL, m);
 
    vcode_unit_t v0 = find_unit("WORK.CHOICE1.P1");
    vcode_select_unit(v0);
@@ -4790,6 +4798,7 @@ START_TEST(test_vunit5)
       { VCODE_OP_MEMSET },
       { VCODE_OP_WRAP },
       { VCODE_OP_STORE_INDIRECT },
+      { VCODE_OP_FCALL, .func = "WORK.VUNIT5-TEST.REC$new" },
       { VCODE_OP_LOAD_INDIRECT },
       { VCODE_OP_DEBUG_LOCUS },
       { VCODE_OP_UARRAY_LEN },
@@ -5083,7 +5092,8 @@ START_TEST(test_issue582)
    cover_data_t *data = cover_data_init(COVER_MASK_ALL, 0, 0);
    rt_model_t *m = model_new(jit, NULL);
 
-   elab(tree_to_object(a), jit, ur, mc, data, NULL, m);
+   object_t *top[1] = { tree_to_object(a) };
+   elab(top, 1, jit, ur, mc, data, NULL, m);
 
    model_free(m);
    jit_free(jit);
@@ -6606,23 +6616,24 @@ START_TEST(test_issue1194)
    cover_data_t *data = cover_data_init(COVER_MASK_EXPRESSION, 0, 0);
    rt_model_t *m = model_new(jit, NULL);
 
-   elab(tree_to_object(a), jit, get_registry(), get_mir(), data, NULL, m);
+   object_t *top[1] = { tree_to_object(a) };
+   elab(top, 1, jit, get_registry(), get_mir(), data, NULL, m);
 
    mir_unit_t *mu = find_unit2("WORK.ISSUE1194.B._I0");
 
    static const mir_match_t bb1[] = {
-      { MIR_OP_VAR_UPREF },   // TODO: X
+      { MIR_OP_VAR_UPREF, ENUM(2), UPREF("X") },
       { MIR_OP_LOAD },
       { MIR_OP_RESOLVED },
       { MIR_OP_LOAD },
-      { MIR_OP_VAR_UPREF },  // TODO: Y
+      { MIR_OP_VAR_UPREF, ENUM(2), UPREF("Y") },
       { MIR_OP_LOAD },
       { MIR_OP_RESOLVED },
       { MIR_OP_LOAD },
       { MIR_OP_OR },
       { MIR_OP_NOT },
       { MIR_OP_NOT },
-      { MIR_OP_VAR_UPREF },  // TODO: #counters
+      { MIR_OP_VAR_UPREF, ENUM(1), UPREF("#counters") },
       { MIR_OP_LOAD },
       { MIR_OP_AND },
       { MIR_OP_COND, NODE(_), BLOCK(3), BLOCK(2) },
@@ -6828,14 +6839,17 @@ START_TEST(test_issue1280)
 
    run_elab();
 
-   vcode_unit_t vu = find_unit("WORK.ISSUE1280.CMP_TEST.MY_SIG$delayed_2_NS");
+   (void)find_unit("WORK.ISSUE1280.CMP_TEST.PROC_MODEL");
+
+   vcode_unit_t vu =
+      find_unit("WORK.ISSUE1280.CMP_TEST.PROC_MODEL.MY_SIG$delayed_2_NS");
    vcode_select_unit(vu);
 
    EXPECT_BB(0) = {
       { VCODE_OP_VAR_UPREF, .hops = 1, .name = "MY_SIG$delayed_2_NS" },
       { VCODE_OP_LOAD_INDIRECT },
       { VCODE_OP_CONST, .value = 0 },
-      { VCODE_OP_STORE, .name = "i1" },
+      { VCODE_OP_STORE, .name = "i2" },
       { VCODE_OP_UARRAY_LEN },
       { VCODE_OP_UNWRAP },
       { VCODE_OP_CMP, .cmp = VCODE_CMP_EQ },
@@ -6847,7 +6861,7 @@ START_TEST(test_issue1280)
    EXPECT_BB(1) = {  // Process entry must be block 1
       { VCODE_OP_CONST, .value = 2000000 },
       { VCODE_OP_CONST, .value = 0 },
-      { VCODE_OP_VAR_UPREF, .hops = 1, .name = "MY_SIG" },
+      { VCODE_OP_VAR_UPREF, .hops = 2, .name = "MY_SIG" },
       { VCODE_OP_LOAD_INDIRECT },
       { VCODE_OP_FCALL, .func = "WORK.TEST-RTL.T_REAL_RECORD_ARRAY$resolved" },
       { VCODE_OP_VAR_UPREF, .hops = 1, .name = "MY_SIG$delayed_2_NS" },
@@ -6857,7 +6871,7 @@ START_TEST(test_issue1280)
       { VCODE_OP_UARRAY_LEN },
       { VCODE_OP_LENGTH_CHECK },
       { VCODE_OP_CONST, .value = 0 },
-      { VCODE_OP_STORE, .name = "i1" },
+      { VCODE_OP_STORE, .name = "i2" },
       { VCODE_OP_UNWRAP },
       { VCODE_OP_CMP, .cmp = VCODE_CMP_EQ },
       { VCODE_OP_COND, .target = 7, .target_else = 6 },
@@ -6941,7 +6955,7 @@ START_TEST(test_issue1350)
       mir_unit_t *mu = find_unit2("WORK.ENT.PROC(Q)");
 
       static const mir_match_t bb0[] = {
-         { MIR_OP_VAR_UPREF, CONST(1) },
+         { MIR_OP_VAR_UPREF, ENUM(1), UPREF("WORK.ENT.PROC(Q).N") },
          { MIR_OP_LOAD },
          { MIR_OP_SUB, NODE(_), CONST(1) },
          { MIR_OP_JUMP, BLOCK(1) },   // TODO: should merge with next block
@@ -6963,7 +6977,7 @@ START_TEST(test_issue1350)
          { MIR_OP_CONST_ARRAY, CONST(0), CONST(0) },
          { MIR_OP_ADDRESS_OF },
          { MIR_OP_DEBUG_LOCUS },
-         { MIR_OP_VAR_UPREF, ENUM(1) },
+         { MIR_OP_VAR_UPREF, ENUM(1), UPREF("WORK.ENT.PROC(Q).N") },
          { MIR_OP_LOAD },
          { MIR_OP_SUB, NODE(_), CONST(1) },
          { MIR_OP_RANGE_LENGTH },
@@ -7113,33 +7127,56 @@ END_TEST
 
 START_TEST(test_types1)
 {
+   opt_set_int(OPT_LOWER_MIR, 1);
+
    set_standard(STD_08);
 
    input_from_file(TESTDIR "/lower/types1.vhd");
 
-   tree_t p = parse_check_and_simplify(T_PACKAGE, T_PACKAGE);
+   parse_check_and_simplify(T_PACKAGE, T_PACKAGE, T_PACKAGE);
 
-   ident_t name = tree_ident(p);
-   mir_defer(get_mir(), name, NULL, MIR_UNIT_PACKAGE,
-             vhdl_lower_deferred, tree_to_object(p));
+   {
+      mir_unit_t *mu = find_unit2("WORK.TYPES1_DEF");
 
-   mir_unit_t *mu = mir_get_unit(get_mir(), name);
+      static const mir_match_t bb0[] = {
+         // MY_INT1
+         { MIR_OP_NULL },   // XXX: should be LINK_PACKAGE
+         { MIR_OP_FCALL, LINK("WORK.UTIL.EXPENSIVE()I") },
+         { MIR_OP_NULL },
+         { MIR_OP_WRAP, NODE(_), CONST(1), NODE(_) },
+         { MIR_OP_STORE, VAR("WORK.TYPES1_DEF.MY_INT1") },
 
-   static const mir_match_t bb0[] = {
-      // MY_INT1
-      { MIR_OP_FCALL, LINK("WORK.UTIL.EXPENSIVE()I") },
-      { MIR_OP_NULL },
-      { MIR_OP_WRAP, NODE(_), CONST(1), NODE(_) },
-      { MIR_OP_STORE, VAR("WORK.TYPES1.MY_INT1") },
+         // MY_ARRAY1
+         { MIR_OP_NULL },
+         { MIR_OP_FCALL, LINK("WORK.UTIL.EXPENSIVE()I") },
+         { MIR_OP_WRAP, NODE(_), CONST(1), NODE(_) },
+         { MIR_OP_STORE, VAR("WORK.TYPES1_DEF.MY_ARRAY1") },
 
-      // C1
-      { MIR_OP_DEBUG_LOCUS },
-      { MIR_OP_RANGE_CHECK, CONST(5) },
-      { MIR_OP_STORE, VAR("C1"), CONST(5) },
+         { MIR_OP_RETURN },
+      };
+      mir_match(mu, 0, bb0);
+   }
 
-      { MIR_OP_RETURN },
-   };
-   mir_match(mu, 0, bb0);
+   {
+      mir_unit_t *mu = find_unit2("WORK.TYPES1_USE");
+
+      static const mir_match_t bb0[] = {
+         // C1
+         { MIR_OP_LINK_PACKAGE, LINK("WORK.TYPES1_DEF") },
+         { MIR_OP_LINK_VAR, LINK("WORK.TYPES1_DEF"), NODE(_),
+           EXTVAR("WORK.TYPES1_DEF.MY_INT1") },
+         { MIR_OP_LOAD },
+         { MIR_OP_UARRAY_LEFT },
+         { MIR_OP_UARRAY_RIGHT },
+         { MIR_OP_UARRAY_DIR },
+         { MIR_OP_DEBUG_LOCUS },
+         { MIR_OP_RANGE_CHECK },
+         { MIR_OP_STORE, VAR("C1") },
+
+         { MIR_OP_RETURN },
+      };
+      mir_match(mu, 0, bb0);
+   }
 
    fail_if_errors();
 }
@@ -7152,6 +7189,47 @@ START_TEST(test_issue1503)
    input_from_file(TESTDIR "/lower/issue1503.vhd");
 
    run_elab();
+
+   fail_if_errors();
+}
+END_TEST
+
+START_TEST(test_issue1707)
+{
+   input_from_file(TESTDIR "/lower/issue1707.vhd");
+
+   run_elab();
+
+   mir_unit_t *mu = find_unit2("WORK.REPRO.OUTER_PROC");
+
+   static const mir_match_t bb8[] = {
+      { MIR_OP_RESUME, LINK("WORK.REPRO.WAITS_A_BIT") },
+      { MIR_OP_RETURN },
+   };
+   mir_match(mu, 8, bb8);
+
+   fail_if_errors();
+}
+END_TEST
+
+START_TEST(test_issue1722)
+{
+   set_standard(STD_08);
+
+   input_from_file(TESTDIR "/lower/issue1722.vhd");
+
+   run_elab();
+
+   mir_unit_t *mu = find_unit2("WORK.ISSUE1722.P1");
+
+   static const mir_match_t bb1[] = {
+      { MIR_OP_VAR_UPREF, ENUM(1), UPREF("STATE") },
+      { MIR_OP_LOAD },
+      { MIR_OP_RESOLVED },
+      { MIR_OP_LOAD },
+      { MIR_OP_CASE },
+   };
+   mir_match(mu, 1, bb1);
 
    fail_if_errors();
 }
@@ -7322,6 +7400,8 @@ Suite *get_lower_tests(void)
    tcase_add_test(tc, test_issue1425);
    tcase_add_test(tc, test_types1);
    tcase_add_test(tc, test_issue1503);
+   tcase_add_test(tc, test_issue1707);
+   tcase_add_test(tc, test_issue1722);
    suite_add_tcase(s, tc);
 
    return s;

@@ -17,7 +17,6 @@
 
 #include "util.h"
 #include "cov/cov-api.h"
-#include "cov/cov-data.h"
 #include "cov/cov-priv.h"
 #include "cov/cov-structs.h"
 #include "hash.h"
@@ -35,13 +34,10 @@ typedef struct _cover_rpt {
    cover_data_t *data;
    mem_pool_t   *pool;
    shash_t      *files;
-   hash_t       *hier;
+   ihash_t      *hier;
    unsigned      skipped;
    unsigned      item_limit;
 } cover_rpt_t;
-
-static void rpt_visit_children(cover_rpt_t *rpt, rpt_hier_t *h,
-                               const cover_scope_t *s);
 
 static rpt_line_t *rpt_get_line(rpt_file_t *f, const loc_t *loc)
 {
@@ -59,75 +55,105 @@ static void rpt_merge_stats(rpt_stats_t *dst, const rpt_stats_t *src)
    }
 }
 
-static bool rpt_is_hit(const cover_item_t *item)
+static bool rpt_is_hit(cover_rpt_t *rpt, const rpt_item_t *ri)
 {
-   return item->data >= item->atleast && item->atleast > 0;
+   int32_t threshold = cover_get_threshold(rpt->data, ri->item);
+   return ri->data >= threshold && threshold > 0;
 }
 
-static bool rpt_is_excluded(cover_rpt_t *rpt, const cover_item_t *item)
+static bool rpt_is_excluded(cover_rpt_t *rpt, const rpt_item_t *ri)
 {
-   if (item->flags & COV_FLAG_EXCLUDED)
+   cover_flags_t flags = cover_get_flags(rpt->data, ri->bin);
+
+   if (flags & COV_FLAG_EXCLUDED)
       return true;
 
-   if (cover_bin_unreachable(rpt->data, item))
-      return true;
+   if (rpt->data->mask & COVER_MASK_EXCLUDE_UNREACHABLE) {
+      cover_item_kind_t kind = cover_get_kind(rpt->data, ri->item);
+
+      if (kind == COV_ITEM_TOGGLE && (ri->data & COV_FLAG_UNREACHABLE))
+         return true;
+
+      if (kind == COV_ITEM_EXPRESSION && (flags & COV_FLAG_UNREACHABLE))
+         return true;
+   }
 
    return false;
 }
 
 static rpt_table_t *rpt_table_new(cover_rpt_t *rpt, const rpt_line_t *line,
-                                  const rpt_line_t *line_end, int count)
+                                  int count)
 {
    if (count == 0)
       return NULL;
 
    rpt_table_t *table = pool_malloc_flex(rpt->pool, sizeof(rpt_table_t), count,
-                                         sizeof(cover_item_t *));
-   table->line     = line;
-   table->line_end = line_end;
-   table->count    = count;
+                                         sizeof(rpt_item_t));
+   table->line  = line;
+   table->count = count;
 
    return table;
 }
 
 static void rpt_get_detail(cover_rpt_t *rpt, rpt_detail_t *detail,
-                           rpt_stats_t *stats, const cover_item_t *item,
-                           const rpt_line_t *line, const rpt_line_t *line_end)
+                           rpt_stats_t *stats, cover_obj_t item,
+                           const cover_obj_t *bins, const int32_t *data,
+                           int count, const rpt_line_t *line)
 {
    int nhit = 0, nmiss = 0, nexcl = 0;
 
-   for (int i = 0; i < item->consecutive; i++) {
-      stats->total[item->kind]++;
+   cover_item_kind_t kind = cover_get_kind(rpt->data, item);
 
-      if (rpt_is_hit(item + i)) {
-         stats->hit[item->kind]++;
+   for (int i = 0; i < count; i++) {
+      rpt_item_t ri = {
+         .item = item,
+         .bin  = bins[i],
+      };
+
+      if (data == NULL)
+         ri.data = cover_get_u32(rpt->data, bins[i], COV_ATTR_DATA, 0);
+      else
+         ri.data = data[i];
+
+      stats->total[kind]++;
+
+      if (rpt_is_hit(rpt, &ri)) {
+         stats->hit[kind]++;
          nhit++;
       }
-      else if (rpt_is_excluded(rpt, item + i)) {
-         stats->hit[item->kind]++;
+      else if (rpt_is_excluded(rpt, &ri)) {
+         stats->hit[kind]++;
          nexcl++;
       }
       else
          nmiss++;
-
-      assert(item[i].kind == item->kind);
    }
 
-   rpt_table_t *hit = rpt_table_new(rpt, line, line_end, nhit);
-   rpt_table_t *miss = rpt_table_new(rpt, line, line_end, nmiss);
-   rpt_table_t *excl = rpt_table_new(rpt, line, line_end, nexcl);
+   rpt_table_t *hit = rpt_table_new(rpt, line, nhit);
+   rpt_table_t *miss = rpt_table_new(rpt, line, nmiss);
+   rpt_table_t *excl = rpt_table_new(rpt, line, nexcl);
 
-   for (int i = 0, hpos = 0, mpos = 0, epos = 0; i < item->consecutive; i++) {
-      if (rpt_is_hit(item + i))
-         hit->items[hpos++] = item + i;
-      else if (rpt_is_excluded(rpt, item + i))
-         excl->items[epos++] = item + i;
+   for (int i = 0, hpos = 0, mpos = 0, epos = 0; i < count; i++) {
+      rpt_item_t ref = {
+         .item = item,
+         .bin  = bins[i],
+      };
+
+      if (data == NULL)
+         ref.data = cover_get_u32(rpt->data, bins[i], COV_ATTR_DATA, 0);
       else
-         miss->items[mpos++] = item + i;
+         ref.data = data[i];
+
+      if (rpt_is_hit(rpt, &ref))
+         hit->items[hpos++] = ref;
+      else if (rpt_is_excluded(rpt, &ref))
+         excl->items[epos++] = ref;
+      else
+         miss->items[mpos++] = ref;
    }
 
    if (hit != NULL) {
-      APUSH(detail->hits[item->kind], hit);
+      APUSH(detail->hits[kind], hit);
 
       if (hit->count > rpt->item_limit) {
          rpt->skipped += hit->count - rpt->item_limit;
@@ -136,7 +162,7 @@ static void rpt_get_detail(cover_rpt_t *rpt, rpt_detail_t *detail,
    }
 
    if (miss != NULL) {
-      APUSH(detail->miss[item->kind], miss);
+      APUSH(detail->miss[kind], miss);
 
       if (miss->count > rpt->item_limit) {
          rpt->skipped += miss->count - rpt->item_limit;
@@ -145,7 +171,7 @@ static void rpt_get_detail(cover_rpt_t *rpt, rpt_detail_t *detail,
    }
 
    if (excl != NULL) {
-      APUSH(detail->excl[item->kind], excl);
+      APUSH(detail->excl[kind], excl);
 
       if (excl->count > rpt->item_limit) {
          rpt->skipped += excl->count - rpt->item_limit;
@@ -156,50 +182,92 @@ static void rpt_get_detail(cover_rpt_t *rpt, rpt_detail_t *detail,
    detail->total += nhit + nmiss + nexcl;
 }
 
-static void rpt_merge_file_items(cover_rpt_t *rpt, rpt_file_t *f,
-                                 const cover_scope_t *s)
+static void rpt_merge_data(cover_rpt_t *rpt, rpt_item_t *ri, int32_t data)
 {
-   // TODO: This has O(n^2). May be issue for large designs ?
-   for (int i = 0; i < s->items.count; i++) {
-      cover_item_t *scope_item = AGET(s->items, i);
-      bool found = false;
+   switch (cover_get_kind(rpt->data, ri->item)) {
+   case COV_ITEM_TOGGLE:
+      if ((ri->data & COV_FLAG_UNREACHABLE) || (data & COV_FLAG_UNREACHABLE))
+         ri->data = COV_FLAG_UNREACHABLE;
+      else
+         ri->data = saturate_add(ri->data, data);
+      break;
+   default:
+      ri->data = saturate_add(ri->data, data);
+      break;
+   }
+}
 
+static void rpt_merge_file_items(cover_rpt_t *rpt, rpt_file_t *f,
+                                 cover_obj_t scope)
+{
+   const int nitems = cover_count(rpt->data, scope, COV_REL_ITEMS);
+
+   // TODO: This has O(n^2). May be issue for large designs ?
+   for (int i = 0; i < nitems; i++) {
+      cover_obj_t scope_item = cover_at(rpt->data, scope, COV_REL_ITEMS, i);
+
+      cover_obj_t scope_bin0 = cover_at(rpt->data, scope_item, COV_REL_BINS, 0);
+      cover_flags_t scope_flags = cover_get_flags(rpt->data, scope_bin0);
+      uint32_t data = cover_get_u32(rpt->data, scope_bin0, COV_ATTR_DATA, 0);
+
+      loc_t scope_loc = cover_get_loc(rpt->data, scope_item, COV_ATTR_LOC);
+      cover_item_kind_t scope_kind = cover_get_kind(rpt->data, scope_item);
+
+      bool found = false;
       for (int j = 0; j < f->items.count; j++) {
-         cover_item_t *file_item = AGET(f->items, j);
+         rpt_item_t *file_item = AREF(f->items, j);
+
+         cover_obj_t file_bin0 = cover_at(rpt->data, file_item->item,
+                                          COV_REL_BINS, 0);
+         cover_flags_t file_flags = cover_get_flags(rpt->data, file_bin0);
+
+         loc_t file_loc =
+            cover_get_loc(rpt->data, file_item->item, COV_ATTR_LOC);
+         cover_item_kind_t file_kind =
+            cover_get_kind(rpt->data, file_item->item);
 
          // We must take into account:
          //    - kind   - different kind items can be at the same loc
          //    - loc    - to get aggregated per-file data
          //    - flags  - to not merge different bins
          found =
-            (file_item->kind == scope_item->kind)
-            && loc_eq(&(file_item->loc), &(scope_item->loc))
-            && (file_item->flags == scope_item->flags);
+            (file_kind == scope_kind)
+            && file_loc.first_line == scope_loc.first_line
+            && file_loc.first_column == scope_loc.first_column
+            && (file_flags == scope_flags);
 
          if (found) {
-            cover_merge_one_item(file_item, scope_item->data);
+            rpt_merge_data(rpt, file_item, data);
             break;
          }
       }
 
       if (!found) {
-         cover_item_t *copy = pool_malloc(rpt->pool, sizeof(cover_item_t));
-         *copy = *scope_item;
-         copy->consecutive = 1;
-         APUSH(f->items, copy);
+         cover_iter_t it = cover_begin(rpt->data, scope_item, COV_REL_BINS);
+         cover_obj_t bin;
+         while (cover_next(&it, &bin)) {
+            const rpt_item_t new = {
+               .item = scope_item,
+               .bin  = bin,
+               .data = cover_get_u32(rpt->data, bin, COV_ATTR_DATA, 0),
+            };
+            APUSH(f->items, new);
+         }
       }
    }
 }
 
-static rpt_file_t *rpt_visit_file(cover_rpt_t *rpt, const cover_scope_t *s)
+static rpt_file_t *rpt_visit_file(cover_rpt_t *rpt, cover_obj_t scope)
 {
-   if (loc_invalid_p(&(s->loc)))
+   loc_t loc = cover_get_loc(rpt->data, scope, COV_ATTR_LOC);
+
+   if (loc_invalid_p(&loc))
       return NULL;
 
-   const char *path = loc_file_str(&(s->loc));
+   const char *path = loc_file_str(&loc);
    rpt_file_t *f = shash_get(rpt->files, path);
    if (f != NULL) {
-      rpt_merge_file_items(rpt, f, s);
+      rpt_merge_file_items(rpt, f, scope);
       return f->valid ? f : NULL;
    }
 
@@ -208,8 +276,7 @@ static rpt_file_t *rpt_visit_file(cover_rpt_t *rpt, const cover_scope_t *s)
 
    shash_put(rpt->files, path, f);
 
-   for (int i = 0; i < s->items.count; i++)
-      APUSH(f->items, s->items.items[i]);
+   rpt_merge_file_items(rpt, f, scope);
 
    FILE *fp = fopen(path, "r");
    if (fp == NULL) {
@@ -219,9 +286,9 @@ static rpt_file_t *rpt_visit_file(cover_rpt_t *rpt, const cover_scope_t *s)
    }
 
    if (fp == NULL) {
-      warn_at(&(s->loc), "omitting hierarchy %s from the coverage report as "
+      warn_at(&loc, "omitting hierarchy %pi from the coverage report as "
               "the correpsonding source file could not be found",
-              istr(s->hier));
+              cover_get_ident(rpt->data, scope, COV_ATTR_HIER));
       return NULL;
    }
 
@@ -256,74 +323,94 @@ static rpt_file_t *rpt_visit_file(cover_rpt_t *rpt, const cover_scope_t *s)
    return f;
 }
 
-static rpt_hier_t *rpt_visit_hier(cover_rpt_t *rpt, const cover_scope_t *s)
+static void rpt_visit_scope(cover_rpt_t *rpt, rpt_hier_t *h, cover_obj_t scope)
 {
+   rpt_file_t *f_src = rpt_visit_file(rpt, scope);
+   if (f_src != NULL) {
+      cover_iter_t item_it = cover_begin(rpt->data, scope, COV_REL_ITEMS);
+      cover_obj_t item;
+      while (cover_next(&item_it, &item)) {
+         loc_t loc = cover_get_loc(rpt->data, item, COV_ATTR_LOC);
+
+         const rpt_line_t *line = rpt_get_line(f_src, &loc);
+         if (line == NULL)
+            continue;
+
+         cover_obj_t small[10];
+         const int nbins = cover_rel(rpt->data, item, COV_REL_BINS, 0, small,
+                                     ARRAY_LEN(small));
+
+         if (nbins <= ARRAY_LEN(small))
+            rpt_get_detail(rpt, &h->detail, &h->flat_stats, item, small, NULL,
+                           nbins, line);
+         else {
+            cover_obj_t *ext LOCAL = xmalloc_array(nbins, sizeof(cover_obj_t));
+            cover_rel(rpt->data, item, COV_REL_BINS, 0, ext, nbins);
+
+            rpt_get_detail(rpt, &h->detail, &h->flat_stats, item, ext, NULL,
+                           nbins, line);
+         }
+      }
+   }
+
+   cover_iter_t it = cover_begin(rpt->data, scope, COV_REL_CHILDREN);
+   cover_obj_t child;
+   while (cover_next(&it, &child))
+      rpt_visit_scope(rpt, h, child);
+}
+
+static rpt_hier_t *rpt_visit_inst(cover_rpt_t *rpt, cover_obj_t inst)
+{
+   ident_t hier = cover_get_ident(rpt->data, inst, COV_ATTR_HIER);
+
    rpt_hier_t *h = pool_calloc(rpt->pool, sizeof(rpt_hier_t));
-   get_hex_hash(istr(s->hier), h->name_hash);
+   get_hex_hash(istr(hier), h->name_hash);
 
-   rpt_visit_file(rpt, s);
+   cover_obj_t root = cover_get_obj(rpt->data, inst, COV_ATTR_ROOT);
+   rpt_visit_file(rpt, root);
 
-   assert(hash_get(rpt->hier, s->block) == NULL);
-   hash_put(rpt->hier, s->block, h);
+   assert(ihash_get(rpt->hier, inst.bits) == NULL);
+   ihash_put(rpt->hier, inst.bits, h);
 
-   rpt_visit_children(rpt, h, s);
+   rpt_visit_scope(rpt, h, root);
+
+   cover_iter_t it = cover_begin(rpt->data, inst, COV_REL_CHILDREN);
+   cover_obj_t child;
+   while (cover_next(&it, &child)) {
+      rpt_hier_t *sub = rpt_visit_inst(rpt, child);
+      rpt_merge_stats(&h->nested_stats, &sub->nested_stats);
+   }
 
    rpt_merge_stats(&h->nested_stats, &h->flat_stats);
 
    return h;
 }
 
-static void rpt_visit_sub_scope(cover_rpt_t *rpt, rpt_hier_t *h,
-                                cover_scope_t *s)
-{
-   rpt_file_t *f_src = rpt_visit_file(rpt, s);
-   if (f_src != NULL) {
-      for (int i = 0; i < s->items.count; i++) {
-         cover_item_t *item = s->items.items[i];
-         assert(item->loc.file_ref == s->loc.file_ref);
-
-         const rpt_line_t *line = rpt_get_line(f_src, &item->loc);
-         if (line != NULL)
-            rpt_get_detail(rpt, &h->detail, &h->flat_stats, item, line,
-                           f_src->lines + f_src->n_lines);
-      }
-   }
-
-   rpt_visit_children(rpt, h, s);
-}
-
-static void rpt_visit_children(cover_rpt_t *rpt, rpt_hier_t *h,
-                               const cover_scope_t *s)
-{
-   for (int i = 0; i < s->children.count; i++) {
-      cover_scope_t *it = s->children.items[i];
-      if (cover_is_hier(it)) {
-         rpt_hier_t *sub = rpt_visit_hier(rpt, it);
-         rpt_merge_stats(&h->nested_stats, &sub->nested_stats);
-      }
-      else
-         rpt_visit_sub_scope(rpt, h, it);
-   }
-}
-
 static void rpt_gen_file_details(cover_rpt_t *rpt, rpt_file_t *f)
 {
    for (int i = 0; i < f->items.count; i++) {
-      cover_item_t *item = f->items.items[i];
+      const rpt_item_t *ri = &(f->items.items[i]);
 
-      const rpt_line_t *line = rpt_get_line(f, &item->loc);
-      if (line != NULL)
-         rpt_get_detail(rpt, &f->detail, &f->stats, item, line,
-                        f->lines + f->n_lines);
+      loc_t loc = cover_get_loc(rpt->data, ri->item, COV_ATTR_LOC);
+
+      const rpt_line_t *line = rpt_get_line(f, &loc);
+      if (line == NULL)
+         continue;
+
+      cover_obj_t bins[1] = { ri->bin };
+      rpt_get_detail(rpt, &f->detail, &f->stats, ri->item,
+                     bins, &ri->data, 1, line);
    }
 }
 
-const rpt_file_t *rpt_get_file(cover_rpt_t *rpt, cover_scope_t *s)
+const rpt_file_t *rpt_get_file(cover_rpt_t *rpt, cover_obj_t obj)
 {
-   if (loc_invalid_p(&(s->loc)))
+   loc_t loc = cover_get_loc(rpt->data, obj, COV_ATTR_LOC);
+
+   if (loc_invalid_p(&loc))
       return NULL;
 
-   const char *path = loc_file_str(&(s->loc));
+   const char *path = loc_file_str(&loc);
    rpt_file_t *f = shash_get(rpt->files, path);
    if (f != NULL)
       return f->valid ? f : NULL;
@@ -331,13 +418,14 @@ const rpt_file_t *rpt_get_file(cover_rpt_t *rpt, cover_scope_t *s)
    return NULL;
 }
 
-const rpt_hier_t *rpt_get_hier(cover_rpt_t *rpt, cover_scope_t *s)
+const rpt_hier_t *rpt_get_hier(cover_rpt_t *rpt, cover_obj_t inst)
 {
-   assert(cover_is_hier(s));
+   assert(inst.tag == COVER_TAG_INST);
 
-   rpt_hier_t *h = hash_get(rpt->hier, s->block);
+   rpt_hier_t *h = ihash_get(rpt->hier, inst.bits);
    if (h == NULL)
-      fatal_trace("no hierarchy report for %s", istr(s->block->name));
+      fatal_trace("no hierarchy report for %pI",
+                  cover_get_ident(rpt->data, inst, COV_ATTR_NAME));
 
    return h;
 }
@@ -369,13 +457,13 @@ cover_rpt_t *cover_report_new(cover_data_t *db, int item_limit)
    rpt->data       = db;
    rpt->pool       = pool_new();
    rpt->files      = shash_new(32);
-   rpt->hier       = hash_new(32);
+   rpt->hier       = ihash_new(32);
    rpt->item_limit = item_limit;
 
-   for (int i = 0; i < db->root_scope->children.count; i++) {
-      cover_scope_t *child = AGET(db->root_scope->children, i);
-      rpt_visit_hier(rpt, child);
-   }
+   cover_iter_t it = cover_begin(db, COVER_NULL_OBJ, COV_REL_CHILDREN);
+   cover_obj_t root;
+   while (cover_next(&it, &root))
+      rpt_visit_inst(rpt, root);
 
    const char *key;
    void *value;
@@ -401,6 +489,6 @@ void cover_report_free(cover_rpt_t *rpt)
 
    pool_free(rpt->pool);
    shash_free(rpt->files);
-   hash_free(rpt->hier);
+   ihash_free(rpt->hier);
    free(rpt);
 }

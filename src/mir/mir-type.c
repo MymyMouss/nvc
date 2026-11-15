@@ -26,6 +26,7 @@
 #include <assert.h>
 #include <float.h>
 #include <inttypes.h>
+#include <math.h>
 #include <stdlib.h>
 
 #define REPROBE_LIMIT 10
@@ -748,6 +749,25 @@ mir_type_t mir_vec4_type(mir_unit_t *mu, int size, bool issigned)
    return mir_build_type(mu, &td);
 }
 
+mir_type_t mir_vector_slice(mir_unit_t *mu, mir_type_t base, int size)
+{
+   assert(size >= 0);
+
+   const type_data_t *td = mir_type_data(mu, base);
+   assert(td->class == MIR_TYPE_VEC2 || td->class == MIR_TYPE_VEC4);
+   assert(size <= td->u.vec.size);
+
+   if (td->u.vec.size == size)
+      return base;
+
+   const type_data_t new = {
+      .class = td->class,
+      .u = { .vec = { .size = size, .issigned = td->u.vec.issigned } }
+   };
+
+   return mir_build_type(mu, &new);
+}
+
 mir_type_t mir_get_base(mir_unit_t *mu, mir_type_t type)
 {
    const type_data_t *td = mir_type_data(mu, type);
@@ -994,6 +1014,9 @@ mir_stamp_t mir_int_stamp(mir_unit_t *mu, int64_t low, int64_t high)
 
 mir_stamp_t mir_real_stamp(mir_unit_t *mu, double low, double high)
 {
+   if (!isfinite(low) || !isfinite(high))
+      return MIR_NULL_STAMP;
+
    assert(low <= high);
 
    const stamp_data_t sd = {
@@ -1248,9 +1271,9 @@ mir_stamp_t mir_stamp_cmp(mir_unit_t *mu, mir_cmp_t cmp, mir_stamp_t left,
 mir_stamp_t mir_stamp_union(mir_unit_t *mu, mir_stamp_t left, mir_stamp_t right)
 {
    if (mir_is_null(left))
-      return right;
-   else if (mir_is_null(right))
       return left;
+   else if (mir_is_null(right))
+      return right;
 
    const stamp_data_t *lsd = mir_stamp_data(mu, left);
    const stamp_data_t *rsd = mir_stamp_data(mu, right);
@@ -1273,6 +1296,9 @@ mir_stamp_t mir_stamp_union(mir_unit_t *mu, mir_stamp_t left, mir_stamp_t right)
 
          return mir_real_stamp(mu, low, high);
       }
+
+   case MIR_STAMP_POINTER:
+      return MIR_NULL_STAMP;   // TODO
 
    default:
       should_not_reach_here();
