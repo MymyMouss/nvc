@@ -8,8 +8,16 @@
   `nvc_design_search`, `nvc_signal_get`, `nvc_signal_set`,
   `nvc_sim_close`), and record signal changes in a bounded in-memory
   buffer to look back at what led to a failure (`nvc_trace_start`,
-  `nvc_trace_get`, `nvc_trace_stop`).  Each call that loads a design runs in an isolated
-  worker process.
+  `nvc_trace_get`, `nvc_trace_stop`).  Long simulations run in the
+  background (`nvc_sim_run` with `background`, followed with
+  `nvc_sim_status`, `nvc_sim_wait` and `nvc_sim_stop`), signals can be
+  recorded to size-limited FST files while a simulation runs
+  (`nvc_wave_start`, `nvc_wave_stop`) and read back with
+  `nvc_wave_summary`, `nvc_wave_get` and `nvc_wave_find`, and what a
+  design prints is kept in a log read with `nvc_sim_log`.  Each call that
+  loads a design runs in an isolated worker process.
+- Fixed a crash when attaching a waveform dumper to signals whose watch had
+  been freed.
 - Code coverage can now be collected for package declarations and
   bodies, opted in via the new `+package` directive (or an existing
   `+hierarchy` rule) in a coverage specification file.  Packages from the

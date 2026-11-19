@@ -663,6 +663,46 @@ il faudra le traiter à part.
 4. Journal persistant et sa lecture.
 5. Rétention et nettoyage.
 
+### 8.5 Réalisé
+
+Étapes 1 à 3 de §8.4 et le run de fond de §7.4:
+
+- **Run de fond.** `nvc_sim_run` accepte `background:true` (sans limite de
+  temps réel, 24 h au plus); le worker avance alors le run par tranches entre
+  deux requêtes et répond aux lectures (`list`, `search`, `get`, `trace_get`,
+  `status`, `wave_start`, `wave_stop`) pendant qu'il tourne. `nvc_sim_status`
+  donne l'état (`running`, `idle`, `finished`, `terminated`), le temps simulé,
+  le débit (fs simulées par seconde réelle), le pourcentage et l'ETA quand
+  une cible existe, les messages depuis `since_seq` (numéros croissants) et
+  les tailles de fichiers. `nvc_sim_wait` (≤ 30 s) sonde le worker toutes les
+  250 ms côté serveur et rend la main à l'arrêt du run, à l'apparition de
+  nouvelles erreurs, à l'annulation ou au délai. `nvc_sim_stop` termine le
+  run sans fermer la simulation. Une simulation en run de fond n'est pas
+  expirée par l'inactivité (limite de 24 h).
+- **Fichiers.** Chaque simulation a un répertoire `.nvc-mcp/<sim_id>/` dans
+  l'espace de travail, jamais supprimé automatiquement. La sortie du design
+  y est écrite (`output.log`, plafond 1 Gio puis abandon avec un message:
+  le plafond de 256 Mio, silencieux, a disparu). `nvc_wave_start` démarre
+  un fichier FST à tout moment, avec `include`/`exclude` (chemins du design,
+  `*` joker) et un quota `max_bytes` (1 Gio par défaut); au quota,
+  l'enregistrement s'arrête avec un message et la simulation continue.
+  `nvc_wave_stop` finalise le fichier, ce qui permet d'en commencer un autre
+  (segments). `nvc_sim_close` attend jusqu'à 3 s que le worker finalise ses
+  fichiers; un worker tué avant laisse un FST illisible (le message d'erreur
+  le dit).
+- **Lecture.** `nvc_wave_summary`, `nvc_wave_get` (fenêtre, `max_changes`,
+  radix) et `nvc_wave_find` lisent un fichier terminé par le lecteur FST
+  dans le front-end, sans simulation vivante; `nvc_sim_log` lit une plage,
+  la fin ou les lignes contenant un motif. Seuls les fichiers sous
+  `.nvc-mcp/` sont lisibles (`realpath`).
+
+Limites connues: un FST en cours d'écriture n'est pas lisible (il faut
+`nvc_wave_stop`); l'enregistrement démarré en cours de run ne couvre que
+l'intervalle à partir du démarrage; `nvc_wave_find` compare des valeurs
+binaires (les énumérations multi-bits se donnent telles qu'écrites dans le
+fichier); la rétention automatique des répertoires (étape 5) reste à faire;
+les tâches MCP (extension `tasks`) ne sont pas encore proposées.
+
 ## Références
 
 - Spécification MCP 2026-07-28, changements:

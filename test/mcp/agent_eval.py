@@ -154,6 +154,14 @@ SCENARIOS = [
          "inside the counter instance at that moment. Finish with exactly "
          "one line in this form: RESULT: <time in ns> <value>, for example "
          "RESULT: 40 ns 3"),
+    dict(name="wave-find", files="checked", tools=[],
+         check=r"RESULT:\s*55\s*ns\s*$", must_call="nvc_wave_start",
+         prompt="src/ holds a counter and a testbench called checked_tb. "
+         "Simulate the testbench for 200 ns while recording a waveform file "
+         "of only the signals inside the counter instance, then use that "
+         "file to find the first simulated time at which the register cnt "
+         "inside the counter becomes 5. Finish with exactly one line in "
+         "this form: RESULT: <time in ns> ns"),
 ]
 
 
