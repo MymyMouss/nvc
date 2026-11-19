@@ -28,6 +28,7 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #ifdef __linux__
@@ -63,6 +64,7 @@ typedef struct {
    pid_t    pid;
    int      fd;
    char    *top;
+   char    *files_dir;     // Relative to the workspace root
    uint64_t last_used_us;
    bool     background;     // A background run was in progress at last look
    char    *buf;
@@ -106,6 +108,7 @@ static void sim_free(sim_t *s)
    sim_reap_process(s);
    free(s->buf);
    free(s->top);
+   free(s->files_dir);
    free(s);
 }
 
@@ -479,14 +482,15 @@ static void worker_exec(const char *root, char **argv, int out_wr, int ctl_fd)
    if (chdir(root) < 0)
       _exit(126);
 
-   // What the design prints is held in memory: bound it, and make an
-   // overflow an ordinary write error rather than a fatal signal
+   // Files the worker writes are limited by the worker itself (output log
+   // and waveform quotas): this is only a backstop, and makes an overflow
+   // an ordinary write error rather than a fatal signal
    signal(SIGXFSZ, SIG_IGN);
 
    struct rlimit rl = { 0, 0 };
    setrlimit(RLIMIT_CORE, &rl);
 
-   rl = (struct rlimit){ 256u << 20, 256u << 20 };
+   rl = (struct rlimit){ 128ull << 30, 128ull << 30 };
    setrlimit(RLIMIT_FSIZE, &rl);
 
    execv(argv[0], argv);
@@ -546,6 +550,7 @@ static const char open_output[] = MCP_JSON({
       "delta": { "type": "integer" },
       "next_event_fs": { "type": ["integer", "null"] },
       "idle_timeout_s": { "type": "integer" },
+      "files_directory": { "type": "string" },
       "open_simulations": { "type": "integer" },
       "messages": { "type": "array", "items": { "type": "object" } },
       "messages_truncated": { "type": "boolean" },
@@ -608,12 +613,41 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
    int ngargs;
    const char *const *gargs = mcp_call_global_argv(call, &ngargs);
 
-   const char **argv = xcalloc_array(ngargs + 8, sizeof(char *));
+   const char **argv = xcalloc_array(ngargs + 9, sizeof(char *));
    size_t argc = 0;
 
    char *work_opt = library ? xasprintf("--work=%s", library) : NULL;
    char *std_opt = std ? xasprintf("--std=%s", std) : NULL;
    char *fd_opt = xasprintf("--fd=%d", WORKER_CTL_FD);
+
+   char sim_id[2 * ID_BYTES + 1];
+   make_id(sim_id);
+
+   // Output and waveform files live in the workspace, in a directory
+   // that is never removed automatically
+   char *files_dir = xasprintf(".nvc-mcp/%s", sim_id);
+   char *files_abs = xasprintf("%s/%s", mcp_call_root(call), files_dir);
+   char *files_parent = xasprintf("%s/.nvc-mcp", mcp_call_root(call));
+   mkdir(files_parent, 0755);
+   free(files_parent);
+   if (mkdir(files_abs, 0755) < 0) {
+      mcp_call_error(call, "Could not create the directory %s for the "
+                     "simulation files: %s", files_dir, strerror(errno));
+      free(files_abs);
+      free(files_dir);
+      free(fd_opt);
+      free(work_opt);
+      free(std_opt);
+      free(argv);
+      close(ctl[0]);
+      close(child_fd);
+      close(outp[0]);
+      close(outp[1]);
+      return false;
+   }
+   free(files_abs);
+
+   char *files_opt = xasprintf("--files-dir=%s", files_dir);
 
    argv[argc++] = mcp_call_exe(call);
    for (int i = 0; i < ngargs; i++)
@@ -624,6 +658,7 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
       argv[argc++] = std_opt;
    argv[argc++] = "--mcp-worker";
    argv[argc++] = fd_opt;
+   argv[argc++] = files_opt;
    argv[argc++] = top;
    argv[argc] = NULL;
 
@@ -635,11 +670,13 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
    free(work_opt);
    free(std_opt);
    free(fd_opt);
+   free(files_opt);
 
    close(outp[1]);
    close(child_fd);
 
    if (pid < 0) {
+      free(files_dir);
       close(ctl[0]);
       close(outp[0]);
       mcp_call_error(call, "Could not start the simulation process: %s",
@@ -651,8 +688,9 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
    s->pid = pid;
    s->fd = ctl[0];
    s->top = xstrdup(top);
+   s->files_dir = files_dir;
    s->last_used_us = get_timestamp_us();
-   make_id(s->id);
+   strcpy(s->id, sim_id);
 
    // Wait for the worker to report that the design is loaded.  Until
    // then anything it prints on its standard streams is kept so a
@@ -759,6 +797,8 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
    jw_string(out, top);
    jw_key(out, "idle_timeout_s");
    jw_int(out, IDLE_TIMEOUT_S);
+   jw_key(out, "files_directory");
+   jw_string(out, s->files_dir);
    jw_key(out, "open_simulations");
    jw_int(out, sims->count);
    jw_raw_members(out, copy);
@@ -836,7 +876,7 @@ static const char run_example[] = MCP_JSON({
 });
 
 // Parse a time such as "100 ns" or "2.5us" into femtoseconds
-static bool parse_sim_time(mcp_call_t *call, const char *what, const char *text,
+bool mcp_parse_sim_time(mcp_call_t *call, const char *what, const char *text,
                            int64_t *fs)
 {
    static const struct { const char *unit; uint64_t scale; } units[] = {
@@ -924,10 +964,10 @@ static bool tool_sim_run(mcp_call_t *call, const json_t *args,
    }
 
    int64_t duration_fs = -1, until_fs = -1;
-   if (duration != NULL && !parse_sim_time(call, "duration", duration,
+   if (duration != NULL && !mcp_parse_sim_time(call, "duration", duration,
                                            &duration_fs))
       return false;
-   else if (until != NULL && !parse_sim_time(call, "until", until, &until_fs))
+   else if (until != NULL && !mcp_parse_sim_time(call, "until", until, &until_fs))
       return false;
 
    LOCAL_TEXT_BUF req = tb_new();
@@ -1034,6 +1074,7 @@ static const char status_output[] = MCP_JSON({
       "exit_status": { "type": "integer" },
       "messages": { "type": "array", "items": { "type": "object" } },
       "messages_truncated": { "type": "boolean" },
+      "files": { "type": "object" },
       "next_seq": { "type": "integer" },
       "counts": { "type": "object" },
       "sim_output": { "type": "string" },
@@ -1195,6 +1236,111 @@ static bool tool_sim_stop(mcp_call_t *call, const json_t *args,
    return true;
 }
 
+
+////////////////////////////////////////////////////////////////////////////////
+// nvc_wave_start and nvc_wave_stop
+
+static const char wave_start_input[] = MCP_JSON({
+   "type": "object",
+   "properties": {
+      "sim_id": { "type": "string", "minLength": 32, "maxLength": 32 },
+      "include": {
+         "type": "array",
+         "maxItems": 64,
+         "items": { "type": "string", "minLength": 1, "maxLength": 512 },
+         "description": "Signals to record, as design paths such as /dut/cnt, with * as a wildcard, for example /dut/* for everything below a region. Without include every signal is recorded."
+      },
+      "exclude": {
+         "type": "array",
+         "maxItems": 64,
+         "items": { "type": "string", "minLength": 1, "maxLength": 512 },
+         "description": "Signals to leave out, in the same form. Exclusions win over inclusions."
+      },
+      "max_bytes": {
+         "type": "integer",
+         "minimum": 1,
+         "maximum": 68719476736,
+         "description": "Stop recording when the files reach this size. Defaults to 1 GiB. The simulation goes on without recording and a message says so."
+      },
+      "name": {
+         "type": "string",
+         "minLength": 1,
+         "maxLength": 64,
+         "description": "File name without a directory, such as phase2. Defaults to wave-N."
+      }
+   },
+   "required": ["sim_id"],
+   "additionalProperties": false
+});
+
+static const char wave_output[] = MCP_JSON({
+   "type": "object",
+   "properties": {
+      "file": { "type": "string" },
+      "bytes": { "type": "integer" },
+      "max_bytes": { "type": "integer" },
+      "now_fs": { "type": "integer" },
+      "now": { "type": "string" },
+      "files": { "type": "object" }
+   },
+   "required": ["file"]
+});
+
+static const char wave_start_example[] = MCP_JSON({
+   "sim_id": "0123456789abcdef0123456789abcdef",
+   "include": ["/dut/cnt", "/dut/state*"], "max_bytes": 500000000
+});
+
+static bool tool_wave_start(mcp_call_t *call, const json_t *args,
+                            json_writer_t *out)
+{
+   const char *sim_id = json_string(json_get(args, "sim_id"));
+
+   LOCAL_TEXT_BUF req = tb_new();
+   json_writer_t w;
+   jw_init(&w, req);
+   jw_begin_object(&w);
+   jw_key(&w, "op");
+   jw_string(&w, "wave_start");
+
+   const char *keys[] = { "include", "exclude", "max_bytes", "name" };
+   for (size_t i = 0; i < ARRAY_LEN(keys); i++) {
+      const json_t *v = json_get(args, keys[i]);
+      if (v == NULL)
+         continue;
+
+      jw_key(&w, keys[i]);
+      if (json_is(v, JSON_ARRAY)) {
+         jw_begin_array(&w);
+         for (size_t j = 0; j < v->array.count; j++)
+            jw_string(&w, json_string(json_at(v, j)) ?: "");
+         jw_end_array(&w);
+      }
+      else if (json_is(v, JSON_STRING))
+         jw_string(&w, json_string(v));
+      else {
+         int64_t n = 0;
+         json_as_int(v, &n);
+         jw_int(&w, n);
+      }
+   }
+
+   jw_end_object(&w);
+
+   return sim_op(call, sim_id, req, 10000, out);
+}
+
+static bool tool_wave_stop(mcp_call_t *call, const json_t *args,
+                           json_writer_t *out)
+{
+   const char *sim_id = json_string(json_get(args, "sim_id"));
+
+   LOCAL_TEXT_BUF req = tb_new();
+   tb_cat(req, "{\"op\":\"wave_stop\"}");
+
+   return sim_op(call, sim_id, req, 10000, out);
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // nvc_sim_close
 
@@ -1233,6 +1379,16 @@ static bool tool_sim_close(mcp_call_t *call, const json_t *args,
    // Ask the worker to finish, then make sure it is gone
    static const char close_req[] = "{\"op\":\"close\"}\n";
    send_all(s->fd, close_req, strlen(close_req));
+
+   // Give the worker time to finish its waveform files before it is
+   // killed: it replies and then closes the socket
+   const uint64_t close_start_us = get_timestamp_us();
+   while ((get_timestamp_us() - close_start_us) / 1000 < KILL_GRACE_MS) {
+      bool ready = false;
+      mcp_call_wait(call, &s->fd, 1, &ready, 200);
+      if (ready && !fill_buffer(s))
+         break;   // Closed
+   }
 
    mcp_sims_t *sims = mcp_call_sims(call);
    char *id = xstrdup(s->id);
@@ -1682,9 +1838,9 @@ static bool tool_trace_get(mcp_call_t *call, const json_t *args,
    json_as_int(json_get(args, "trace_id"), &trace_id);
    json_as_int(json_get(args, "limit"), &limit);
 
-   if (from != NULL && !parse_sim_time(call, "from", from, &from_fs))
+   if (from != NULL && !mcp_parse_sim_time(call, "from", from, &from_fs))
       return false;
-   else if (to != NULL && !parse_sim_time(call, "to", to, &to_fs))
+   else if (to != NULL && !mcp_parse_sim_time(call, "to", to, &to_fs))
       return false;
 
    LOCAL_TEXT_BUF req = tb_new();
@@ -1873,6 +2029,45 @@ static const mcp_tool_t sim_tools[] = {
       .destructive   = false,
       .idempotent    = true,
       .fn            = tool_sim_stop,
+   },
+   {
+      .name          = "nvc_wave_start",
+      .title         = "Start recording a waveform file",
+      .description   =
+         "Record signal changes to a waveform file (FST format) from the "
+         "current simulated time on, while the simulation runs.  Choose the "
+         "signals with include and exclude: recording only what you need is "
+         "much faster and smaller than recording everything, and you can "
+         "start another file later for other signals.  The file is in the "
+         "simulation files directory and is complete only after "
+         "nvc_wave_stop or nvc_sim_close, or when the simulation ends; read "
+         "it then with nvc_wave_summary and nvc_wave_get.  max_bytes "
+         "bounds its size: when it is reached recording stops with a note "
+         "in the messages and the simulation continues.  nvc_sim_status "
+         "reports the size and its growth rate.  One file can be active at "
+         "a time.",
+      .input_schema  = wave_start_input,
+      .output_schema = wave_output,
+      .example       = wave_start_example,
+      .read_only     = false,
+      .destructive   = false,
+      .idempotent    = false,
+      .fn            = tool_wave_start,
+   },
+   {
+      .name          = "nvc_wave_stop",
+      .title         = "Finish the waveform file",
+      .description   =
+         "Finish the active waveform file so it can be read with "
+         "nvc_wave_summary and nvc_wave_get.  Recording another file with "
+         "nvc_wave_start is then possible.",
+      .input_schema  = close_input,
+      .output_schema = wave_output,
+      .example       = sim_id_example,
+      .read_only     = false,
+      .destructive   = false,
+      .idempotent    = false,
+      .fn            = tool_wave_stop,
    },
    {
       .name          = "nvc_sim_close",

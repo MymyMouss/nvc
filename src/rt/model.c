@@ -718,6 +718,9 @@ rt_watch_t *find_watch(rt_nexus_t *n, sig_event_fn_t fn)
       rt_pending_t *p = untag_pointer(n->pending, rt_pending_t);
 
       for (int i = 0; i < p->count; i++) {
+         if (p->wake[i] == NULL)
+            continue;   // Removed by clear_event
+
          rt_wakeable_t *obj = untag_pointer(p->wake[i], rt_wakeable_t);
          if (obj->kind == W_WATCH) {
             rt_watch_t *w = container_of(obj, rt_watch_t, wakeable);

@@ -53,6 +53,7 @@ endif
 bin_unit_test_LDADD = \
 	lib/libnvc.a \
 	lib/libthirdparty.a \
+	$(zlib_LIBS) \
 	$(check_LIBS) \
 	$(libdw_LIBS) \
 	$(libffi_LIBS) \

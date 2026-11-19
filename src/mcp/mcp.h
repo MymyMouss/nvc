@@ -30,8 +30,12 @@ int mcp_run(const char *root, const char *exe_hint,
 // Worker side: report diagnostics as JSON lines on the given descriptor
 void mcp_diag_install(int fd);
 
+// Format a time in femtoseconds with the largest exact unit
+void mcp_format_time(int64_t fs, char *buf, size_t len);
+
 // Worker side: serve a loaded simulation on the control socket until the
 // supervisor closes it.  See mcp-worker.c.
-int mcp_worker_main(rt_model_t *m, tree_t top, int ctl_fd);
+int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
+                    const char *files_dir);
 
 #endif   // _MCP_H

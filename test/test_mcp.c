@@ -2238,6 +2238,107 @@ START_TEST(test_sim_background)
 }
 END_TEST
 
+START_TEST(test_sim_waves)
+{
+   fixture_t f;
+   const char *names[] = { "tb.vhd" }, *sources[] = { tb_src };
+   const char *tops[] = { "tb" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   char id[40];
+   open_sim(&f, "tb", id);
+
+   // Only the design under test is recorded
+   const json_t *sc = structured(sim_tool(&f, "nvc_wave_start", id,
+                                          "\"include\":[\"/dut/*\"],"
+                                          "\"name\":\"dut\""));
+   const char *file = str_field(sc, "file");
+   ck_assert_ptr_nonnull(strstr(file, "dut.fst"));
+   char *wave_file = xstrdup(file);
+
+   // Only one file at a time
+   const char *err = tool_error(sim_tool(&f, "nvc_wave_start", id, ""));
+   ck_assert_ptr_nonnull(strstr(err, "already active"));
+
+   sc = structured(sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"1 us\","
+                            "\"pause_on\":\"never\""));
+   ck_assert_str_eq(str_field(sc, "stopped_because"), "time");
+
+   sc = structured(sim_tool(&f, "nvc_sim_status", id, ""));
+   const json_t *files = json_get(sc, "files");
+   ck_assert_ptr_nonnull(files);
+   ck_assert_ptr_nonnull(json_get(files, "output_log"));
+
+   sc = structured(sim_tool(&f, "nvc_wave_stop", id, ""));
+   ck_assert_int_gt(int_field(sc, "bytes"), 0);
+
+   char *args = xasprintf("\"file\":\"%s\"", wave_file);
+   char *extra = xasprintf("%s,\"paths\":[\"/dut/cnt\"],\"from\":\"40 ns\","
+                           "\"until\":\"80 ns\",\"radix\":\"decimal\"", args);
+
+   char *call_args = xasprintf("{%s}", args);
+   sc = structured(tool(f.mp, f.srv, &f.sink, "nvc_wave_summary", call_args));
+   ck_assert_int_eq(int_field(sc, "signals_total"), 2);
+   ck_assert_int_eq(int_field(sc, "end_fs"), 1000000000);
+   free(call_args);
+
+   call_args = xasprintf("{%s}", extra);
+   sc = structured(tool(f.mp, f.srv, &f.sink, "nvc_wave_get", call_args));
+   const json_t *sig = json_at(json_get(sc, "signals"), 0);
+   ck_assert_str_eq(str_field(sig, "value_at_from"), "3");
+   const json_t *changes = json_get(sig, "changes");
+   ck_assert_int_eq(changes->array.count, 4);
+   ck_assert_int_eq(json_at(json_at(changes, 0), 0)->integer, 45000000);
+   ck_assert_str_eq(json_string(json_at(json_at(changes, 0), 1)), "4");
+   free(call_args);
+   free(extra);
+
+   extra = xasprintf("{%s,\"path\":\"/dut/cnt\",\"value\":\"0x5\","
+                     "\"max_matches\":2}", args);
+   sc = structured(tool(f.mp, f.srv, &f.sink, "nvc_wave_find", extra));
+   ck_assert_int_eq(json_get(sc, "matches")->array.count, 2);
+   ck_assert_int_eq(int_field(json_at(json_get(sc, "matches"), 0), "time_fs"),
+                    55000000);
+   free(extra);
+
+   // Unknown signals are explained
+   extra = xasprintf("{%s,\"paths\":[\"/dut/count\"]}", args);
+   err = tool_error(tool(f.mp, f.srv, &f.sink, "nvc_wave_get", extra));
+   ck_assert_ptr_nonnull(strstr(err, "nvc_wave_summary"));
+   free(extra);
+
+   // Files outside the simulation directory cannot be read
+   err = tool_error(tool(f.mp, f.srv, &f.sink, "nvc_sim_log",
+                         "{\"file\":\"../../../etc/passwd\"}"));
+   ck_assert_ptr_nonnull(strstr(err, ".nvc-mcp"));
+
+   free(args);
+
+   // The output log keeps the whole text
+   sc = structured(sim_tool(&f, "nvc_sim_status", id, ""));
+   const json_t *lf = json_get(json_get(json_get(sc, "files"), "output_log"),
+                               "file");
+   char *log_args = xasprintf("{\"file\":\"%s\",\"grep\":\"tick q=3\"}",
+                              json_string(lf));
+   sc = structured(tool(f.mp, f.srv, &f.sink, "nvc_sim_log", log_args));
+   ck_assert_int_gt(int_field(sc, "matches_total"), 0);
+   free(log_args);
+
+   // A second file can follow the first
+   sc = structured(sim_tool(&f, "nvc_wave_start", id, "\"max_bytes\":200"));
+   sc = structured(sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"5 us\","
+                            "\"pause_on\":\"never\""));
+   sc = structured(sim_tool(&f, "nvc_sim_status", id, ""));
+   const json_t *wave = json_get(json_get(sc, "files"), "wave");
+   bool quota = false;
+   json_as_bool(json_get(wave, "quota_reached"), &quota);
+   ck_assert(quota);
+
+   free(wave_file);
+   fixture_close(&f);
+}
+END_TEST
+
 Suite *get_mcp_tests(void)
 {
    Suite *s = suite_create("mcp");
@@ -2270,6 +2371,7 @@ Suite *get_mcp_tests(void)
    tcase_add_test(tc, test_sim_cancel_run);
    tcase_add_test(tc, test_sim_progress);
    tcase_add_test(tc, test_sim_background);
+   tcase_add_test(tc, test_sim_waves);
    tcase_set_timeout(tc, 60);
    suite_add_tcase(s, tc);
 

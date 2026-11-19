@@ -108,6 +108,13 @@ mcp_sims_t *mcp_sims_new(void);
 void mcp_sims_free(mcp_sims_t *sims);
 void mcp_sims_reap(mcp_sims_t *sims);
 
+// Parse a simulated time such as "100 ns" into femtoseconds, reporting an
+// error to the call when it is invalid
+bool mcp_parse_sim_time(mcp_call_t *call, const char *what, const char *text,
+                        int64_t *fs);
+
+const mcp_tool_t *mcp_file_tools(size_t *count);
+
 // Wait up to timeout_ms (negative for no limit) for any of the file
 // descriptors to become readable while still servicing the client's
 // input, which may cancel the call.  ready[i] is set for each

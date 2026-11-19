@@ -1688,17 +1688,22 @@ static int mcp_worker_cmd(int argc, char **argv, cmd_state_t *state)
 {
    static struct option long_options[] = {
       { "fd", required_argument, 0, 'f' },
+      { "files-dir", required_argument, 0, 'd' },
       { 0, 0, 0, 0 }
    };
 
    const int next_cmd = scan_cmd(2, argc, argv);
    int c, index = 0, ctl_fd = -1;
+   const char *files_dir = NULL;
    const char *spec = ":";
    while ((c = getopt_long(next_cmd, argv, spec, long_options, &index)) != -1) {
       switch (c) {
       case 0: break;  // Set a flag
       case 'f':
          ctl_fd = parse_int(optarg);
+         break;
+      case 'd':
+         files_dir = optarg;
          break;
       case '?': bad_option("mcp-worker", argv);
       case ':': missing_argument("mcp-worker", argv);
@@ -1738,7 +1743,7 @@ static int mcp_worker_cmd(int argc, char **argv, cmd_state_t *state)
    state->vhpi = vhpi_context_new();
    state->vpi = vpi_context_new();
 
-   const int rc = mcp_worker_main(state->model, top, ctl_fd);
+   const int rc = mcp_worker_main(state->model, top, state->jit, ctl_fd, files_dir);
 
    vhpi_context_free(state->vhpi);
    state->vhpi = NULL;

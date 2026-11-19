@@ -1427,7 +1427,7 @@ static const mcp_tool_t tools[] = {
 const mcp_tool_t *mcp_tool_table(size_t *count)
 {
    // The order is fixed so clients can cache the list
-   static mcp_tool_t all[32];
+   static mcp_tool_t all[40];
    static size_t n;
 
    if (n == 0) {
@@ -1438,6 +1438,10 @@ const mcp_tool_t *mcp_tool_table(size_t *count)
       const mcp_tool_t *sim = mcp_sim_tools(&nsim);
       for (size_t i = 0; i < nsim; i++)
          all[n++] = sim[i];
+
+      const mcp_tool_t *files = mcp_file_tools(&nsim);
+      for (size_t i = 0; i < nsim; i++)
+         all[n++] = files[i];
 
       assert(n <= ARRAY_LEN(all));
    }

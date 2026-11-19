@@ -30,6 +30,13 @@ wave_dumper_t *wave_dumper_new(const char *file, const char *gtkw_file,
 void wave_dumper_free(wave_dumper_t *wd);
 void wave_dumper_restart(wave_dumper_t *wd, rt_model_t *m, jit_t *jit);
 
+// Finish the file now, before the end of the simulation.  Events of the
+// signals it watched are ignored afterwards.
+void wave_dumper_close(wave_dumper_t *wd);
+
+// Forget all include and exclude patterns
+void wave_clear_globs(void);
+
 void wave_include_glob(const char *glob);
 void wave_exclude_glob(const char *glob);
 void wave_include_file(const char *base);

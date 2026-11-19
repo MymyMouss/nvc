@@ -12,4 +12,5 @@ lib_libnvc_a_SOURCES += \
 	src/mcp/mcp-server.c \
 	src/mcp/mcp-server.h \
 	src/mcp/mcp-tools.c \
+	src/mcp/mcp-wave.c \
 	src/mcp/mcp-worker.c

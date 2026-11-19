@@ -26,11 +26,15 @@
 #include "rt/model.h"
 #include "rt/printer.h"
 #include "rt/structs.h"
+#include "rt/wave.h"
 #include "tree.h"
 #include "type.h"
 
 #include <assert.h>
+#include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <fnmatch.h>
 #include <inttypes.h>
 #include <poll.h>
@@ -58,6 +62,11 @@
 #define OUTPUT_LIMIT        16384
 #define PROGRESS_PERIOD_US  250000
 #define SLICE_TARGET_US     20000
+#define FILES_CHECK_US      250000
+#define DEFAULT_LOG_MAX     (1ull << 30)
+#define DEFAULT_WAVE_MAX    (1ull << 30)
+#define MAX_WAVE_MAX        (64ull << 30)
+#define MAX_WAVE_PATTERNS   64
 #define MAX_REQUEST_BYTES   (1024 * 1024)
 #define MAX_LIST_LIMIT      200
 
@@ -126,6 +135,24 @@ typedef struct {
       unsigned  slice;
    } run;
 
+   // Files written under files_dir, a path relative to the working directory
+   const char   *files_dir;
+   jit_t        *jit;
+   uint64_t      log_max;
+   bool          log_full;
+   wave_dumper_t *wave;
+   wave_dumper_t **old_waves;
+   size_t        nold_waves;
+   char         *wave_file;       // Name of the file being written
+   char        **wave_done;       // Finished files
+   size_t        nwave_done;
+   uint64_t      wave_max;
+   bool          wave_quota_hit;
+   unsigned      wave_seq;
+   uint64_t      wave_bytes;
+   uint64_t      wave_rate;       // Bytes per second at the last check
+   uint64_t      files_check_us;
+
    const char   *last_reason;    // Why the previous run stopped
    int64_t       last_wall_ms;
    uint64_t      msg_base;       // Sequence number of msgs[0]
@@ -134,10 +161,14 @@ typedef struct {
    unsigned      next_trace_id;
 } worker_t;
 
+static void files_check(worker_t *w, bool force);
+static void write_files(worker_t *w, json_writer_t *jw);
+static void wave_finish(worker_t *w);
+
 ////////////////////////////////////////////////////////////////////////////////
 // Helpers
 
-static void format_time(int64_t fs, char *buf, size_t len)
+void mcp_format_time(int64_t fs, char *buf, size_t len)
 {
    static const struct { const char *unit; int64_t scale; } units[] = {
       { "s", 1000000000000000 }, { "ms", 1000000000000 },
@@ -441,7 +472,7 @@ static void worker_diag(diag_t *d, void *context)
    unsigned delta = 0;
    const int64_t now = model_now(w->model, &delta);
    char timestr[32];
-   format_time(now, timestr, sizeof(timestr));
+   mcp_format_time(now, timestr, sizeof(timestr));
 
    jw_key(&jw, "time_fs");
    jw_int(&jw, now);
@@ -535,12 +566,19 @@ static void write_messages(worker_t *w, json_writer_t *jw)
 
 static void capture_output(worker_t *w)
 {
-   // Standard output and error go to an anonymous file so what the
-   // design prints is returned with the call that produced it
-#ifdef MFD_CLOEXEC
-   int fd = memfd_create("nvc-sim-output", MFD_CLOEXEC);
-#else
+   // Standard output and error go to a file so what the design prints is
+   // returned with the call that produced it and can be read again later
    int fd = -1;
+
+   if (w->files_dir != NULL) {
+      char *name = xasprintf("%s/output.log", w->files_dir);
+      fd = open(name, O_RDWR | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0644);
+      free(name);
+   }
+
+#ifdef MFD_CLOEXEC
+   if (fd < 0)
+      fd = memfd_create("nvc-sim-output", MFD_CLOEXEC);
 #endif
 
    if (fd < 0) {
@@ -585,6 +623,15 @@ static void write_output(worker_t *w, json_writer_t *jw)
          jw_bool(jw, true);
          jw_key(jw, "sim_output_total_bytes");
          jw_int(jw, total);
+
+         if (w->files_dir != NULL) {
+            char *name = xasprintf("%s/output.log", w->files_dir);
+            jw_key(jw, "sim_output_log");
+            jw_string(jw, name);
+            free(name);
+            jw_key(jw, "sim_output_next_offset");
+            jw_int(jw, w->out_off + n);
+         }
       }
    }
 
@@ -601,7 +648,7 @@ static void write_state(worker_t *w, json_writer_t *jw)
    const int64_t now = model_now(w->model, &delta);
 
    char timestr[32];
-   format_time(now, timestr, sizeof(timestr));
+   mcp_format_time(now, timestr, sizeof(timestr));
 
    jw_key(jw, "now_fs");
    jw_int(jw, now);
@@ -717,6 +764,8 @@ static void run_step(worker_t *w)
       return run_finish(w, "terminated");
    else if (w->pause_requested)
       return run_finish(w, "severity");
+
+   files_check(w, false);
 
    const uint64_t now_us = get_timestamp_us();
    if (w->run.max_wall_ms > 0
@@ -901,10 +950,328 @@ static void op_status(worker_t *w, const json_t *req)
 
    write_messages_since(w, &jw, since);
    write_output(w, &jw);
+   write_files(w, &jw);
 
    jw_end_object(&jw);
    jw_end_object(&jw);
    ctl_send(w, tb);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Files: the output log and waveform dumps
+//
+// Everything that can grow without bound is written to disk with a size
+// limit that is checked while the simulation runs, so a long run cannot
+// fill the disk and the result stays readable after the worker has gone.
+
+static uint64_t prefix_bytes(const char *dir, const char *prefix)
+{
+   DIR *d = opendir(dir);
+   if (d == NULL)
+      return 0;
+
+   uint64_t total = 0;
+   const size_t plen = strlen(prefix);
+   struct dirent *e;
+   while ((e = readdir(d)) != NULL) {
+      if (strncmp(e->d_name, prefix, plen) != 0)
+         continue;
+
+      char *path = xasprintf("%s/%s", dir, e->d_name);
+      struct stat st;
+      if (stat(path, &st) == 0)
+         total += st.st_size;
+      free(path);
+   }
+
+   closedir(d);
+   return total;
+}
+
+static void wave_finish(worker_t *w)
+{
+   if (w->wave == NULL)
+      return;
+
+   wave_dumper_close(w->wave);
+
+   w->old_waves = xrealloc_array(w->old_waves, w->nold_waves + 1,
+                                 sizeof(wave_dumper_t *));
+   w->old_waves[w->nold_waves++] = w->wave;
+   w->wave = NULL;
+
+   w->wave_done = xrealloc_array(w->wave_done, w->nwave_done + 1,
+                                 sizeof(char *));
+   w->wave_done[w->nwave_done++] = w->wave_file;
+   w->wave_file = NULL;
+}
+
+// Called regularly while running: measure the files and enforce limits
+static void files_check(worker_t *w, bool force)
+{
+   const uint64_t now_us = get_timestamp_us();
+   if (!force && now_us - w->files_check_us < FILES_CHECK_US)
+      return;
+
+   if (w->wave != NULL) {
+      char *base = xstrdup(w->wave_file);
+      char *slash = strrchr(base, '/');
+      *slash = '\0';
+
+      const uint64_t bytes = prefix_bytes(base, slash + 1);
+      free(base);
+
+      if (w->files_check_us != 0 && now_us > w->files_check_us && bytes >=
+          w->wave_bytes) {
+         const double dt = (now_us - w->files_check_us) / 1e6;
+         w->wave_rate = (uint64_t)((bytes - w->wave_bytes) / dt);
+      }
+      w->wave_bytes = bytes;
+
+      if (bytes > w->wave_max) {
+         char *file = xstrdup(w->wave_file);
+         wave_finish(w);
+         w->wave_quota_hit = true;
+         notef("waveform dump %s stopped at its size limit of %"PRIu64
+               " bytes: the simulation continues without it", file,
+               w->wave_max);
+         free(file);
+      }
+   }
+
+   if (w->out_fd >= 0 && !w->log_full) {
+      struct stat st;
+      if (fstat(w->out_fd, &st) == 0 && (uint64_t)st.st_size > w->log_max) {
+         w->log_full = true;
+         notef("the output log reached its limit of %"PRIu64" bytes: "
+               "further output of the design is discarded", w->log_max);
+
+         const int devnull = open("/dev/null", O_WRONLY);
+         if (devnull >= 0) {
+            fflush(stdout);
+            fflush(stderr);
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+         }
+      }
+   }
+
+   w->files_check_us = now_us;
+}
+
+static void write_files(worker_t *w, json_writer_t *jw)
+{
+   if (w->files_dir == NULL)
+      return;
+
+   files_check(w, true);
+
+   jw_key(jw, "files");
+   jw_begin_object(jw);
+
+   jw_key(jw, "directory");
+   jw_string(jw, w->files_dir);
+
+   if (w->out_fd >= 0) {
+      struct stat st;
+      jw_key(jw, "output_log");
+      jw_begin_object(jw);
+      char *log = xasprintf("%s/output.log", w->files_dir);
+      jw_key(jw, "file");
+      jw_string(jw, log);
+      free(log);
+      jw_key(jw, "bytes");
+      jw_int(jw, fstat(w->out_fd, &st) == 0 ? st.st_size : 0);
+      jw_key(jw, "limit_reached");
+      jw_bool(jw, w->log_full);
+      jw_end_object(jw);
+   }
+
+   jw_key(jw, "wave");
+   jw_begin_object(jw);
+   jw_key(jw, "active");
+   jw_bool(jw, w->wave != NULL);
+   if (w->wave != NULL) {
+      jw_key(jw, "file");
+      jw_string(jw, w->wave_file);
+      jw_key(jw, "bytes");
+      jw_int(jw, w->wave_bytes);
+      jw_key(jw, "bytes_per_second");
+      jw_int(jw, w->wave_rate);
+      jw_key(jw, "max_bytes");
+      jw_int(jw, w->wave_max);
+   }
+   jw_key(jw, "quota_reached");
+   jw_bool(jw, w->wave_quota_hit);
+   jw_key(jw, "finished");
+   jw_begin_array(jw);
+   for (size_t i = 0; i < w->nwave_done; i++)
+      jw_string(jw, w->wave_done[i]);
+   jw_end_array(jw);
+   jw_end_object(jw);
+
+   jw_end_object(jw);
+}
+
+// Turn a design path such as /dut/cnt or /dut/* into the pattern the
+// waveform filter matches: the full lower case path with colons
+static char *wave_pattern(worker_t *w, const char *path)
+{
+   if (path[0] == ':')
+      return xstrdup(path);
+
+   LOCAL_TEXT_BUF tb = tb_new();
+   tb_printf(tb, ":%s", istr(tree_ident(tree_stmt(w->top, 0))));
+   for (const char *p = path; *p != '\0'; p++) {
+      if (*p == '/') {
+         if (p[1] != '\0' || p == path)
+            tb_append(tb, ':');
+      }
+      else
+         tb_append(tb, *p);
+   }
+
+   tb_downcase(tb);
+   return tb_claim(tb);
+}
+
+static bool valid_file_name(const char *name)
+{
+   const size_t len = strlen(name);
+   if (len == 0 || len > 64 || name[0] == '.')
+      return false;
+
+   for (const char *p = name; *p != '\0'; p++) {
+      if (!isalnum((unsigned char)*p) && *p != '_' && *p != '-' && *p != '.')
+         return false;
+   }
+
+   return true;
+}
+
+static void op_wave_start(worker_t *w, const json_t *req)
+{
+   if (w->files_dir == NULL) {
+      reply_error(w, "This simulation has no file directory");
+      return;
+   }
+   else if (w->wave != NULL) {
+      reply_error(w, "A waveform dump is already active (%s): stop it with "
+                  "nvc_wave_stop, which also lets you start another file",
+                  w->wave_file);
+      return;
+   }
+
+   const char *name = json_string(json_get(req, "name"));
+   char *auto_name = NULL;
+   if (name == NULL)
+      name = auto_name = xasprintf("wave-%u", w->wave_seq + 1);
+   else if (!valid_file_name(name)) {
+      reply_error(w, "Invalid name '%s': use letters, digits, - _ and . "
+                  "(at most 64 characters, not starting with a dot)", name);
+      return;
+   }
+
+   int64_t max_bytes = DEFAULT_WAVE_MAX;
+   json_as_int(json_get(req, "max_bytes"), &max_bytes);
+   max_bytes = CLAMP_INT(max_bytes, 1, (int64_t)MAX_WAVE_MAX);
+
+   char *file = xasprintf("%s/%s%s", w->files_dir, name,
+                          strstr(name, ".fst") ? "" : ".fst");
+   free(auto_name);
+
+   struct stat st;
+   if (stat(file, &st) == 0) {
+      reply_error(w, "The file %s already exists: choose another name", file);
+      free(file);
+      return;
+   }
+
+   wave_clear_globs();
+
+   const json_t *incl = json_get(req, "include");
+   const json_t *excl = json_get(req, "exclude");
+   for (int pass = 0; pass < 2; pass++) {
+      const json_t *list = pass == 0 ? incl : excl;
+      const size_t n = list != NULL ? list->array.count : 0;
+      for (size_t i = 0; i < n && i < MAX_WAVE_PATTERNS; i++) {
+         const char *pat = json_string(json_at(list, i));
+         if (pat == NULL)
+            continue;
+
+         char *glob = wave_pattern(w, pat);
+         if (pass == 0)
+            wave_include_glob(glob);
+         else
+            wave_exclude_glob(glob);
+         free(glob);
+      }
+   }
+
+   w->wave = wave_dumper_new(file, NULL, w->top, WAVE_FORMAT_FST);
+   w->wave_file = file;
+   w->wave_max = max_bytes;
+   w->wave_quota_hit = false;
+   w->wave_bytes = w->wave_rate = 0;
+   w->wave_seq++;
+
+   // The initial values are those at the current time
+   wave_dumper_restart(w->wave, w->model, w->jit);
+   wave_clear_globs();
+
+   w->files_check_us = 0;
+
+   LOCAL_TEXT_BUF tb = tb_new();
+   json_writer_t jw;
+   jw_init(&jw, tb);
+   begin_reply(&jw, true);
+   jw_key(&jw, "result");
+   jw_begin_object(&jw);
+   jw_key(&jw, "file");
+   jw_string(&jw, w->wave_file);
+   jw_key(&jw, "max_bytes");
+   jw_int(&jw, max_bytes);
+   write_state(w, &jw);
+   write_files(w, &jw);
+   jw_end_object(&jw);
+   jw_end_object(&jw);
+   ctl_send(w, tb);
+}
+
+static void op_wave_stop(worker_t *w)
+{
+   if (w->wave == NULL) {
+      reply_error(w, "No waveform dump is active");
+      return;
+   }
+
+   char *file = xstrdup(w->wave_file);
+   wave_finish(w);
+
+   char *base = xstrdup(file);
+   char *slash = strrchr(base, '/');
+   *slash = '\0';
+   const uint64_t bytes = prefix_bytes(base, slash + 1);
+
+   LOCAL_TEXT_BUF tb = tb_new();
+   json_writer_t jw;
+   jw_init(&jw, tb);
+   begin_reply(&jw, true);
+   jw_key(&jw, "result");
+   jw_begin_object(&jw);
+   jw_key(&jw, "file");
+   jw_string(&jw, file);
+   jw_key(&jw, "bytes");
+   jw_int(&jw, bytes);
+   write_state(w, &jw);
+   write_files(w, &jw);
+   jw_end_object(&jw);
+   jw_end_object(&jw);
+   ctl_send(w, tb);
+
+   free(base);
+   free(file);
 }
 
 // The cursor is a plain count of items already returned
@@ -1578,7 +1945,7 @@ static void op_trace_start(worker_t *w, const json_t *req)
    w->traces[slot] = t;
 
    char timestr[32];
-   format_time(now, timestr, sizeof(timestr));
+   mcp_format_time(now, timestr, sizeof(timestr));
 
    LOCAL_TEXT_BUF tb = tb_new();
    json_writer_t jw;
@@ -1741,7 +2108,7 @@ static void op_trace_get(worker_t *w, const json_t *req)
       if (open && (n == t->count || (wanted && time != group_time))) {
          if (groups >= cursor && shown < limit) {
             char timestr[32];
-            format_time(group_time, timestr, sizeof(timestr));
+            mcp_format_time(group_time, timestr, sizeof(timestr));
 
             jw_begin_object(&jw);
             jw_key(&jw, "time_fs");
@@ -1819,12 +2186,16 @@ static void op_trace_get(worker_t *w, const json_t *req)
 ////////////////////////////////////////////////////////////////////////////////
 // Entry point
 
-int mcp_worker_main(rt_model_t *m, tree_t top, int ctl_fd)
+int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
+                    const char *files_dir)
 {
    worker_t w = {
       .model       = m,
       .top         = top,
       .ctl_fd      = ctl_fd,
+      .jit         = jit,
+      .files_dir   = files_dir,
+      .log_max     = DEFAULT_LOG_MAX,
       .out_fd      = -1,
       .pause_level = DIAG_FATAL + 1,
       .printer     = printer_new(),
@@ -1924,6 +2295,10 @@ int mcp_worker_main(rt_model_t *m, tree_t top, int ctl_fd)
          op_get(&w, req);
       else if (!strcmp(op, "trace_get"))
          op_trace_get(&w, req);
+      else if (!strcmp(op, "wave_start"))
+         op_wave_start(&w, req);
+      else if (!strcmp(op, "wave_stop"))
+         op_wave_stop(&w);
       else if (busy)
          reply_error(&w, "The simulation is running a background run, which "
                      "only allows reading: wait for it with nvc_sim_wait or "
@@ -1939,6 +2314,9 @@ int mcp_worker_main(rt_model_t *m, tree_t top, int ctl_fd)
 
       pool_free(mp);
    }
+
+   // Leave the waveform files complete
+   wave_finish(&w);
 
    diag_set_consumer(NULL, NULL);
    printer_free(w.printer);
