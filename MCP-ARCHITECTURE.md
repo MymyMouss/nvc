@@ -323,6 +323,32 @@ L'étape M0 est écrite (`src/mcp/`, tests dans `test/test_mcp.c`):
   sorties de progression, les limites mémoire (`RLIMIT_AS`) des workers,
   et le support Windows.
 
+### Évaluation avec un agent (Claude Agent SDK)
+
+`test/mcp/agent_eval.py` fait piloter le serveur par un vrai agent (modèle
+`claude-haiku-5-5`, outils limités à `Read`, `Edit`, `Glob` et `nvc_analyse`,
+sans `Bash` pour que l'agent ne puisse pas contourner le serveur). Le
+résultat est vérifié en relançant nvc directement, pas sur la foi de
+l'agent. Ce n'est pas dans `make check`: il appelle un modèle.
+
+| Scénario | Résultat |
+|---|---|
+| Corriger une faute de frappe dans un design de deux fichiers | 7 tours, 2 appels MCP, corrigé et reconfirmé |
+| Compiler dans le désordre avec `--std 2008` | 1 appel: l'agent a réordonné lui-même et passé `std: "2008"` |
+| Chemin faux, sans aucun outil de fichiers | voir ci-dessous |
+
+**Leçon:** au premier essai, le dernier scénario échouait. Le message
+disait seulement « fichier introuvable » avec la racine, l'agent n'avait
+aucun moyen de découvrir `src/counter.vhd` et a abandonné (en le disant
+honnêtement). Le message propose maintenant les fichiers de même nom
+trouvés sous la racine (« Did you mean: src/counter.vhd? »), ou à défaut
+le contenu de la racine. Le même scénario réussit alors en deux appels.
+Un agent qui n'a que ce serveur doit pouvoir se rattraper avec ce que le
+serveur lui dit.
+
+Limites: un petit modèle, trois scénarios courts, un seul essai chacun.
+C'est un test de fumée, pas une mesure statistique.
+
 ## 6. Points à valider et limites de cette étude
 
 À décider avec vous:

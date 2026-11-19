@@ -20,12 +20,14 @@
 #include "mcp/mcp-server.h"
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 
 // The schemas are written as JSON text and kept as the single source of
@@ -36,6 +38,10 @@
 #define WORKER_OUTPUT_LIMIT  8192
 #define MAX_PARSED_DIAGS     10000
 #define MAX_WORKER_ERRORS    200
+#define MAX_SUGGESTIONS      5
+#define MAX_SEARCH_DEPTH     6
+#define MAX_SEARCH_ENTRIES   5000
+#define MAX_ROOT_LISTING     20
 
 ////////////////////////////////////////////////////////////////////////////////
 // nvc_analyse
@@ -149,6 +155,125 @@ static bool valid_library_name(const char *name)
    return true;
 }
 
+typedef struct {
+   const char *base;
+   size_t      rootlen;
+   size_t      visited;
+   char       *found[MAX_SUGGESTIONS];
+   unsigned    nfound;
+} search_t;
+
+static int compare_names(const void *a, const void *b)
+{
+   return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+// Look for regular files called base below dir.  Symbolic links are not
+// followed and the walk is bounded in depth and size.
+static void search_dir(search_t *s, const char *dir, unsigned depth)
+{
+   if (depth > MAX_SEARCH_DEPTH)
+      return;
+
+   DIR *d = opendir(dir);
+   if (d == NULL)
+      return;
+
+   struct dirent *e;
+   while ((e = readdir(d)) != NULL && s->nfound < MAX_SUGGESTIONS
+          && s->visited < MAX_SEARCH_ENTRIES) {
+      if (e->d_name[0] == '.')
+         continue;
+
+      s->visited++;
+
+      char *full = xasprintf("%s/%s", dir, e->d_name);
+
+      struct stat st;
+      if (lstat(full, &st) == 0) {
+         if (S_ISREG(st.st_mode) && strcasecmp(e->d_name, s->base) == 0)
+            s->found[s->nfound++] = xstrdup(full + s->rootlen + 1);
+         else if (S_ISDIR(st.st_mode))
+            search_dir(s, full, depth + 1);
+      }
+
+      free(full);
+   }
+
+   closedir(d);
+}
+
+// Describe where a missing file might be so the caller can recover
+// without a way to list directories.
+static void describe_missing(const char *root, const char *path,
+                             text_buf_t *out)
+{
+   const char *slash = strrchr(path, '/');
+
+   search_t s = {
+      .base    = slash ? slash + 1 : path,
+      .rootlen = strlen(root),
+   };
+
+   search_dir(&s, root, 0);
+
+   if (s.nfound > 0) {
+      qsort(s.found, s.nfound, sizeof(char *), compare_names);
+
+      tb_cat(out, ". Did you mean: ");
+      for (unsigned i = 0; i < s.nfound; i++) {
+         if (i > 0)
+            tb_cat(out, ", ");
+         tb_cat(out, s.found[i]);
+         free(s.found[i]);
+      }
+      tb_append(out, '?');
+      return;
+   }
+
+   // No file of that name: show what the root holds
+   DIR *d = opendir(root);
+   if (d == NULL)
+      return;
+
+   char *names[MAX_ROOT_LISTING + 1];
+   unsigned n = 0;
+   bool more = false;
+
+   struct dirent *e;
+   while ((e = readdir(d)) != NULL) {
+      if (e->d_name[0] == '.')
+         continue;
+      else if (n == MAX_ROOT_LISTING) {
+         more = true;
+         break;
+      }
+
+      char *full = xasprintf("%s/%s", root, e->d_name);
+      struct stat st;
+      const bool is_dir = lstat(full, &st) == 0 && S_ISDIR(st.st_mode);
+      free(full);
+
+      names[n++] = xasprintf("%s%s", e->d_name, is_dir ? "/" : "");
+   }
+
+   closedir(d);
+
+   qsort(names, n, sizeof(char *), compare_names);
+
+   tb_printf(out, ". No file named '%s' exists below the root", s.base);
+   if (n > 0)
+      tb_cat(out, ". The root contains: ");
+   for (unsigned i = 0; i < n; i++) {
+      if (i > 0)
+         tb_cat(out, ", ");
+      tb_cat(out, names[i]);
+      free(names[i]);
+   }
+   if (more)
+      tb_cat(out, ", ...");
+}
+
 // Resolve a client supplied path against the workspace root.  The result
 // is relative to the root and guaranteed not to escape it, even through
 // symbolic links.
@@ -165,8 +290,12 @@ static char *resolve_in_root(mcp_call_t *call, const char *path)
 
    char *real = realpath(tb_get(full), NULL);
    if (real == NULL) {
+      LOCAL_TEXT_BUF hint = tb_new();
+      if (errno == ENOENT)
+         describe_missing(root, path, hint);
+
       mcp_call_error(call, "File '%s' was not found. Paths are relative to "
-                     "the workspace root %s", path, root);
+                     "the workspace root %s%s", path, root, tb_get(hint));
       return NULL;
    }
 

@@ -800,6 +800,16 @@ START_TEST(test_analyse_bad_arguments)
 
    e = tool_error(analyse(mp, srv, &sink, "{\"files\":[\"missing.vhd\"]}"));
    ck_assert_ptr_nonnull(strstr(e, "was not found"));
+   ck_assert_ptr_nonnull(strstr(e, "The root contains: "));
+   ck_assert_ptr_nonnull(strstr(e, "a.vhd"));
+   ck_assert_ptr_nonnull(strstr(e, "subdir/"));
+
+   // A file with the right name in another directory is suggested
+   write_file(root, "subdir/counter.vhd", "-- empty\n", 0644);
+   e = tool_error(analyse(mp, srv, &sink, "{\"files\":[\"counter.vhd\"]}"));
+   ck_assert_ptr_nonnull(strstr(e, "Did you mean: subdir/counter.vhd?"));
+   e = tool_error(analyse(mp, srv, &sink, "{\"files\":[\"x/COUNTER.VHD\"]}"));
+   ck_assert_ptr_nonnull(strstr(e, "Did you mean: subdir/counter.vhd?"));
    e = tool_error(analyse(mp, srv, &sink, "{\"files\":[\"subdir\"]}"));
    ck_assert_ptr_nonnull(strstr(e, "not a regular file"));
 
