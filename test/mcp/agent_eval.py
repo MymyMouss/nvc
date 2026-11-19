@@ -136,6 +136,16 @@ SCENARIOS = [
          prompt="I do not know what is in this workspace. Find out which "
          "VHDL entities it defines. Finish with exactly one line in this "
          "form: RESULT: <entity names separated by commas>"),
+    dict(name="trace-lookback", files="checked", tools=[],
+         check=r"RESULT:\s*(2\s*,\s*)?3\s*,\s*4\s*,\s*5\s*$",
+         must_call="nvc_trace_get",
+         prompt="src/ holds a counter and a testbench called checked_tb whose "
+         "assertion fails at some point. Simulate the testbench to that "
+         "failure, running the simulation only once and never restarting "
+         "it, then tell me the values the counter output q took during the "
+         "30 ns before the failure, oldest first, in decimal. Finish with "
+         "exactly one line in this form: RESULT: <values separated by "
+         "commas>"),
     dict(name="debug-assertion", files="checked", tools=[],
          check=r"RESULT:\s*65\s*ns\s+5\s*$",
          prompt="src/ holds a counter and a testbench called checked_tb. "
@@ -232,6 +242,12 @@ async def run(nvc, model, sc):
         ok = re.search(check, last, re.I) is not None
         for word in sc.get("both", ()):
             ok = ok and re.search(r"\b%s\b" % word, last, re.I) is not None
+
+    # Some scenarios are only meaningful if a particular tool was used
+    must = sc.get("must_call")
+    if must and not any(c.endswith(must) for c in calls):
+        print("  the scenario needed %s, which was never called" % must)
+        ok = False
     shutil.rmtree(ws, ignore_errors=True)
 
     print("  final line: %s" % short(last, 200))

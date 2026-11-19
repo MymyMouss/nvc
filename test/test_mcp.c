@@ -1755,6 +1755,152 @@ START_TEST(test_sim_run_modes)
 }
 END_TEST
 
+START_TEST(test_sim_trace)
+{
+   fixture_t f;
+   const char *names[] = { "tb.vhd" }, *sources[] = { tb_src };
+   const char *tops[] = { "tb" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   char id[40];
+   open_sim(&f, "tb", id);
+
+   // Mistakes first
+   const char *e = tool_error(sim_tool(&f, "nvc_trace_start", id, ""));
+   ck_assert_ptr_nonnull(strstr(e, "either paths or pattern"));
+   e = tool_error(sim_tool(&f, "nvc_trace_start", id,
+                           "\"paths\":[\"/q\"],\"pattern\":\"q\""));
+   ck_assert_ptr_nonnull(strstr(e, "either paths or pattern"));
+   e = tool_error(sim_tool(&f, "nvc_trace_start", id, "\"paths\":[\"/nope\"]"));
+   ck_assert_ptr_nonnull(strstr(e, "nvc_design_search"));
+   e = tool_error(sim_tool(&f, "nvc_trace_start", id, "\"paths\":[\"/dut\"]"));
+   ck_assert_ptr_nonnull(strstr(e, "is a region"));
+   e = tool_error(sim_tool(&f, "nvc_trace_start", id, "\"pattern\":\"zzz*\""));
+   ck_assert_ptr_nonnull(strstr(e, "No signal matches"));
+   e = tool_error(sim_tool(&f, "nvc_trace_get", id, "\"trace_id\":3"));
+   ck_assert_ptr_nonnull(strstr(e, "Trace 3 does not exist"));
+
+   const json_t *sc = structured(sim_tool(&f, "nvc_trace_start", id,
+                                          "\"paths\":[\"/rst\",\"/q\"]"));
+   ck_assert_int_eq(int_field(sc, "trace_id"), 1);
+   ck_assert_int_eq(json_get(sc, "signals")->array.count, 2);
+   ck_assert_int_eq(int_field(sc, "started_fs"), 0);
+
+   // A pattern works too, and several traces can be active
+   sc = structured(sim_tool(&f, "nvc_trace_start", id, "\"pattern\":\"/dut/c*\""));
+   ck_assert_int_eq(int_field(sc, "trace_id"), 2);
+   ck_assert_int_eq(json_get(sc, "signals")->array.count, 2);
+
+   sc = structured(sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"200 ns\""));
+   ck_assert_str_eq(str_field(sc, "stopped_because"), "severity");
+   ck_assert_int_eq(int_field(sc, "now_fs"), 65000000);
+
+   // The window before the failure, without running again
+   sc = structured(sim_tool(&f, "nvc_trace_get", id,
+                            "\"trace_id\":1,\"from\":\"40 ns\",\"to\":\"70 ns\""));
+   ck_assert_int_eq(int_field(sc, "total"), 2);
+   ck_assert(!bool_field(sc, "truncated"));
+   ck_assert_int_eq(int_field(sc, "dropped"), 0);
+   ck_assert_int_eq(int_field(sc, "now_fs"), 65000000);
+   const json_t *changes = json_get(sc, "changes");
+   ck_assert_int_eq(int_field(json_at(changes, 0), "time_fs"), 45000000);
+   ck_assert_str_eq(str_field(json_at(changes, 0), "time"), "45 ns");
+   ck_assert_str_eq(str_field(json_get(json_at(changes, 0), "values"), "/q"),
+                    "0100");
+   ck_assert_int_eq(int_field(json_at(changes, 1), "time_fs"), 55000000);
+   ck_assert_str_eq(str_field(json_get(json_at(changes, 1), "values"), "/q"),
+                    "0101");
+
+   // The first entry holds the values when the trace started
+   sc = structured(sim_tool(&f, "nvc_trace_get", id,
+                            "\"trace_id\":1,\"to\":\"0 fs\""));
+   ck_assert_int_eq(int_field(sc, "total"), 1);
+   ck_assert_int_eq(int_field(sc, "oldest_time_fs"), 0);
+   const json_t *first = json_get(json_at(json_get(sc, "changes"), 0), "values");
+   ck_assert_str_eq(str_field(first, "/rst"), "'1'");
+   ck_assert_str_eq(str_field(first, "/q"), "UUUU");
+
+   // One signal, in decimal, paged
+   sc = structured(sim_tool(&f, "nvc_trace_get", id,
+                            "\"trace_id\":1,\"paths\":[\"/q\"],"
+                            "\"radix\":\"dec\",\"limit\":3"));
+   ck_assert_int_eq(int_field(sc, "total"), 7);
+   ck_assert(bool_field(sc, "truncated"));
+   ck_assert_str_eq(str_field(sc, "next_cursor"), "3");
+   changes = json_get(sc, "changes");
+   ck_assert_int_eq(changes->array.count, 3);
+   ck_assert_str_eq(str_field(json_get(json_at(changes, 1), "values"), "/q"), "0");
+   ck_assert_str_eq(str_field(json_get(json_at(changes, 2), "values"), "/q"), "1");
+
+   sc = structured(sim_tool(&f, "nvc_trace_get", id,
+                            "\"trace_id\":1,\"paths\":[\"/q\"],"
+                            "\"radix\":\"dec\",\"limit\":10,\"cursor\":\"6\""));
+   ck_assert_int_eq(json_get(sc, "changes")->array.count, 1);
+   ck_assert(!bool_field(sc, "truncated"));
+   ck_assert_str_eq(str_field(json_get(json_at(json_get(sc, "changes"), 0),
+                                       "values"), "/q"), "5");
+
+   e = tool_error(sim_tool(&f, "nvc_trace_get", id,
+                           "\"trace_id\":1,\"paths\":[\"/clk\"]"));
+   ck_assert_ptr_nonnull(strstr(e, "is not part of trace 1"));
+   ck_assert_ptr_nonnull(strstr(e, "/rst, /q"));
+
+   // Stopping frees it
+   sc = structured(sim_tool(&f, "nvc_trace_stop", id, "\"trace_id\":1"));
+   ck_assert(bool_field(sc, "stopped"));
+   ck_assert_int_eq(int_field(sc, "changes_kept"), 9);
+   e = tool_error(sim_tool(&f, "nvc_trace_get", id, "\"trace_id\":1"));
+   ck_assert_ptr_nonnull(strstr(e, "Active traces: 2"));
+
+   // The other trace goes on recording
+   sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"40 ns\",\"pause_on\":\"never\"");
+   sc = structured(sim_tool(&f, "nvc_trace_get", id,
+                            "\"trace_id\":2,\"from\":\"70 ns\""));
+   ck_assert_int_ge(int_field(sc, "total"), 1);
+
+   sim_tool(&f, "nvc_sim_close", id, "");
+   fixture_close(&f);
+}
+END_TEST
+
+START_TEST(test_sim_trace_overflow)
+{
+   fixture_t f;
+   const char *names[] = { "tb.vhd" }, *sources[] = { tb_src };
+   const char *tops[] = { "tb" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   char id[40];
+   open_sim(&f, "tb", id);
+
+   // A small buffer keeps only the most recent changes
+   const json_t *sc = structured(sim_tool(&f, "nvc_trace_start", id,
+                                          "\"paths\":[\"/clk\"],"
+                                          "\"max_changes\":100"));
+   ck_assert_int_eq(int_field(sc, "capacity"), 100);
+
+   sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"2 us\",\"pause_on\":\"never\"");
+
+   sc = structured(sim_tool(&f, "nvc_trace_get", id,
+                            "\"trace_id\":1,\"limit\":500"));
+   ck_assert_int_eq(int_field(sc, "total"), 100);
+   ck_assert_int_gt(int_field(sc, "dropped"), 100);
+   ck_assert_int_gt(int_field(sc, "oldest_time_fs"), 0);
+
+   // Entries are in time order
+   const json_t *changes = json_get(sc, "changes");
+   int64_t previous = -1;
+   for (size_t i = 0; i < changes->array.count; i++) {
+      const int64_t t = int_field(json_at(changes, i), "time_fs");
+      ck_assert_int_gt(t, previous);
+      previous = t;
+   }
+
+   sim_tool(&f, "nvc_sim_close", id, "");
+   fixture_close(&f);
+}
+END_TEST
+
 START_TEST(test_sim_hang)
 {
    fixture_t f;
@@ -2046,6 +2192,8 @@ Suite *get_mcp_tests(void)
    tcase_add_test(tc, test_library_and_elaborate);
    tcase_add_test(tc, test_sim_lifecycle);
    tcase_add_test(tc, test_sim_run_modes);
+   tcase_add_test(tc, test_sim_trace);
+   tcase_add_test(tc, test_sim_trace_overflow);
    tcase_add_test(tc, test_sim_hang);
    tcase_add_test(tc, test_sim_fake_workers);
    tcase_add_test(tc, test_sim_not_elaborated);

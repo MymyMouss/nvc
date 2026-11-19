@@ -305,7 +305,7 @@ typées, puis on factorisera si le besoin se confirme.
 | M3 | Bac à sable, filtre de chemins `fileio`, rlimits, fuzzing, `--disable-mcp` | Revue de sécurité sans point bloquant |
 | M4 | Checkpoints (`PLAN.md` §1), extension tâches, HTTP local, couverture | Handles qui survivent à la mort d'un worker |
 
-## 5. État d'avancement (M0 et M1)
+## 5. État d'avancement (M0, M1 et M2)
 
 L'étape M0 est écrite (`src/mcp/`, tests dans `test/test_mcp.c`):
 
@@ -325,9 +325,10 @@ L'étape M0 est écrite (`src/mcp/`, tests dans `test/test_mcp.c`):
 
 ### M1: simulations vivantes et outils de listing
 
-Onze outils au total: `nvc_analyse`, `nvc_elaborate`, `nvc_workspace_list`,
+Quatorze outils au total: `nvc_analyse`, `nvc_elaborate`, `nvc_workspace_list`,
 `nvc_library_list`, `nvc_sim_open`, `nvc_sim_run`, `nvc_sim_close`,
-`nvc_design_list`, `nvc_design_search`, `nvc_signal_get`, `nvc_signal_set`.
+`nvc_design_list`, `nvc_design_search`, `nvc_signal_get`, `nvc_signal_set`,
+`nvc_trace_start`, `nvc_trace_get`, `nvc_trace_stop`.
 Choix de réalisation, avec ce qui les a motivés:
 
 - **Un processus par simulation** (`nvc --mcp-worker --fd=3 TOP`). Le
@@ -364,6 +365,58 @@ Choix de réalisation, avec ce qui les a motivés:
 - **Aucun effet de bord à la lecture.** `nvc --list` crée la bibliothèque si
   elle n'existe pas: `nvc_library_list` vérifie d'abord son existence.
 
+### M2: traces et simulations longues
+
+`nvc_trace_start` enregistre en mémoire les changements de signaux choisis
+(chemins ou motif, 64 au plus, 256 octets par valeur), `nvc_trace_get` les
+relit par fenêtre de temps, paginés, et `nvc_trace_stop` libère la mémoire.
+C'est la réponse au problème des signaux oubliés dans les ondes: on regarde
+en arrière au lieu de relancer. Les valeurs sont celles de la fin de chaque
+pas de temps, comme dans un fichier d'ondes (observateurs au niveau
+« postponed »), regroupées par instant pour limiter le volume. Un tampon
+circulaire garde les `max_changes` plus récents (10 000 par défaut, 500 000
+au plus, 64 Mo au plus): `dropped` et `oldest_time_fs` disent ce qui a été
+perdu.
+
+**Ce que les mesures montrent** (build de debug, 16 compteurs de 32 bits,
+4 cœurs; la référence est `nvc -r` sur la même simulation):
+
+| Mesure | Résultat |
+|---|---|
+| 5 ms simulées, `nvc -r` | 3,58 s |
+| 5 ms, un seul `nvc_sim_run` | 3,52 s (pas de surcoût mesurable) |
+| 5 ms en 10 appels de 0,5 ms | 3,80 s (+8 %) |
+| 5 ms avec budget de 1 s par appel | 4 appels, 3,81 s, reprise exacte |
+| 5 ms avec une trace sur l'horloge (1 M de changements) | 3,86 s (+10 %) |
+| 1 ms avec 16 signaux de 32 bits tracés | 0,81 s contre 0,77 s (+5 %) |
+| Mémoire du worker | 13 Mo au repos, 35 Mo avec un tampon de 500 000 changements, stable ensuite |
+| Annulation d'un run lourd | la requête suivante est servie en 1 ms, l'état est conservé |
+
+**Ce qui est possible à ce stade pour une simulation longue:** la faire
+avancer par tranches de temps réel (`max_wall_ms`) avec reprise exacte,
+suivre sa progression, l'annuler sans la perdre, l'arrêter au premier
+message d'erreur, inspecter et forcer des signaux, regarder en arrière avec
+une trace, et en garder plusieurs ouvertes (4 au plus).
+
+**Ce qui ne l'est pas encore:**
+
+- *Rien ne survit à la mort du worker, du serveur ou du client.* Une
+  simulation de plusieurs heures est perdue si le processus meurt (manque de
+  mémoire, arrêt du client MCP, redémarrage du serveur) ou si elle reste 30
+  minutes sans appel. Il faut les checkpoints (`PLAN.md` §1).
+- *Pas de retour en arrière.* La trace relit le passé des signaux qu'on a
+  choisis avant de simuler, mais on ne peut pas revenir à un instant antérieur
+  pour changer ce qu'on observe ou corriger le code: même cause, mêmes
+  checkpoints.
+- *Pas de saut des périodes calmes* (liaisons série lentes): le temps de
+  calcul reste proportionnel au temps simulé.
+- *Pas de tâches asynchrones au sens MCP.* Chaque appel garde la connexion
+  jusqu'à `max_wall_ms` (300 s au plus). Les clients ont leurs propres
+  délais: viser 30 à 60 s par appel et laisser la progression et la reprise
+  faire le reste. Le comportement des clients n'a pas été testé.
+- *Les messages sont plafonnés* à 100 par appel (les compteurs restent
+  exacts), et la sortie texte à 16 Ko.
+
 ### Évaluation avec un agent (Claude Agent SDK)
 
 `test/mcp/agent_eval.py` fait piloter le serveur par un vrai agent (modèle
@@ -379,6 +432,7 @@ l'agent. Ce n'est pas dans `make check`: il appelle un modèle.
 | Chemin faux, sans aucun outil de fichiers | voir ci-dessous |
 | Découvrir les entités d'un espace de travail inconnu (aucun outil de fichiers) | 5 appels MCP, les deux entités |
 | Trouver quand une assertion échoue et la valeur du registre (aucun outil de fichiers) | 9 appels, `65 ns 5`, exact |
+| Relire les valeurs d'un signal avant l'échec, un seul run autorisé (aucun outil de fichiers) | 9 appels: trace démarrée avant le run, puis relue, `3, 4, 5` |
 
 **Leçon:** au premier essai, le dernier scénario échouait. Le message
 disait seulement « fichier introuvable » avec la racine, l'agent n'avait
@@ -399,7 +453,7 @@ résultats de `nvc_sim_run` qui dit quoi faire ensuite (par exemple « le
 design a signalé beaucoup d'erreurs: utilisez pause_on error »). Même
 scénario ensuite: 9 appels au lieu de 15, sans faux pas.
 
-Limites: un petit modèle, cinq scénarios courts, un seul essai chacun.
+Limites: un petit modèle, six scénarios courts, un seul essai chacun.
 C'est un test de fumée, pas une mesure statistique.
 
 ## 6. Points à valider et limites de cette étude

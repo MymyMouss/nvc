@@ -1256,6 +1256,245 @@ static bool tool_signal_set(mcp_call_t *call, const json_t *args,
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// Traces
+
+static const char trace_start_input[] = MCP_JSON({
+   "type": "object",
+   "properties": {
+      "sim_id": { "type": "string", "minLength": 32, "maxLength": 32 },
+      "paths": {
+         "type": "array",
+         "minItems": 1,
+         "maxItems": 64,
+         "items": { "type": "string", "minLength": 1, "maxLength": 1024 },
+         "description": "Full paths of the signals to record, for example /q or /dut/cnt."
+      },
+      "pattern": {
+         "type": "string",
+         "minLength": 1,
+         "maxLength": 256,
+         "description": "Instead of paths: a glob such as /dut/* or *state*, as for nvc_design_search. At most 64 signals can match."
+      },
+      "max_changes": {
+         "type": "integer",
+         "minimum": 100,
+         "maximum": 500000,
+         "description": "How many of the most recent changes to keep, across all the signals. Defaults to 10000. Older changes are discarded."
+      }
+   },
+   "required": ["sim_id"],
+   "additionalProperties": false
+});
+
+static const char trace_start_output[] = MCP_JSON({
+   "type": "object",
+   "properties": {
+      "trace_id": { "type": "integer" },
+      "signals": { "type": "array", "items": { "type": "string" } },
+      "capacity": { "type": "integer" },
+      "started_fs": { "type": "integer" },
+      "started": { "type": "string" }
+   },
+   "required": ["trace_id", "signals", "capacity", "started_fs", "started"]
+});
+
+static const char trace_start_example[] = MCP_JSON({
+   "sim_id": "0123456789abcdef0123456789abcdef", "paths": ["/q", "/dut/cnt"]
+});
+
+static bool tool_trace_start(mcp_call_t *call, const json_t *args,
+                             json_writer_t *out)
+{
+   const char *sim_id = json_string(json_get(args, "sim_id"));
+   const json_t *paths = json_get(args, "paths");
+   const char *pattern = json_string(json_get(args, "pattern"));
+
+   if ((paths == NULL) == (pattern == NULL)) {
+      mcp_call_error(call, "Give either paths or pattern, not both and not "
+                     "neither");
+      return false;
+   }
+
+   int64_t max_changes = 10000;
+   json_as_int(json_get(args, "max_changes"), &max_changes);
+
+   LOCAL_TEXT_BUF req = tb_new();
+   json_writer_t w;
+   jw_init(&w, req);
+   jw_begin_object(&w);
+   jw_key(&w, "op");
+   jw_string(&w, "trace_start");
+   if (paths != NULL) {
+      jw_key(&w, "paths");
+      jw_begin_array(&w);
+      for (size_t i = 0; i < paths->array.count; i++)
+         jw_string(&w, paths->array.items[i]->string.chars);
+      jw_end_array(&w);
+   }
+   else {
+      jw_key(&w, "pattern");
+      jw_string(&w, pattern);
+   }
+   jw_key(&w, "max_changes");
+   jw_int(&w, max_changes);
+   jw_end_object(&w);
+
+   return sim_op(call, sim_id, req, 10000, out);
+}
+
+static const char trace_get_input[] = MCP_JSON({
+   "type": "object",
+   "properties": {
+      "sim_id": { "type": "string", "minLength": 32, "maxLength": 32 },
+      "trace_id": { "type": "integer", "minimum": 1, "description": "From nvc_trace_start." },
+      "from": { "type": "string", "maxLength": 32, "description": "Earliest simulated time to show, for example 40 ns. Defaults to the start." },
+      "to": { "type": "string", "maxLength": 32, "description": "Latest simulated time to show, for example 80 ns. Defaults to the end." },
+      "paths": {
+         "type": "array",
+         "minItems": 1,
+         "maxItems": 64,
+         "items": { "type": "string", "minLength": 1, "maxLength": 1024 },
+         "description": "Show only these traced signals. Defaults to all of them."
+      },
+      "radix": { "type": "string", "enum": ["default", "hex", "bin", "dec"], "description": "How to print vectors, as for nvc_signal_get." },
+      "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum entries to return. Defaults to 100." },
+      "cursor": { "type": "string", "maxLength": 20, "description": "next_cursor from the previous page." }
+   },
+   "required": ["sim_id", "trace_id"],
+   "additionalProperties": false
+});
+
+static const char trace_get_output[] = MCP_JSON({
+   "type": "object",
+   "properties": {
+      "trace_id": { "type": "integer" },
+      "changes": {
+         "type": "array",
+         "items": {
+            "type": "object",
+            "properties": {
+               "time_fs": { "type": "integer" },
+               "time": { "type": "string" },
+               "values": { "type": "object" }
+            },
+            "required": ["time_fs", "time", "values"]
+         }
+      },
+      "total": { "type": "integer" },
+      "truncated": { "type": "boolean" },
+      "next_cursor": { "type": "string" },
+      "dropped": { "type": "integer" },
+      "oldest_time_fs": { "type": ["integer", "null"] },
+      "now_fs": { "type": "integer" },
+      "now": { "type": "string" }
+   },
+   "required": ["trace_id", "changes", "total", "truncated", "dropped",
+                "oldest_time_fs", "now_fs", "now"]
+});
+
+static const char trace_get_example[] = MCP_JSON({
+   "sim_id": "0123456789abcdef0123456789abcdef", "trace_id": 1,
+   "from": "40 ns", "to": "70 ns"
+});
+
+static bool tool_trace_get(mcp_call_t *call, const json_t *args,
+                           json_writer_t *out)
+{
+   const char *sim_id = json_string(json_get(args, "sim_id"));
+   const char *from = json_string(json_get(args, "from"));
+   const char *to = json_string(json_get(args, "to"));
+   const char *radix = json_string(json_get(args, "radix")) ?: "default";
+   const char *cursor = json_string(json_get(args, "cursor"));
+   const json_t *paths = json_get(args, "paths");
+
+   int64_t trace_id = 0, limit = 100, from_fs = 0, to_fs = INT64_MAX;
+   json_as_int(json_get(args, "trace_id"), &trace_id);
+   json_as_int(json_get(args, "limit"), &limit);
+
+   if (from != NULL && !parse_sim_time(call, "from", from, &from_fs))
+      return false;
+   else if (to != NULL && !parse_sim_time(call, "to", to, &to_fs))
+      return false;
+
+   LOCAL_TEXT_BUF req = tb_new();
+   json_writer_t w;
+   jw_init(&w, req);
+   jw_begin_object(&w);
+   jw_key(&w, "op");
+   jw_string(&w, "trace_get");
+   jw_key(&w, "trace_id");
+   jw_int(&w, trace_id);
+   jw_key(&w, "from_fs");
+   jw_int(&w, from_fs);
+   jw_key(&w, "to_fs");
+   jw_int(&w, to_fs);
+   jw_key(&w, "limit");
+   jw_int(&w, limit);
+   jw_key(&w, "radix");
+   jw_string(&w, radix);
+   if (cursor != NULL) {
+      jw_key(&w, "cursor");
+      jw_string(&w, cursor);
+   }
+   if (paths != NULL) {
+      jw_key(&w, "paths");
+      jw_begin_array(&w);
+      for (size_t i = 0; i < paths->array.count; i++)
+         jw_string(&w, paths->array.items[i]->string.chars);
+      jw_end_array(&w);
+   }
+   jw_end_object(&w);
+
+   return sim_op(call, sim_id, req, 10000, out);
+}
+
+static const char trace_stop_input[] = MCP_JSON({
+   "type": "object",
+   "properties": {
+      "sim_id": { "type": "string", "minLength": 32, "maxLength": 32 },
+      "trace_id": { "type": "integer", "minimum": 1 }
+   },
+   "required": ["sim_id", "trace_id"],
+   "additionalProperties": false
+});
+
+static const char trace_stop_output[] = MCP_JSON({
+   "type": "object",
+   "properties": {
+      "stopped": { "type": "boolean" },
+      "trace_id": { "type": "integer" },
+      "changes_kept": { "type": "integer" },
+      "changes_dropped": { "type": "integer" }
+   },
+   "required": ["stopped", "trace_id", "changes_kept", "changes_dropped"]
+});
+
+static const char trace_stop_example[] = MCP_JSON({
+   "sim_id": "0123456789abcdef0123456789abcdef", "trace_id": 1
+});
+
+static bool tool_trace_stop(mcp_call_t *call, const json_t *args,
+                            json_writer_t *out)
+{
+   const char *sim_id = json_string(json_get(args, "sim_id"));
+
+   int64_t trace_id = 0;
+   json_as_int(json_get(args, "trace_id"), &trace_id);
+
+   LOCAL_TEXT_BUF req = tb_new();
+   json_writer_t w;
+   jw_init(&w, req);
+   jw_begin_object(&w);
+   jw_key(&w, "op");
+   jw_string(&w, "trace_stop");
+   jw_key(&w, "trace_id");
+   jw_int(&w, trace_id);
+   jw_end_object(&w);
+
+   return sim_op(call, sim_id, req, 10000, out);
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // Tool table
 
 static const mcp_tool_t sim_tools[] = {
@@ -1389,6 +1628,62 @@ static const mcp_tool_t sim_tools[] = {
       .destructive   = false,
       .idempotent    = true,
       .fn            = tool_signal_set,
+   },
+   {
+      .name          = "nvc_trace_start",
+      .title         = "Start recording signal changes",
+      .description   =
+         "Start recording the value changes of chosen signals in memory, "
+         "so that you can look back at what happened before a failure "
+         "without running the simulation again.  Start a trace before "
+         "nvc_sim_run: only changes after this call are kept (the current "
+         "values are recorded as the first entry).  The most recent "
+         "max_changes changes are kept and older ones are discarded; "
+         "dropped in nvc_trace_get says how many.  Values are those at the "
+         "end of each simulated time step, as in a waveform file.  Give "
+         "the paths of the signals or a pattern.  Read the recording with "
+         "nvc_trace_get.  At most 4 traces can be active.",
+      .input_schema  = trace_start_input,
+      .output_schema = trace_start_output,
+      .example       = trace_start_example,
+      .read_only     = false,
+      .destructive   = false,
+      .idempotent    = false,
+      .fn            = tool_trace_start,
+   },
+   {
+      .name          = "nvc_trace_get",
+      .title         = "Read recorded signal changes",
+      .description   =
+         "Read the changes recorded by nvc_trace_start, oldest first, "
+         "optionally between two simulated times.  Each entry is one "
+         "simulated time and lists the signals that changed then with their "
+         "new values, so a short window shows the lead-up to a failure "
+         "compactly.  oldest_time_fs is the time of the oldest change still "
+         "held and dropped counts older ones that were discarded: if what "
+         "you need is older, start a trace earlier or raise max_changes.  "
+         "Results are paged: pass next_cursor to get the next page.",
+      .input_schema  = trace_get_input,
+      .output_schema = trace_get_output,
+      .example       = trace_get_example,
+      .read_only     = true,
+      .destructive   = false,
+      .idempotent    = true,
+      .fn            = tool_trace_get,
+   },
+   {
+      .name          = "nvc_trace_stop",
+      .title         = "Stop a trace",
+      .description   =
+         "Stop recording and free the memory of a trace.  Nothing on disk "
+         "changes.",
+      .input_schema  = trace_stop_input,
+      .output_schema = trace_stop_output,
+      .example       = trace_stop_example,
+      .read_only     = false,
+      .destructive   = false,
+      .idempotent    = false,
+      .fn            = tool_trace_stop,
    },
 };
 

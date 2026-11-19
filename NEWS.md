@@ -6,7 +6,9 @@
   live simulations that can be stopped at the first failed assertion,
   inspected and forced (`nvc_sim_open`, `nvc_sim_run`, `nvc_design_list`,
   `nvc_design_search`, `nvc_signal_get`, `nvc_signal_set`,
-  `nvc_sim_close`).  Each call that loads a design runs in an isolated
+  `nvc_sim_close`), and record signal changes in a bounded in-memory
+  buffer to look back at what led to a failure (`nvc_trace_start`,
+  `nvc_trace_get`, `nvc_trace_stop`).  Each call that loads a design runs in an isolated
   worker process.
 - Code coverage can now be collected for package declarations and
   bodies, opted in via the new `+package` directive (or an existing

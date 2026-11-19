@@ -63,7 +63,15 @@
 
 #define CLAMP_INT(v, lo, hi) ((v) < (lo) ? (lo) : (v) > (hi) ? (hi) : (v))
 
+#define MAX_TRACES           4
+#define MAX_TRACE_SIGNALS    64
+#define MAX_TRACE_BYTES      256
+#define DEFAULT_TRACE_CHANGES 10000
+#define MAX_TRACE_CHANGES    500000
+#define TRACE_MEMORY_LIMIT   (64u << 20)
+
 typedef enum { OBJ_REGION, OBJ_SIGNAL } obj_kind_t;
+typedef struct _trace trace_t;
 
 typedef struct {
    obj_kind_t    kind;
@@ -104,6 +112,9 @@ typedef struct {
    bool          started;
    bool          ended;
    uint64_t      last_target;
+
+   trace_t      *traces[MAX_TRACES];
+   unsigned      next_trace_id;
 } worker_t;
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -828,6 +839,14 @@ static void op_list(worker_t *w, const json_t *req)
    ctl_send(w, tb);
 }
 
+// ident_glob does not accept an empty match for * and has no ?, so use
+// fnmatch.  A pattern without a slash is matched against the last path
+// component.
+static bool obj_matches(const design_obj_t *o, const char *glob, bool by_leaf)
+{
+   return fnmatch(glob, istr(by_leaf ? o->name : o->path), FNM_CASEFOLD) == 0;
+}
+
 static void op_search(worker_t *w, const json_t *req)
 {
    const char *pattern = json_string(json_get(req, "pattern"));
@@ -876,9 +895,7 @@ static void op_search(worker_t *w, const json_t *req)
       if (o->kind == OBJ_SIGNAL ? !want_signals : !want_regions)
          continue;
 
-      // ident_glob does not accept an empty match for * and has no ?
-      if (fnmatch(tb_get(glob), istr(by_leaf ? o->name : o->path),
-                  FNM_CASEFOLD) != 0)
+      if (!obj_matches(o, tb_get(glob), by_leaf))
          continue;
 
       if (seen++ < cursor || shown >= limit)
@@ -1180,6 +1197,486 @@ static void op_close(worker_t *w)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// Traces: a bounded record of signal changes
+//
+// Waveform files have to be asked for before a run.  A trace lets the
+// agent look back instead: it keeps the most recent changes of chosen
+// signals in a ring buffer, so what happened just before a failure can be
+// read without running again.  Values are those at the end of each time
+// step, as in a waveform dump.
+
+typedef struct {
+   trace_t  *trace;
+   unsigned  index;
+} trace_sig_t;
+
+struct _trace {
+   unsigned       id;
+   unsigned       nsigs;
+   design_obj_t **objs;
+   rt_watch_t   **watches;
+   trace_sig_t   *ctx;
+   uint8_t       *buf;
+   size_t         stride;
+   size_t         cap;
+   size_t         head;      // Total records written
+   size_t         count;     // Records held
+   size_t         dropped;   // Records overwritten
+};
+
+#define TRACE_HEADER 16   // time (8), signal (4), length (4)
+
+static void trace_record(trace_t *t, int64_t now, unsigned sig,
+                         const void *data, size_t size)
+{
+   uint8_t *rec = t->buf + (t->head % t->cap) * t->stride;
+
+   const uint32_t sig32 = sig, len32 = size;
+   memcpy(rec, &now, sizeof(now));
+   memcpy(rec + 8, &sig32, sizeof(sig32));
+   memcpy(rec + 12, &len32, sizeof(len32));
+   memcpy(rec + TRACE_HEADER, data, MIN(size, t->stride - TRACE_HEADER));
+
+   t->head++;
+   if (t->count < t->cap)
+      t->count++;
+   else
+      t->dropped++;
+}
+
+static void trace_event_cb(uint64_t now, rt_signal_t *s, rt_watch_t *w,
+                           void *user)
+{
+   trace_sig_t *ctx = user;
+   trace_record(ctx->trace, now, ctx->index, signal_value(s), s->shared.size);
+}
+
+static void trace_free(worker_t *w, trace_t *t)
+{
+   for (unsigned i = 0; i < t->nsigs; i++)
+      watch_free(w->model, t->watches[i]);
+
+   free(t->objs);
+   free(t->watches);
+   free(t->ctx);
+   free(t->buf);
+   free(t);
+}
+
+static print_flags_t radix_flags(const char *radix)
+{
+   if (!strcmp(radix, "hex"))
+      return PRINT_F_HEX;
+   else if (!strcmp(radix, "bin"))
+      return PRINT_F_BIN;
+   else if (!strcmp(radix, "dec"))
+      return PRINT_F_DEC;
+   else
+      return 0;
+}
+
+static void format_raw(worker_t *w, design_obj_t *o, const void *data,
+                       size_t size, const char *radix, text_buf_t *out)
+{
+   type_t type = tree_type(o->signal->where);
+   const char *printed = print_raw(o->printer, data, size, radix_flags(radix));
+
+   if (!type_is_character_array(type)
+       || !format_vector(printed, signal_width(o->signal), type_pp(type),
+                         radix, out))
+      tb_cat(out, printed);
+}
+
+static trace_t *find_trace(worker_t *w, int64_t id)
+{
+   for (unsigned i = 0; i < MAX_TRACES; i++) {
+      if (w->traces[i] != NULL && (int64_t)w->traces[i]->id == id)
+         return w->traces[i];
+   }
+
+   return NULL;
+}
+
+static void trace_not_found(worker_t *w, int64_t id)
+{
+   LOCAL_TEXT_BUF active = tb_new();
+   unsigned n = 0;
+   for (unsigned i = 0; i < MAX_TRACES; i++) {
+      if (w->traces[i] != NULL)
+         tb_printf(active, "%s%u", n++ ? ", " : "", w->traces[i]->id);
+   }
+
+   reply_error(w, "Trace %"PRIi64" does not exist. Active traces: %s. Start "
+               "one with nvc_trace_start", id, n > 0 ? tb_get(active) : "none");
+}
+
+static void op_trace_start(worker_t *w, const json_t *req)
+{
+   const json_t *paths = json_get(req, "paths");
+   const char *pattern = json_string(json_get(req, "pattern"));
+
+   int64_t max_changes = DEFAULT_TRACE_CHANGES;
+   json_as_int(json_get(req, "max_changes"), &max_changes);
+   max_changes = CLAMP_INT(max_changes, 100, MAX_TRACE_CHANGES);
+
+   unsigned slot = 0;
+   while (slot < MAX_TRACES && w->traces[slot] != NULL)
+      slot++;
+
+   if (slot == MAX_TRACES) {
+      reply_error(w, "%d traces are already active. Stop one with "
+                  "nvc_trace_stop first", MAX_TRACES);
+      return;
+   }
+
+   design_obj_t *picked[MAX_TRACE_SIGNALS];
+   size_t npicked = 0;
+   size_t matches = 0;
+
+   if (json_is(paths, JSON_ARRAY)) {
+      for (size_t i = 0; i < paths->array.count; i++) {
+         const char *path = json_string(paths->array.items[i]);
+         design_obj_t *o = path ? find_obj(w, path) : NULL;
+
+         if (o == NULL) {
+            LOCAL_TEXT_BUF hint = tb_new();
+            suggest_paths(w, path ?: "", hint);
+            reply_error(w, "Signal '%s' was not found%s", path ?: "",
+                        tb_get(hint));
+            return;
+         }
+         else if (o->kind != OBJ_SIGNAL) {
+            reply_error(w, "'%s' is a region, not a signal", path);
+            return;
+         }
+
+         bool seen = false;
+         for (size_t j = 0; j < npicked; j++)
+            seen |= picked[j] == o;
+
+         matches++;
+         if (!seen && npicked < MAX_TRACE_SIGNALS)
+            picked[npicked++] = o;
+      }
+   }
+   else if (pattern != NULL) {
+      LOCAL_TEXT_BUF glob = tb_new();
+      tb_cat(glob, pattern);
+      tb_downcase(glob);
+      const bool by_leaf = strchr(pattern, '/') == NULL;
+
+      for (size_t i = 0; i < w->nobjs; i++) {
+         design_obj_t *o = &(w->objs[i]);
+         if (o->kind == OBJ_SIGNAL && obj_matches(o, tb_get(glob), by_leaf)) {
+            matches++;
+            if (npicked < MAX_TRACE_SIGNALS)
+               picked[npicked++] = o;
+         }
+      }
+   }
+   else {
+      reply_error(w, "Give paths or a pattern: the signals to record");
+      return;
+   }
+
+   if (matches == 0) {
+      reply_error(w, "No signal matches. Find signals with nvc_design_search");
+      return;
+   }
+   else if (matches > MAX_TRACE_SIGNALS) {
+      reply_error(w, "%zu signals match but at most %d can be traced at "
+                  "once. Narrow the pattern or list the paths you need",
+                  matches, MAX_TRACE_SIGNALS);
+      return;
+   }
+
+   size_t maxbytes = 0;
+   for (size_t i = 0; i < npicked; i++) {
+      design_obj_t *o = picked[i];
+      const size_t bytes = o->signal->shared.size;
+
+      if (bytes > MAX_TRACE_BYTES) {
+         reply_error(w, "Signal '%s' is too wide to trace (%zu bytes, the "
+                     "limit is %d). Trace a narrower signal", istr(o->path),
+                     bytes, MAX_TRACE_BYTES);
+         return;
+      }
+      else if (!obj_printer(w, o)) {
+         reply_error(w, "Signals of type %s cannot be displayed",
+                     type_pp(tree_type(o->signal->where)));
+         return;
+      }
+
+      maxbytes = MAX(maxbytes, bytes);
+   }
+
+   trace_t *t = xcalloc(sizeof(trace_t));
+   t->id      = ++w->next_trace_id;
+   t->nsigs   = npicked;
+   t->stride  = TRACE_HEADER + ((maxbytes + 7) & ~(size_t)7);
+   t->cap     = MIN((size_t)max_changes, TRACE_MEMORY_LIMIT / t->stride);
+   t->objs    = xmalloc_array(npicked, sizeof(design_obj_t *));
+   t->watches = xmalloc_array(npicked, sizeof(rt_watch_t *));
+   t->ctx     = xmalloc_array(npicked, sizeof(trace_sig_t));
+   t->buf     = xmalloc(t->cap * t->stride);
+
+   const int64_t now = model_now(w->model, NULL);
+
+   for (size_t i = 0; i < npicked; i++) {
+      t->objs[i] = picked[i];
+      t->ctx[i] = (trace_sig_t){ t, i };
+
+      rt_signal_t *s = picked[i]->signal;
+      t->watches[i] = watch_new(w->model, trace_event_cb, &(t->ctx[i]),
+                                WATCH_POSTPONED, 1);
+      model_set_event_cb(w->model, s, 0, signal_width(s), t->watches[i]);
+
+      // The starting value, so the record is complete from here
+      trace_record(t, now, i, signal_value(s), s->shared.size);
+   }
+
+   w->traces[slot] = t;
+
+   char timestr[32];
+   format_time(now, timestr, sizeof(timestr));
+
+   LOCAL_TEXT_BUF tb = tb_new();
+   json_writer_t jw;
+   jw_init(&jw, tb);
+   begin_reply(&jw, true);
+   jw_key(&jw, "result");
+   jw_begin_object(&jw);
+   jw_key(&jw, "trace_id");
+   jw_int(&jw, t->id);
+   jw_key(&jw, "signals");
+   jw_begin_array(&jw);
+   for (size_t i = 0; i < npicked; i++)
+      jw_string(&jw, istr(picked[i]->path));
+   jw_end_array(&jw);
+   jw_key(&jw, "capacity");
+   jw_int(&jw, t->cap);
+   jw_key(&jw, "started_fs");
+   jw_int(&jw, now);
+   jw_key(&jw, "started");
+   jw_string(&jw, timestr);
+   jw_end_object(&jw);
+   jw_end_object(&jw);
+   ctl_send(w, tb);
+}
+
+static void op_trace_stop(worker_t *w, const json_t *req)
+{
+   int64_t id = 0;
+   json_as_int(json_get(req, "trace_id"), &id);
+
+   trace_t *t = find_trace(w, id);
+   if (t == NULL) {
+      trace_not_found(w, id);
+      return;
+   }
+
+   for (unsigned i = 0; i < MAX_TRACES; i++) {
+      if (w->traces[i] == t)
+         w->traces[i] = NULL;
+   }
+
+   const size_t kept = t->count, dropped = t->dropped;
+   trace_free(w, t);
+
+   LOCAL_TEXT_BUF tb = tb_new();
+   json_writer_t jw;
+   jw_init(&jw, tb);
+   begin_reply(&jw, true);
+   jw_key(&jw, "result");
+   jw_begin_object(&jw);
+   jw_key(&jw, "stopped");
+   jw_bool(&jw, true);
+   jw_key(&jw, "trace_id");
+   jw_int(&jw, id);
+   jw_key(&jw, "changes_kept");
+   jw_int(&jw, kept);
+   jw_key(&jw, "changes_dropped");
+   jw_int(&jw, dropped);
+   jw_end_object(&jw);
+   jw_end_object(&jw);
+   ctl_send(w, tb);
+}
+
+static void op_trace_get(worker_t *w, const json_t *req)
+{
+   int64_t id = 0, from_fs = 0, to_fs = INT64_MAX, limit = 100, cursor = 0;
+   json_as_int(json_get(req, "trace_id"), &id);
+   json_as_int(json_get(req, "from_fs"), &from_fs);
+   json_as_int(json_get(req, "to_fs"), &to_fs);
+   json_as_int(json_get(req, "limit"), &limit);
+   limit = CLAMP_INT(limit, 1, 500);
+
+   const char *cursor_str = json_string(json_get(req, "cursor"));
+   if (cursor_str != NULL)
+      cursor = MAX(strtoll(cursor_str, NULL, 10), 0);
+
+   const char *radix = json_string(json_get(req, "radix")) ?: "default";
+   const json_t *only = json_get(req, "paths");
+
+   trace_t *t = find_trace(w, id);
+   if (t == NULL) {
+      trace_not_found(w, id);
+      return;
+   }
+
+   // Which of the traced signals to show
+   bool *show = xcalloc_array(t->nsigs, sizeof(bool));
+   if (json_is(only, JSON_ARRAY)) {
+      for (size_t i = 0; i < only->array.count; i++) {
+         const char *path = json_string(only->array.items[i]);
+         design_obj_t *o = path ? find_obj(w, path) : NULL;
+
+         bool found = false;
+         for (unsigned j = 0; o != NULL && j < t->nsigs; j++) {
+            if (t->objs[j] == o) {
+               show[j] = true;
+               found = true;
+            }
+         }
+
+         if (!found) {
+            LOCAL_TEXT_BUF recorded = tb_new();
+            for (unsigned j = 0; j < t->nsigs && j < 10; j++)
+               tb_printf(recorded, "%s%s", j > 0 ? ", " : "",
+                         istr(t->objs[j]->path));
+            if (t->nsigs > 10)
+               tb_cat(recorded, ", ...");
+
+            reply_error(w, "Signal '%s' is not part of trace %"PRIi64". It "
+                        "records: %s", path ?: "", id, tb_get(recorded));
+            free(show);
+            return;
+         }
+      }
+   }
+   else {
+      for (unsigned j = 0; j < t->nsigs; j++)
+         show[j] = true;
+   }
+
+   LOCAL_TEXT_BUF tb = tb_new();
+   json_writer_t jw;
+   jw_init(&jw, tb);
+   begin_reply(&jw, true);
+   jw_key(&jw, "result");
+   jw_begin_object(&jw);
+   jw_key(&jw, "trace_id");
+   jw_int(&jw, id);
+   jw_key(&jw, "changes");
+   jw_begin_array(&jw);
+
+   // Records come oldest first.  Those with the same time are one entry,
+   // showing the last value each signal took at that time.
+   const size_t first = t->head - t->count;
+   int64_t group_time = -1;
+   int64_t groups = 0, shown = 0;
+   int64_t oldest = -1;
+
+   size_t *latest = xmalloc_array(t->nsigs, sizeof(size_t));
+   bool *have = xcalloc_array(t->nsigs, sizeof(bool));
+   bool open = false;
+
+   for (size_t n = 0; n <= t->count; n++) {
+      int64_t time = INT64_MAX;
+      uint32_t sig = 0;
+      const uint8_t *rec = NULL;
+      bool wanted = false;
+
+      if (n < t->count) {
+         rec = t->buf + ((first + n) % t->cap) * t->stride;
+         memcpy(&time, rec, sizeof(time));
+         memcpy(&sig, rec + 8, sizeof(sig));
+         if (oldest < 0)
+            oldest = time;
+
+         wanted = show[sig] && time >= from_fs && time <= to_fs;
+      }
+
+      // A different time (or the end) closes the entry being built
+      if (open && (n == t->count || (wanted && time != group_time))) {
+         if (groups >= cursor && shown < limit) {
+            char timestr[32];
+            format_time(group_time, timestr, sizeof(timestr));
+
+            jw_begin_object(&jw);
+            jw_key(&jw, "time_fs");
+            jw_int(&jw, group_time);
+            jw_key(&jw, "time");
+            jw_string(&jw, timestr);
+            jw_key(&jw, "values");
+            jw_begin_object(&jw);
+            for (unsigned j = 0; j < t->nsigs; j++) {
+               if (!have[j])
+                  continue;
+
+               const uint8_t *r = t->buf + latest[j] * t->stride;
+               uint32_t len;
+               memcpy(&len, r + 12, sizeof(len));
+
+               LOCAL_TEXT_BUF value = tb_new();
+               format_raw(w, t->objs[j], r + TRACE_HEADER, len, radix, value);
+
+               jw_key(&jw, istr(t->objs[j]->path));
+               jw_string(&jw, tb_get(value));
+            }
+            jw_end_object(&jw);
+            jw_end_object(&jw);
+            shown++;
+         }
+
+         groups++;
+         open = false;
+         memset(have, 0, t->nsigs * sizeof(bool));
+      }
+
+      if (!wanted)
+         continue;
+
+      if (!open) {
+         open = true;
+         group_time = time;
+      }
+
+      latest[sig] = (first + n) % t->cap;
+      have[sig] = true;
+   }
+
+   jw_end_array(&jw);
+   jw_key(&jw, "total");
+   jw_int(&jw, groups);
+   jw_key(&jw, "truncated");
+   jw_bool(&jw, cursor + shown < groups);
+   if (cursor + shown < groups) {
+      char *next = cursor_string(cursor + shown);
+      jw_key(&jw, "next_cursor");
+      jw_string(&jw, next);
+      free(next);
+   }
+
+   jw_key(&jw, "dropped");
+   jw_int(&jw, t->dropped);
+   jw_key(&jw, "oldest_time_fs");
+   if (oldest < 0)
+      jw_null(&jw);
+   else
+      jw_int(&jw, oldest);
+   write_state(w, &jw);
+   jw_end_object(&jw);
+   jw_end_object(&jw);
+
+   ctl_send(w, tb);
+
+   free(latest);
+   free(have);
+   free(show);
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // Entry point
 
 int mcp_worker_main(rt_model_t *m, tree_t top, int ctl_fd)
@@ -1266,6 +1763,12 @@ int mcp_worker_main(rt_model_t *m, tree_t top, int ctl_fd)
          op_get(&w, req);
       else if (!strcmp(op, "set"))
          op_set(&w, req);
+      else if (!strcmp(op, "trace_start"))
+         op_trace_start(&w, req);
+      else if (!strcmp(op, "trace_get"))
+         op_trace_get(&w, req);
+      else if (!strcmp(op, "trace_stop"))
+         op_trace_stop(&w, req);
       else if (!strcmp(op, "close")) {
          op_close(&w);
          pool_free(mp);
