@@ -483,6 +483,105 @@ Incertitudes de ma part:
 - Le comportement sous Windows n'a pas été regardé (socketpair, `exec` de
   `/proc/self/exe`).
 
+## 7. Processus longs et LLM: état de l'art
+
+Question: comment le LLM voit l'état d'une simulation longue et en
+apprend la fin sans interroger en boucle? Lectures du 19 novembre 2026,
+sources en fin de document. Rien de ce qui suit n'a été testé avec un vrai
+client MCP.
+
+### 7.1 Ce que dit le protocole
+
+| Mécanisme | Ce qu'il apporte | Limites |
+|---|---|---|
+| `notifications/progress` | Progression d'un appel en cours, avec un message lisible | Liée à une requête en cours, s'arrête à sa fin. La spécification ne dit pas si le modèle la voit: c'est laissé à l'application hôte |
+| Extension tâches (`io.modelcontextprotocol/tasks`, 2026-07-28) | Le serveur répond `resultType: "task"` avec un `taskId`, le client interroge `tasks/get`, annule par `tasks/cancel`. `statusMessage` (peut être montré à l'utilisateur ou au modèle) décrit l'avancement. `notifications/tasks` via `subscriptions/listen` | Interrogation pure, sans attente longue ni délai (`pollIntervalMs` seulement). Pas de `tasks/list`. La survie à un redémarrage du serveur n'est pas définie. Aucune notification de progression sur une tâche: seul `statusMessage` l'exprime |
+| `subscriptions/listen` | Pousse `list_changed`, `resources/updated` et les tâches suivies | La spécification ne dit pas que le modèle en est informé |
+
+Le serveur décide pour chaque requête s'il répond par une tâche, mais
+seulement si le client a déclaré l'extension; une erreur tool reste un
+résultat `completed` avec `isError: true`.
+
+### 7.2 Ce que font les clients (Claude Code, d'après sa documentation)
+
+- **Tâches MCP en bêta publique** depuis Claude Code 2.1.304: l'appel rend la
+  main quand le serveur accepte le travail, une relève toutes les 2 s par
+  défaut (bornée à 250-30 000 ms), un panneau `/tasks`, annulation depuis ce
+  panneau. Pas dans VS Code ni l'application de bureau. Une tâche d'un
+  serveur stdio s'arrête avec le processus de Claude Code. La matrice de
+  clients de modelcontextprotocol.io a une colonne Tasks vide pour tous les
+  clients: elle n'est pas à jour ou non définie, ne pas la lire comme un non.
+- **Mise en arrière-plan automatique d'un appel MCP ordinaire**: un appel
+  encore en cours après 2 minutes (`CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS`, 0
+  pour désactiver) devient une tâche de fond; le modèle reçoit un
+  identifiant, continue de travailler et reçoit le résultat comme
+  notification. C'est, aujourd'hui et sans rien changer au serveur, le seul
+  mécanisme documenté qui réveille le modèle à la fin d'un appel long. Il ne
+  vaut pas pour les sous-agents, les exécutions non interactives, ni les
+  appels qui attendent une saisie.
+- **Délais**: limite par appel `timeout` du serveur (dure, la progression ne
+  la repousse pas), `MCP_TOOL_TIMEOUT` (environ 28 h si absent), délai
+  d'inactivité de 30 min en stdio (la progression compte comme activité).
+- **Sortie**: 25 000 jetons par défaut (`MAX_MCP_OUTPUT_TOKENS`), au-delà le
+  résultat est écrit dans un fichier.
+- **Canaux (« channels »)**, aperçu de recherche: un serveur MCP pousse
+  `notifications/claude/channel` dans la session, le modèle le reçoit comme
+  une balise `<channel>`, et le même serveur peut exposer des outils. Il faut
+  `--channels`, une liste d'autorisation (un canal personnalisé exige
+  `--dangerously-load-development-channels`, interactif seulement, ignoré
+  avec `-p` et le SDK), une authentification claude.ai ou Console, et la
+  politique de l'organisation. Des rapports signalent des événements mis en
+  tampon plutôt que réveillant une session inactive. Un serveur qui négocie
+  la révision 2026-07-28 n'est pas enregistré comme canal (il faut le forcer
+  en négociation ancienne). Propre à Claude Code et instable.
+
+### 7.3 Ce que font les agents en général
+
+Le schéma dominant: l'outil rend une **poignée tout de suite**, le travail
+continue, et le résultat arrive par **interrogation, source de vérité**, avec
+la **poussée en optimisation**. Quand on pousse, l'événement est injecté dans
+le contexte de l'agent pour le réveiller. Les mises en garde reviennent:
+idempotence des relances, état durable après un plantage, et le lien entre
+l'événement et l'appel d'origine à rétablir soi-même.
+
+### 7.4 Ce que cela implique pour nvc
+
+Aujourd'hui `nvc_sim_run` est un appel bloquant et borné: il marche partout
+mais le LLM ne voit rien pendant qu'il attend, et une simulation ne peut pas
+avancer entre deux appels. Conception proposée, par couches, la première
+suffisant à tous les clients:
+
+1. **Un run de fond côté worker** (portable). `nvc_sim_run` accepte
+   `background: true` et rend tout de suite; le worker continue et, entre deux
+   tranches, répond à des requêtes en lecture. Nouveaux outils:
+   - `nvc_sim_status`: ne bloque jamais. État (`running`, `paused`,
+     `finished`, `terminated`), temps simulé, temps réel écoulé, débit (fs
+     simulées par seconde réelle) et temps restant estimé si une cible existe,
+     compteurs de messages, derniers messages.
+   - `nvc_sim_wait`: attente longue bornée (30 s au plus) qui rend la main à
+     la fin du run, au premier message de la sévérité demandée ou après le
+     délai. Une seule requête remplace une boucle d'interrogation, sans
+     jetons entre deux.
+   - Un **journal d'événements numérotés** (`since_seq`): rien n'est perdu si
+     le LLM interroge tard, ce qui rend l'interrogation fiable et sans doublon.
+   - `nvc_signal_get`, `nvc_design_*`, `nvc_trace_get` et `nvc_signal_set`
+     restent utilisables pendant un run, et leur résultat porte l'état courant.
+2. **Tâches MCP** pour les clients qui les déclarent: `nvc_sim_run` en fond
+   répond `resultType: "task"`, avec `statusMessage` du genre « 3,2 ms sur
+   10 ms, 2 erreurs, dernière: counter reached five », ce qui rend l'état
+   visible sans outil supplémentaire. `tasks/cancel` arrête le run, et
+   `notifications/tasks` complète la relève. À prévoir: la tâche vit et
+   meurt avec le worker.
+3. **Mise en arrière-plan de Claude Code**: un `nvc_sim_wait` plus long que
+   le seuil de 2 minutes devient une tâche de fond et son résultat réveille le
+   modèle. À vérifier avant de compter dessus.
+4. **Canaux**, en dernier et facultatif: seulement si l'essai montre que les
+   couches précédentes ne suffisent pas.
+
+La survie d'un run à la mort du worker, du serveur ou du client reste
+l'affaire des checkpoints (`PLAN.md` §1): ni les tâches MCP (processus stdio)
+ni le run de fond n'y répondent.
+
 ## Références
 
 - Spécification MCP 2026-07-28, changements:
@@ -505,3 +604,20 @@ Incertitudes de ma part:
   <https://www.anthropic.com/engineering/writing-tools-for-agents>
 - Serveurs MCP de simulation existants, exemple Verilator:
   <https://glama.ai/mcp/servers/@ssql2014/verilator-mcp/blob/dbddace3ea4c502f6f4b0731dfe074d96ca29c2f/README.md>
+- Extension tâches, spécification normative:
+  <https://github.com/modelcontextprotocol/ext-tasks/blob/main/specification/2026-07-28/tasks.md>
+- Abonnements:
+  <https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/subscriptions>
+- Progression:
+  <https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/progress>
+- Matrice de clients des extensions:
+  <https://modelcontextprotocol.io/extensions/client-matrix>
+- Claude Code, serveurs MCP (délais, tâches, arrière-plan):
+  <https://code.claude.com/docs/en/mcp>
+- Claude Code, canaux: <https://code.claude.com/docs/en/channels> et
+  <https://code.claude.com/docs/en/channels-reference>
+- Rapports sur des canaux qui ne réveillent pas une session inactive:
+  <https://claudeissues.com/issue/38027-mcp-channel-notifications-should-wake-the-model-for-real-time-messaging>,
+  <https://claudeissues.com/issue/63452-channel-notifications-notifications-claude-channel-buffered-instead-of-injected>
+- Schémas d'agents asynchrones: <https://tianpan.co/blog/2026/03/07/async-agent-workflows-long-running-task-design>
+  et <https://mastra.ai/docs/long-running-agents/background-tasks>
