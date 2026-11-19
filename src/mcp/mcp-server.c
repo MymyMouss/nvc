@@ -861,9 +861,6 @@ static void wait_for(mcp_server_t *srv, const int *fds, size_t nfds,
    for (size_t i = 0; i < nfds; i++)
       ready[i] = false;
 
-   if (n == 0)
-      return;
-
    const int rc = poll(pfd, n, timeout_ms);
    if (rc < 0) {
       if (errno != EINTR)

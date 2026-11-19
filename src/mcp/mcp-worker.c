@@ -113,6 +113,23 @@ typedef struct {
    bool          ended;
    uint64_t      last_target;
 
+   // The run in progress, advanced one slice at a time between requests
+   struct {
+      bool      active;
+      bool      background;
+      bool      progress;
+      uint64_t  start_us;
+      uint64_t  last_progress_us;
+      uint64_t  stop;
+      int64_t   max_wall_ms;     // Zero for no limit
+      int64_t   start_fs;
+      unsigned  slice;
+   } run;
+
+   const char   *last_reason;    // Why the previous run stopped
+   int64_t       last_wall_ms;
+   uint64_t      msg_base;       // Sequence number of msgs[0]
+
    trace_t      *traces[MAX_TRACES];
    unsigned      next_trace_id;
 } worker_t;
@@ -469,6 +486,8 @@ static void worker_diag(diag_t *d, void *context)
 
 static void reset_messages(worker_t *w)
 {
+   w->msg_base += w->nmsgs + w->nmsgs_dropped;
+
    for (size_t i = 0; i < w->nmsgs; i++)
       free(w->msgs[i]);
 
@@ -479,13 +498,19 @@ static void reset_messages(worker_t *w)
    w->pause_requested = false;
 }
 
-static void write_messages(worker_t *w, json_writer_t *jw)
+static void write_messages_since(worker_t *w, json_writer_t *jw,
+                                 uint64_t since)
 {
    jw_key(jw, "messages");
    jw_begin_array(jw);
-   for (size_t i = 0; i < w->nmsgs; i++)
-      jw_raw(jw, w->msgs[i]);
+   for (size_t i = 0; i < w->nmsgs; i++) {
+      if (w->msg_base + i >= since)
+         jw_raw(jw, w->msgs[i]);
+   }
    jw_end_array(jw);
+
+   jw_key(jw, "next_seq");
+   jw_int(jw, w->msg_base + w->nmsgs + w->nmsgs_dropped);
 
    jw_key(jw, "messages_truncated");
    jw_bool(jw, w->nmsgs_dropped > 0);
@@ -501,6 +526,11 @@ static void write_messages(worker_t *w, json_writer_t *jw)
    jw_key(jw, "failure");
    jw_int(jw, w->counts[DIAG_FAILURE] + w->counts[DIAG_FATAL]);
    jw_end_object(jw);
+}
+
+static void write_messages(worker_t *w, json_writer_t *jw)
+{
+   write_messages_since(w, jw, 0);
 }
 
 static void capture_output(worker_t *w)
@@ -588,122 +618,27 @@ static void write_state(worker_t *w, json_writer_t *jw)
       jw_int(jw, next);
 }
 
-static bool cancel_requested(worker_t *w)
+static void send_progress(worker_t *w)
 {
-   char *line;
-   bool cancel = false;
-
-   while ((line = ctl_read_line(w, 0)) != NULL) {
-      if (strstr(line, "\"cancel\"") != NULL)
-         cancel = true;
-      free(line);
-   }
-
-   return cancel || w->eof;
+   LOCAL_TEXT_BUF tb = tb_new();
+   json_writer_t jw;
+   jw_init(&jw, tb);
+   jw_begin_object(&jw);
+   jw_key(&jw, "event");
+   jw_string(&jw, "progress");
+   jw_key(&jw, "now_fs");
+   jw_int(&jw, model_now(w->model, NULL));
+   jw_end_object(&jw);
+   ctl_send(w, tb);
 }
 
-static void op_run(worker_t *w, const json_t *req)
+static void run_finish(worker_t *w, const char *reason)
 {
-   int64_t max_wall_ms = 10000, until_fs = -1, duration_fs = -1;
-   json_as_int(json_get(req, "max_wall_ms"), &max_wall_ms);
-   json_as_int(json_get(req, "until_fs"), &until_fs);
-   json_as_int(json_get(req, "duration_fs"), &duration_fs);
-
-   // A duration counts from the end of the previous run, not from the
-   // time of the last event, so two runs of 100 ns advance 200 ns
-   int64_t stop_fs = until_fs;
-   if (duration_fs >= 0) {
-      const int64_t base = MAX((int64_t)w->last_target,
-                               model_now(w->model, NULL));
-      stop_fs = duration_fs > INT64_MAX - base ? INT64_MAX : base + duration_fs;
-   }
-
-   bool progress = false;
-   json_as_bool(json_get(req, "progress"), &progress);
-
-   const char *pause = json_string(json_get(req, "pause_on"));
-   w->pause_level = DIAG_FATAL + 1;
-   if (pause != NULL) {
-      if (!strcmp(pause, "note"))         w->pause_level = DIAG_NOTE;
-      else if (!strcmp(pause, "warning")) w->pause_level = DIAG_WARN;
-      else if (!strcmp(pause, "error"))   w->pause_level = DIAG_ERROR;
-      else if (!strcmp(pause, "failure")) w->pause_level = DIAG_FAILURE;
-   }
-
-   reset_messages(w);
-
-   const uint64_t stop = stop_fs < 0 ? (uint64_t)INT64_MAX : (uint64_t)stop_fs;
-
-   const uint64_t start_us = get_timestamp_us();
-   uint64_t last_progress_us = start_us;
-
-   if (!w->started) {
-      w->started = true;
-      model_start(w->model);
-   }
-
-   const char *reason = NULL;
-   unsigned slice = 16;
-
-   for (;;) {
-      if (model_is_terminated(w->model)) {
-         reason = "terminated";
-         break;
-      }
-      else if (w->pause_requested) {
-         reason = "severity";
-         break;
-      }
-      else if (cancel_requested(w)) {
-         reason = "cancelled";
-         break;
-      }
-
-      const uint64_t now_us = get_timestamp_us();
-      if ((int64_t)((now_us - start_us) / 1000) >= max_wall_ms) {
-         reason = "wall_budget";
-         break;
-      }
-
-      if (progress && now_us - last_progress_us >= PROGRESS_PERIOD_US) {
-         LOCAL_TEXT_BUF tb = tb_new();
-         json_writer_t jw;
-         jw_init(&jw, tb);
-         jw_begin_object(&jw);
-         jw_key(&jw, "event");
-         jw_string(&jw, "progress");
-         jw_key(&jw, "now_fs");
-         jw_int(&jw, model_now(w->model, NULL));
-         jw_end_object(&jw);
-         ctl_send(w, tb);
-
-         last_progress_us = now_us;
-      }
-
-      const bool done = model_run_cycles(w->model, stop, slice,
-                                         &w->pause_requested);
-
-      // Aim for slices short enough to notice a cancellation promptly
-      const uint64_t took = get_timestamp_us() - now_us;
-      if (took < SLICE_TARGET_US / 4 && slice < (1u << 20))
-         slice *= 2;
-      else if (took > SLICE_TARGET_US * 2 && slice > 1)
-         slice /= 2;
-
-      if (done) {
-         if (model_is_terminated(w->model))
-            reason = "terminated";
-         else if (model_is_finished(w->model))
-            reason = "finished";
-         else
-            reason = "time";
-         break;
-      }
-   }
+   const uint64_t wall_ms = (get_timestamp_us() - w->run.start_us) / 1000;
 
    // Only a run that reached its target moves the reference point for
    // the next relative duration beyond the time actually simulated
-   w->last_target = !strcmp(reason, "time") ? stop
+   w->last_target = !strcmp(reason, "time") ? w->run.stop
       : (uint64_t)model_now(w->model, NULL);
 
    if (!w->ended && (!strcmp(reason, "finished")
@@ -712,6 +647,13 @@ static void op_run(worker_t *w, const json_t *req)
       if (!model_is_terminated(w->model))
          model_end(w->model);
    }
+
+   w->run.active = false;
+   w->last_reason = reason;
+   w->last_wall_ms = wall_ms;
+
+   if (w->run.background)
+      return;   // Read later with the status operation
 
    LOCAL_TEXT_BUF tb = tb_new();
    json_writer_t jw;
@@ -724,7 +666,7 @@ static void op_run(worker_t *w, const json_t *req)
    jw_string(&jw, reason);
    write_state(w, &jw);
    jw_key(&jw, "wall_ms");
-   jw_int(&jw, (get_timestamp_us() - start_us) / 1000);
+   jw_int(&jw, wall_ms);
    if (model_is_terminated(w->model)) {
       jw_key(&jw, "exit_status");
       jw_int(&jw, model_exit_status(w->model));
@@ -744,7 +686,8 @@ static void op_run(worker_t *w, const json_t *req)
       else
          hint = "The real time limit was reached with the design still "
             "running. Call nvc_sim_run again to continue, or give duration "
-            "or until to stop at a chosen simulated time.";
+            "or until to stop at a chosen simulated time. For a long run "
+            "use background true and follow it with nvc_sim_wait.";
    }
    else if (!strcmp(reason, "severity"))
       hint = "Stopped at the first message of the requested severity: read "
@@ -764,6 +707,203 @@ static void op_run(worker_t *w, const json_t *req)
    jw_end_object(&jw);
    jw_end_object(&jw);
 
+   ctl_send(w, tb);
+}
+
+// Advance the run by one short slice of work
+static void run_step(worker_t *w)
+{
+   if (model_is_terminated(w->model))
+      return run_finish(w, "terminated");
+   else if (w->pause_requested)
+      return run_finish(w, "severity");
+
+   const uint64_t now_us = get_timestamp_us();
+   if (w->run.max_wall_ms > 0
+       && (int64_t)((now_us - w->run.start_us) / 1000) >= w->run.max_wall_ms)
+      return run_finish(w, "wall_budget");
+
+   if (w->run.progress && now_us - w->run.last_progress_us
+       >= PROGRESS_PERIOD_US) {
+      send_progress(w);
+      w->run.last_progress_us = now_us;
+   }
+
+   const bool done = model_run_cycles(w->model, w->run.stop, w->run.slice,
+                                      &w->pause_requested);
+
+   // Aim for slices short enough to notice a cancellation promptly
+   const uint64_t took = get_timestamp_us() - now_us;
+   if (took < SLICE_TARGET_US / 4 && w->run.slice < (1u << 20))
+      w->run.slice *= 2;
+   else if (took > SLICE_TARGET_US * 2 && w->run.slice > 1)
+      w->run.slice /= 2;
+
+   if (done) {
+      if (model_is_terminated(w->model))
+         run_finish(w, "terminated");
+      else if (model_is_finished(w->model))
+         run_finish(w, "finished");
+      else
+         run_finish(w, "time");
+   }
+}
+
+static void op_run(worker_t *w, const json_t *req)
+{
+   if (w->run.active) {
+      reply_error(w, "A run is already in progress: wait for it with "
+                  "nvc_sim_wait or end it with nvc_sim_stop");
+      return;
+   }
+
+   int64_t max_wall_ms = 10000, until_fs = -1, duration_fs = -1;
+   json_as_int(json_get(req, "max_wall_ms"), &max_wall_ms);
+   json_as_int(json_get(req, "until_fs"), &until_fs);
+   json_as_int(json_get(req, "duration_fs"), &duration_fs);
+
+   // A duration counts from the end of the previous run, not from the
+   // time of the last event, so two runs of 100 ns advance 200 ns
+   int64_t stop_fs = until_fs;
+   if (duration_fs >= 0) {
+      const int64_t base = MAX((int64_t)w->last_target,
+                               model_now(w->model, NULL));
+      stop_fs = duration_fs > INT64_MAX - base ? INT64_MAX : base + duration_fs;
+   }
+
+   bool progress = false, background = false;
+   json_as_bool(json_get(req, "progress"), &progress);
+   json_as_bool(json_get(req, "background"), &background);
+
+   const char *pause = json_string(json_get(req, "pause_on"));
+   w->pause_level = DIAG_FATAL + 1;
+   if (pause != NULL) {
+      if (!strcmp(pause, "note"))         w->pause_level = DIAG_NOTE;
+      else if (!strcmp(pause, "warning")) w->pause_level = DIAG_WARN;
+      else if (!strcmp(pause, "error"))   w->pause_level = DIAG_ERROR;
+      else if (!strcmp(pause, "failure")) w->pause_level = DIAG_FAILURE;
+   }
+
+   reset_messages(w);
+
+   if (!w->started) {
+      w->started = true;
+      model_start(w->model);
+   }
+
+   w->run.active = true;
+   w->run.background = background;
+   w->run.progress = progress && !background;
+   w->run.stop = stop_fs < 0 ? (uint64_t)INT64_MAX : (uint64_t)stop_fs;
+   w->run.max_wall_ms = max_wall_ms;
+   w->run.start_us = w->run.last_progress_us = get_timestamp_us();
+   w->run.start_fs = model_now(w->model, NULL);
+   w->run.slice = 16;
+   w->last_reason = NULL;
+
+   if (background) {
+      LOCAL_TEXT_BUF tb = tb_new();
+      json_writer_t jw;
+      jw_init(&jw, tb);
+      begin_reply(&jw, true);
+      jw_key(&jw, "result");
+      jw_begin_object(&jw);
+      jw_key(&jw, "state");
+      jw_string(&jw, "running");
+      write_state(w, &jw);
+      jw_key(&jw, "hint");
+      jw_string(&jw, "The run continues in the background. Call nvc_sim_wait "
+                "to wait for it to stop or report a problem, nvc_sim_status "
+                "to look without waiting, or nvc_sim_stop to end it.");
+      jw_end_object(&jw);
+      jw_end_object(&jw);
+      ctl_send(w, tb);
+   }
+}
+
+// Called for a request that arrives while a run is in progress
+static void op_stop(worker_t *w)
+{
+   if (w->run.active)
+      run_finish(w, "cancelled");
+}
+
+static void op_status(worker_t *w, const json_t *req)
+{
+   int64_t since = 0;
+   json_as_int(json_get(req, "since_seq"), &since);
+
+   const char *state;
+   if (w->run.active)
+      state = "running";
+   else if (model_is_terminated(w->model))
+      state = "terminated";
+   else if (w->started && model_is_finished(w->model))
+      state = "finished";
+   else
+      state = "idle";
+
+   LOCAL_TEXT_BUF tb = tb_new();
+   json_writer_t jw;
+   jw_init(&jw, tb);
+
+   begin_reply(&jw, true);
+   jw_key(&jw, "result");
+   jw_begin_object(&jw);
+   jw_key(&jw, "state");
+   jw_string(&jw, state);
+
+   if (w->last_reason != NULL) {
+      jw_key(&jw, "stopped_because");
+      jw_string(&jw, w->last_reason);
+   }
+
+   write_state(w, &jw);
+
+   const uint64_t now_us = get_timestamp_us();
+   const int64_t now_fs = model_now(w->model, NULL);
+
+   jw_key(&jw, "wall_ms");
+   jw_int(&jw, w->run.active ? (now_us - w->run.start_us) / 1000
+          : w->last_wall_ms);
+
+   if (w->run.active) {
+      const uint64_t wall_us = MAX(now_us - w->run.start_us, 1);
+      const int64_t advanced = now_fs - w->run.start_fs;
+      const int64_t rate = (int64_t)((double)advanced * 1e6 / wall_us);
+
+      jw_key(&jw, "run_started_at_fs");
+      jw_int(&jw, w->run.start_fs);
+      jw_key(&jw, "sim_fs_per_second");
+      jw_int(&jw, rate);
+
+      if (w->run.stop != (uint64_t)INT64_MAX) {
+         jw_key(&jw, "target_fs");
+         jw_int(&jw, w->run.stop);
+
+         const int64_t span = (int64_t)w->run.stop - w->run.start_fs;
+         if (span > 0) {
+            jw_key(&jw, "percent");
+            jw_int(&jw, MIN(100, advanced * 100 / span));
+         }
+         if (rate > 0 && (int64_t)w->run.stop > now_fs) {
+            jw_key(&jw, "eta_ms");
+            jw_int(&jw, (int64_t)(((double)w->run.stop - now_fs)
+                                  * 1000.0 / rate));
+         }
+      }
+   }
+
+   if (model_is_terminated(w->model)) {
+      jw_key(&jw, "exit_status");
+      jw_int(&jw, model_exit_status(w->model));
+   }
+
+   write_messages_since(w, &jw, since);
+   write_output(w, &jw);
+
+   jw_end_object(&jw);
+   jw_end_object(&jw);
    ctl_send(w, tb);
 }
 
@@ -1741,9 +1881,15 @@ int mcp_worker_main(rt_model_t *m, tree_t top, int ctl_fd)
    reset_messages(&w);
 
    for (;;) {
-      char *line = ctl_read_line(&w, -1);
-      if (line == NULL)
-         break;
+      // While a run is in progress only poll for requests so it advances
+      char *line = ctl_read_line(&w, w.run.active ? 0 : -1);
+      if (line == NULL) {
+         if (w.eof)
+            break;
+         else if (w.run.active)
+            run_step(&w);
+         continue;
+      }
 
       mem_pool_t *mp = pool_new();
       const char *perr;
@@ -1751,8 +1897,23 @@ int mcp_worker_main(rt_model_t *m, tree_t top, int ctl_fd)
       free(line);
 
       const char *op = json_string(json_get(req, "op"));
+      const bool busy = w.run.active;
+
       if (op == NULL)
          reply_error(&w, "malformed request");
+      else if (!strcmp(op, "close")) {
+         op_close(&w);
+         pool_free(mp);
+         break;
+      }
+      else if (!strcmp(op, "cancel"))
+         op_stop(&w);   // Otherwise arrived after its run finished
+      else if (!strcmp(op, "stop")) {
+         op_stop(&w);
+         op_status(&w, req);
+      }
+      else if (!strcmp(op, "status"))
+         op_status(&w, req);
       else if (!strcmp(op, "run"))
          op_run(&w, req);
       else if (!strcmp(op, "list"))
@@ -1761,21 +1922,18 @@ int mcp_worker_main(rt_model_t *m, tree_t top, int ctl_fd)
          op_search(&w, req);
       else if (!strcmp(op, "get"))
          op_get(&w, req);
+      else if (!strcmp(op, "trace_get"))
+         op_trace_get(&w, req);
+      else if (busy)
+         reply_error(&w, "The simulation is running a background run, which "
+                     "only allows reading: wait for it with nvc_sim_wait or "
+                     "end it with nvc_sim_stop, then repeat this call");
       else if (!strcmp(op, "set"))
          op_set(&w, req);
       else if (!strcmp(op, "trace_start"))
          op_trace_start(&w, req);
-      else if (!strcmp(op, "trace_get"))
-         op_trace_get(&w, req);
       else if (!strcmp(op, "trace_stop"))
          op_trace_stop(&w, req);
-      else if (!strcmp(op, "close")) {
-         op_close(&w);
-         pool_free(mp);
-         break;
-      }
-      else if (!strcmp(op, "cancel"))
-         ;   // Arrived after the run it was meant for finished
       else
          reply_error(&w, "unknown operation '%s'", op);
 

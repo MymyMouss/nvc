@@ -2168,6 +2168,76 @@ START_TEST(test_sim_progress)
 }
 END_TEST
 
+START_TEST(test_sim_background)
+{
+   fixture_t f;
+   const char *names[] = { "tb.vhd" }, *sources[] = { tb_src };
+   const char *tops[] = { "tb" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   char id[40];
+   open_sim(&f, "tb", id);
+
+   const json_t *sc = structured(sim_tool(&f, "nvc_sim_run", id,
+                                          "\"background\":true,"
+                                          "\"pause_on\":\"never\""));
+   ck_assert_str_eq(str_field(sc, "state"), "running");
+
+   // Reading works during the run, changing the simulation does not
+   sc = structured(sim_tool(&f, "nvc_signal_get", id, "\"paths\":[\"/clk\"]"));
+   ck_assert_ptr_nonnull(sc);
+
+   const char *err = tool_error(sim_tool(&f, "nvc_signal_set", id,
+                                         "\"path\":\"/rst\","
+                                         "\"value\":\"1\""));
+   ck_assert_ptr_nonnull(strstr(err, "nvc_sim_stop"));
+
+   err = tool_error(sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"1 ns\""));
+   ck_assert_ptr_nonnull(strstr(err, "already in progress"));
+
+   // A short wait times out while the run goes on
+   sc = structured(sim_tool(&f, "nvc_sim_wait", id, "\"timeout_ms\":400"));
+   ck_assert_str_eq(str_field(sc, "state"), "running");
+
+   // The design asserts repeatedly, so the wait may end early on new errors
+   const char *why = str_field(sc, "woke_because");
+   ck_assert(!strcmp(why, "timeout") || !strcmp(why, "new_errors"));
+   ck_assert_int_gt(int_field(sc, "sim_fs_per_second"), 0);
+
+   sc = structured(sim_tool(&f, "nvc_sim_status", id, ""));
+   ck_assert_str_eq(str_field(sc, "state"), "running");
+   const int64_t then = int_field(sc, "now_fs");
+   ck_assert_int_gt(then, 0);
+
+   // The first message is at least the start-up note, with a sequence
+   ck_assert_int_gt(int_field(sc, "next_seq"), 0);
+
+   sc = structured(sim_tool(&f, "nvc_sim_stop", id, ""));
+   ck_assert_str_ne(str_field(sc, "state"), "running");
+   ck_assert_str_eq(str_field(sc, "stopped_because"), "cancelled");
+   ck_assert_int_ge(int_field(sc, "now_fs"), then);
+
+   // The simulation continues from where it stopped
+   sc = structured(sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"10 ns\","
+                            "\"pause_on\":\"never\""));
+   ck_assert_str_eq(str_field(sc, "stopped_because"), "time");
+
+   // A bounded background run stops by itself and wait returns early
+   sc = structured(sim_tool(&f, "nvc_sim_run", id, "\"background\":true,"
+                            "\"duration\":\"1 ns\",\"pause_on\":\"never\""));
+   sc = structured(sim_tool(&f, "nvc_sim_wait", id, "\"timeout_ms\":20000"));
+   ck_assert_str_eq(str_field(sc, "woke_because"), "stopped");
+   ck_assert_str_eq(str_field(sc, "stopped_because"), "time");
+
+   // The foreground limit still applies
+   err = tool_error(sim_tool(&f, "nvc_sim_run", id,
+                             "\"max_wall_ms\":400000"));
+   ck_assert_ptr_nonnull(strstr(err, "background"));
+
+   fixture_close(&f);
+}
+END_TEST
+
 Suite *get_mcp_tests(void)
 {
    Suite *s = suite_create("mcp");
@@ -2199,6 +2269,7 @@ Suite *get_mcp_tests(void)
    tcase_add_test(tc, test_sim_not_elaborated);
    tcase_add_test(tc, test_sim_cancel_run);
    tcase_add_test(tc, test_sim_progress);
+   tcase_add_test(tc, test_sim_background);
    tcase_set_timeout(tc, 60);
    suite_add_tcase(s, tc);
 
