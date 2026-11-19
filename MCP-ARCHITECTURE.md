@@ -305,7 +305,7 @@ typées, puis on factorisera si le besoin se confirme.
 | M3 | Bac à sable, filtre de chemins `fileio`, rlimits, fuzzing, `--disable-mcp` | Revue de sécurité sans point bloquant |
 | M4 | Checkpoints (`PLAN.md` §1), extension tâches, HTTP local, couverture | Handles qui survivent à la mort d'un worker |
 
-## 5. État d'avancement (M0)
+## 5. État d'avancement (M0 et M1)
 
 L'étape M0 est écrite (`src/mcp/`, tests dans `test/test_mcp.c`):
 
@@ -323,6 +323,47 @@ L'étape M0 est écrite (`src/mcp/`, tests dans `test/test_mcp.c`):
   sorties de progression, les limites mémoire (`RLIMIT_AS`) des workers,
   et le support Windows.
 
+### M1: simulations vivantes et outils de listing
+
+Onze outils au total: `nvc_analyse`, `nvc_elaborate`, `nvc_workspace_list`,
+`nvc_library_list`, `nvc_sim_open`, `nvc_sim_run`, `nvc_sim_close`,
+`nvc_design_list`, `nvc_design_search`, `nvc_signal_get`, `nvc_signal_set`.
+Choix de réalisation, avec ce qui les a motivés:
+
+- **Un processus par simulation** (`nvc --mcp-worker --fd=3 TOP`). Le
+  superviseur lui parle en JSON par lignes sur un socket dont le numéro est
+  fixé à 3 (un shell comme dash ne sait pas rediriger au-delà de 9, ce qui
+  rend le contrat testable avec de faux workers). Le worker part avec
+  `PR_SET_PDEATHSIG`, dans son propre groupe de processus, et est tué avec le
+  serveur.
+- **Exécution par tranches.** `model_run` rejoue les callbacks de début à
+  chaque appel et refuse de reprendre après une interruption, donc le modèle
+  expose `model_start`, `model_run_cycles` et `model_end`. Le worker lit
+  l'horloge, l'annulation et la progression entre deux tranches (de taille
+  adaptative, visée à 20 ms). Un drapeau de halte est testé après chaque
+  cycle, ce qui permet de s'arrêter exactement au cycle où un message de la
+  sévérité demandée apparaît (65 ns, pas 140 ns).
+- **Budget de temps réel.** `max_wall_ms` (10 s par défaut) borne chaque
+  appel. Un worker muet (un processus sans `wait`) est tué après un délai de
+  grâce de 3 s et le handle disparaît.
+- **Messages structurés.** Les `report` et `assert` passent par le hook de
+  diagnostics et reviennent avec le temps simulé, le delta et la trace
+  (100 au plus, les compteurs restent exacts). Ce que le design imprime sur
+  stdout est capturé dans un fichier mémoire et relu à chaque appel, ce qui
+  évite tout problème d'ordre entre deux canaux.
+- **Relatif et absolu.** `duration` se compte depuis la fin du run précédent,
+  pas depuis le dernier événement: deux runs de 100 ns avancent de 200 ns.
+- **Valeurs compactes.** Un vecteur de `std_logic` sort en `0101`, ou en
+  `0x5` / `5` avec `radix`, au lieu de `('0', '1', '0', '1')`.
+- **Pas de `deposit`.** `deposit_signal` suppose un processus actif et ne
+  peut pas être appelé de l'extérieur: seuls `force` et `release` existent,
+  comme dans le shell TCL.
+- **Glob par `fnmatch`.** `ident_glob` de nvc refuse qu'un `*` final soit
+  vide et n'a pas de `?`: la recherche utilise `fnmatch` insensible à la
+  casse.
+- **Aucun effet de bord à la lecture.** `nvc --list` crée la bibliothèque si
+  elle n'existe pas: `nvc_library_list` vérifie d'abord son existence.
+
 ### Évaluation avec un agent (Claude Agent SDK)
 
 `test/mcp/agent_eval.py` fait piloter le serveur par un vrai agent (modèle
@@ -336,6 +377,8 @@ l'agent. Ce n'est pas dans `make check`: il appelle un modèle.
 | Corriger une faute de frappe dans un design de deux fichiers | 7 tours, 2 appels MCP, corrigé et reconfirmé |
 | Compiler dans le désordre avec `--std 2008` | 1 appel: l'agent a réordonné lui-même et passé `std: "2008"` |
 | Chemin faux, sans aucun outil de fichiers | voir ci-dessous |
+| Découvrir les entités d'un espace de travail inconnu (aucun outil de fichiers) | 5 appels MCP, les deux entités |
+| Trouver quand une assertion échoue et la valeur du registre (aucun outil de fichiers) | 9 appels, `65 ns 5`, exact |
 
 **Leçon:** au premier essai, le dernier scénario échouait. Le message
 disait seulement « fichier introuvable » avec la racine, l'agent n'avait
@@ -346,7 +389,17 @@ le contenu de la racine. Le même scénario réussit alors en deux appels.
 Un agent qui n'a que ce serveur doit pouvoir se rattraper avec ce que le
 serveur lui dit.
 
-Limites: un petit modèle, trois scénarios courts, un seul essai chacun.
+**Deuxième leçon (M1):** au premier essai du scénario de débogage,
+l'agent a demandé `pause_on: "failure"` (« l'assertion échoue » devenait la
+sévérité *failure*), donc la simulation a couru 10 s sans s'arrêter avant
+qu'il ne la rouvre. Sa recherche `cnt*` ne trouvait rien à cause de
+`ident_glob`. Corrections: description de `pause_on` réécrite autour de ce
+que l'on cherche, recherche par `fnmatch`, et un champ `hint` dans les
+résultats de `nvc_sim_run` qui dit quoi faire ensuite (par exemple « le
+design a signalé beaucoup d'erreurs: utilisez pause_on error »). Même
+scénario ensuite: 9 appels au lieu de 15, sans faux pas.
+
+Limites: un petit modèle, cinq scénarios courts, un seul essai chacun.
 C'est un test de fumée, pas une mesure statistique.
 
 ## 6. Points à valider et limites de cette étude

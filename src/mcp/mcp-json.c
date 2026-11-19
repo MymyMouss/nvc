@@ -826,3 +826,18 @@ void jw_raw(json_writer_t *w, const char *json)
    jw_prefix(w);
    tb_cat(w->tb, json);
 }
+
+void jw_raw_members(json_writer_t *w, const char *members)
+{
+   assert(!w->after_key);
+
+   if (*members == '\0')
+      return;
+
+   if (!w->first[w->depth])
+      tb_append(w->tb, ',');
+
+   w->first[w->depth] = false;
+
+   tb_cat(w->tb, members);
+}

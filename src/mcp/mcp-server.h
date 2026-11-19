@@ -20,6 +20,10 @@
 
 #include "mcp/mcp-json.h"
 
+// Tool schemas are written as JSON text: the macro quotes it.  Avoid
+// apostrophes in descriptions.
+#define MCP_JSON(...) #__VA_ARGS__
+
 //
 // Model Context Protocol server
 //
@@ -87,6 +91,22 @@ const char *const *mcp_call_global_argv(mcp_call_t *call, int *argc);
 
 // True when the client cancelled this request
 bool mcp_call_cancelled(mcp_call_t *call);
+
+// Report progress of a long call.  Does nothing unless the client asked
+// for progress notifications with a progress token.  The value must
+// increase between calls.
+bool mcp_call_wants_progress(mcp_call_t *call);
+void mcp_call_progress(mcp_call_t *call, int64_t progress, const char *message);
+
+// Live simulations owned by this server
+typedef struct _mcp_sims mcp_sims_t;
+mcp_sims_t *mcp_call_sims(mcp_call_t *call);
+
+// Tool definitions that live in other files
+const mcp_tool_t *mcp_sim_tools(size_t *count);
+mcp_sims_t *mcp_sims_new(void);
+void mcp_sims_free(mcp_sims_t *sims);
+void mcp_sims_reap(mcp_sims_t *sims);
 
 // Wait up to timeout_ms (negative for no limit) for any of the file
 // descriptors to become readable while still servicing the client's

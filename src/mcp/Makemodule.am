@@ -7,7 +7,9 @@ lib_libnvc_a_SOURCES += \
 	src/mcp/mcp-json.h \
 	src/mcp/mcp-main.c \
 	src/mcp/mcp-schema.c \
+	src/mcp/mcp-sim.c \
 	src/mcp/mcp-schema.h \
 	src/mcp/mcp-server.c \
 	src/mcp/mcp-server.h \
-	src/mcp/mcp-tools.c
+	src/mcp/mcp-tools.c \
+	src/mcp/mcp-worker.c

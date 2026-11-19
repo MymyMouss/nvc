@@ -75,12 +75,14 @@ struct _mcp_server {
    size_t             qalloc;
    char              *current_id;
    bool               cancel;
+   mcp_sims_t        *sims;
 };
 
 struct _mcp_call {
    mcp_server_t *srv;
    text_buf_t   *err;
    bool          failed;
+   char         *progress_token;   // Serialised, or NULL
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -561,6 +563,11 @@ static void handle_tools_call(mcp_server_t *srv, const char *id_raw,
 
    mcp_call_t call = { .srv = srv, .err = tb_new() };
 
+   // A progress token may be a string or an integer
+   const json_t *token =
+      json_get(json_get(params, "_meta"), "progressToken");
+   call.progress_token = id_to_raw(token);
+
    const bool ok = (*tool->fn)(&call, args, &w);
 
    const bool cancelled = srv->cancel;
@@ -568,6 +575,8 @@ static void handle_tools_call(mcp_server_t *srv, const char *id_raw,
    free(srv->current_id);
    srv->current_id = NULL;
    srv->cancel = false;
+
+   free(call.progress_token);
 
    if (cancelled) {
       // The client no longer expects a response
@@ -889,6 +898,7 @@ mcp_server_t *mcp_server_new(const mcp_options_t *opts)
       srv->opts.global_argv = copy;
    }
    srv->schema_pool = pool_new();
+   srv->sims = mcp_sims_new();
    srv->tools = mcp_tool_table(&srv->ntools);
    srv->inputs = xmalloc_array(srv->ntools, sizeof(json_t *));
 
@@ -928,6 +938,8 @@ void mcp_server_free(mcp_server_t *srv)
    free((char *)srv->opts.exe);
    free((char *)srv->opts.root);
 
+   mcp_sims_free(srv->sims);
+
    free(srv->queue);
    free(srv->inbuf);
    free(srv->inputs);
@@ -961,8 +973,11 @@ void mcp_server_run(mcp_server_t *srv)
       }
       else if (srv->eof)
          break;
-      else
-         wait_for(srv, NULL, 0, NULL, -1);
+      else {
+         // Wake up now and then to retire simulations nobody uses
+         wait_for(srv, NULL, 0, NULL, 30000);
+         mcp_sims_reap(srv->sims);
+      }
    }
 }
 
@@ -1003,4 +1018,44 @@ void mcp_call_wait(mcp_call_t *call, const int *fds, size_t nfds,
                    bool *ready, int timeout_ms)
 {
    wait_for(call->srv, fds, nfds, ready, timeout_ms);
+}
+
+bool mcp_call_wants_progress(mcp_call_t *call)
+{
+   return call->progress_token != NULL;
+}
+
+void mcp_call_progress(mcp_call_t *call, int64_t progress, const char *message)
+{
+   if (call->progress_token == NULL)
+      return;
+
+   LOCAL_TEXT_BUF tb = tb_new();
+   json_writer_t w;
+   jw_init(&w, tb);
+
+   jw_begin_object(&w);
+   jw_key(&w, "jsonrpc");
+   jw_string(&w, "2.0");
+   jw_key(&w, "method");
+   jw_string(&w, "notifications/progress");
+   jw_key(&w, "params");
+   jw_begin_object(&w);
+   jw_key(&w, "progressToken");
+   jw_raw(&w, call->progress_token);
+   jw_key(&w, "progress");
+   jw_int(&w, progress);
+   if (message != NULL) {
+      jw_key(&w, "message");
+      jw_string(&w, message);
+   }
+   jw_end_object(&w);
+   jw_end_object(&w);
+
+   send_tb(call->srv, tb);
+}
+
+mcp_sims_t *mcp_call_sims(mcp_call_t *call)
+{
+   return call->srv->sims;
 }

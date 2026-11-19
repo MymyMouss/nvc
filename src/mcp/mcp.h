@@ -18,6 +18,8 @@
 #ifndef _MCP_H
 #define _MCP_H
 
+#include "prim.h"
+
 // Run the MCP server on standard input and output until the client
 // closes its end.  The root directory bounds every file the tools may
 // access and defaults to the current directory.  The global options are
@@ -27,5 +29,9 @@ int mcp_run(const char *root, const char *exe_hint,
 
 // Worker side: report diagnostics as JSON lines on the given descriptor
 void mcp_diag_install(int fd);
+
+// Worker side: serve a loaded simulation on the control socket until the
+// supervisor closes it.  See mcp-worker.c.
+int mcp_worker_main(rt_model_t *m, tree_t top, int ctl_fd);
 
 #endif   // _MCP_H

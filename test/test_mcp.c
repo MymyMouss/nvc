@@ -21,6 +21,7 @@
 #include "mcp/mcp-server.h"
 
 #include <ftw.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -1105,6 +1106,922 @@ START_TEST(test_input_too_large)
 }
 END_TEST
 
+
+////////////////////////////////////////////////////////////////////////////////
+// Listing, elaboration and live simulation
+
+static const char counter_src[] =
+   "library ieee;\n"
+   "use ieee.std_logic_1164.all;\n"
+   "use ieee.numeric_std.all;\n"
+   "entity counter is\n"
+   "  port (clk, rst : in std_logic; q : out unsigned(3 downto 0));\n"
+   "end entity;\n"
+   "architecture rtl of counter is\n"
+   "  signal cnt : unsigned(3 downto 0);\n"
+   "begin\n"
+   "  process (clk) begin\n"
+   "    if rising_edge(clk) then\n"
+   "      if rst = '1' then cnt <= (others => '0');\n"
+   "      else cnt <= cnt + 1; end if;\n"
+   "    end if;\n"
+   "  end process;\n"
+   "  q <= cnt;\n"
+   "end architecture;\n";
+
+// A free running clock, a report at the start and an error when the
+// counter reaches five
+static const char tb_src[] =
+   "library ieee;\n"
+   "use ieee.std_logic_1164.all;\n"
+   "use ieee.numeric_std.all;\n"
+   "use std.textio.all;\n"
+   "entity tb is end entity;\n"
+   "architecture test of tb is\n"
+   "  signal clk : std_logic := '0';\n"
+   "  signal rst : std_logic := '1';\n"
+   "  signal q   : unsigned(3 downto 0);\n"
+   "begin\n"
+   "  dut : entity work.counter port map (clk => clk, rst => rst, q => q);\n"
+   "  clk <= not clk after 5 ns;\n"
+   "  process begin\n"
+   "    report \"testbench starting\" severity note;\n"
+   "    wait for 12 ns; rst <= '0'; wait;\n"
+   "  end process;\n"
+   "  process (clk)\n"
+   "    variable l : line;\n"
+   "  begin\n"
+   "    if rising_edge(clk) and rst = '0' then\n"
+   "      write(l, string'(\"tick q=\") & integer'image(to_integer(q)));\n"
+   "      writeline(output, l);\n"
+   "      assert q /= 5 report \"q reached five\" severity error;\n"
+   "    end if;\n"
+   "  end process;\n"
+   "end architecture;\n";
+
+// Finishes by itself: the clock stops after 50 ns
+static const char finite_src[] =
+   "entity finite is end entity;\n"
+   "architecture a of finite is\n"
+   "  signal done : boolean := false;\n"
+   "  signal clk : bit := '0';\n"
+   "begin\n"
+   "  clk <= not clk after 5 ns when not done;\n"
+   "  process begin wait for 50 ns; done <= true; wait; end process;\n"
+   "end architecture;\n";
+
+// Ends the simulation with a failure at 30 ns
+static const char fail_src[] =
+   "entity failing is end entity;\n"
+   "architecture a of failing is\n"
+   "  signal x : integer := 0;\n"
+   "begin\n"
+   "  process begin\n"
+   "    wait for 10 ns; x <= 7;\n"
+   "    wait for 20 ns;\n"
+   "    assert false report \"giving up\" severity failure;\n"
+   "    wait;\n"
+   "  end process;\n"
+   "end architecture;\n";
+
+// More messages than the result can hold, all at time zero
+static const char chatty_src[] =
+   "entity chatty is end entity;\n"
+   "architecture a of chatty is\n"
+   "begin\n"
+   "  process begin\n"
+   "    for i in 1 to 300 loop report \"message\" severity note; end loop;\n"
+   "    wait;\n"
+   "  end process;\n"
+   "end architecture;\n";
+
+// A process that never waits
+static const char hang_src[] =
+   "entity hang is end entity;\n"
+   "architecture a of hang is\n"
+   "  signal s : integer := 0;\n"
+   "begin\n"
+   "  process begin\n"
+   "    wait for 10 ns;\n"
+   "    loop s <= s + 1; end loop;\n"
+   "  end process;\n"
+   "end architecture;\n";
+
+static json_t *tool(mem_pool_t *mp, mcp_server_t *srv, sink_t *sink,
+                    const char *name, const char *args)
+{
+   char *req = xasprintf("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":"
+                         "\"tools/call\",\"params\":{\"name\":\"%s\","
+                         "\"arguments\":%s," MODERN_META "}}", name, args);
+   json_t *r = call(mp, srv, sink, req);
+   free(req);
+   return json_get(r, "result");
+}
+
+static int64_t int_field(const json_t *obj, const char *key)
+{
+   int64_t v;
+   ck_assert_msg(json_as_int(json_get(obj, key), &v), "no integer '%s'", key);
+   return v;
+}
+
+static const char *str_field(const json_t *obj, const char *key)
+{
+   const char *v = json_string(json_get(obj, key));
+   ck_assert_msg(v != NULL, "no string '%s'", key);
+   return v;
+}
+
+static bool bool_field(const json_t *obj, const char *key)
+{
+   bool v = false;
+   ck_assert_msg(json_as_bool(json_get(obj, key), &v), "no boolean '%s'", key);
+   return v;
+}
+
+typedef struct {
+   char         *root;
+   char         *nvc;
+   mem_pool_t   *mp;
+   sink_t        sink;
+   mcp_server_t *srv;
+} fixture_t;
+
+// A server over a fresh workspace with the real nvc, the counter and the
+// given extra source files analysed and elaborated
+static void fixture_open(fixture_t *f, const char *const *names,
+                         const char *const *sources, size_t nextra,
+                         const char *const *tops, size_t ntops)
+{
+   memset(f, 0, sizeof(*f));
+
+   f->root = make_workspace();
+   f->nvc = build_path("bin/nvc");
+
+   char *lib = build_path("lib");
+   setenv("NVC_LIBPATH", lib, 1);
+   free(lib);
+
+   write_file(f->root, "counter.vhd", counter_src, 0644);
+
+   LOCAL_TEXT_BUF files = tb_new();
+   tb_cat(files, "\"counter.vhd\"");
+   for (size_t i = 0; i < nextra; i++) {
+      write_file(f->root, names[i], sources[i], 0644);
+      tb_printf(files, ",\"%s\"", names[i]);
+   }
+
+   f->mp = pool_new();
+   f->srv = new_server(&f->sink, f->root, f->nvc);
+
+   char *args = xasprintf("{\"files\":[%s],\"std\":\"2008\"}", tb_get(files));
+   const json_t *sc = structured(tool(f->mp, f->srv, &f->sink, "nvc_analyse",
+                                      args));
+   free(args);
+   ck_assert_msg(bool_field(sc, "ok"), "analysis failed: %s",
+                 f->sink.lines[0]);
+
+   for (size_t i = 0; i < ntops; i++) {
+      args = xasprintf("{\"top\":\"%s\",\"std\":\"2008\"}", tops[i]);
+      sc = structured(tool(f->mp, f->srv, &f->sink, "nvc_elaborate", args));
+      free(args);
+      ck_assert_msg(bool_field(sc, "ok"), "elaboration of %s failed: %s",
+                    tops[i], f->sink.lines[0]);
+   }
+}
+
+static void fixture_close(fixture_t *f)
+{
+   mcp_server_free(f->srv);
+   sink_clear(&f->sink);
+   pool_free(f->mp);
+   remove_tree(f->root);
+   free(f->root);
+   free(f->nvc);
+}
+
+static const char *open_sim(fixture_t *f, const char *top, char *id)
+{
+   char *args = xasprintf("{\"top\":\"%s\",\"std\":\"2008\"}", top);
+   const json_t *sc = structured(tool(f->mp, f->srv, &f->sink, "nvc_sim_open",
+                                      args));
+   free(args);
+
+   snprintf(id, 40, "%s", str_field(sc, "sim_id"));
+   ck_assert_int_eq(strlen(id), 32);
+   return id;
+}
+
+static const json_t *sim_tool(fixture_t *f, const char *name, const char *id,
+                              const char *extra)
+{
+   char *args = xasprintf("{\"sim_id\":\"%s\"%s%s}", id,
+                          extra[0] ? "," : "", extra);
+   const json_t *r = tool(f->mp, f->srv, &f->sink, name, args);
+   free(args);
+   return r;
+}
+
+START_TEST(test_workspace_list)
+{
+   char *root = make_workspace();
+   mem_pool_t *mp = pool_new();
+   sink_t sink = {};
+   mcp_server_t *srv = new_server(&sink, root, "/bin/true");
+
+   write_file(root, "top.vhd", "-- vhdl\n", 0644);
+   write_file(root, "notes.txt", "text\n", 0644);
+   write_file(root, ".hidden.vhd", "-- vhdl\n", 0644);
+
+   char *dir = xasprintf("%s/rtl", root);
+   ck_assert_int_eq(mkdir(dir, 0755), 0);
+   free(dir);
+   write_file(root, "rtl/alu.sv", "module alu; endmodule\n", 0644);
+   write_file(root, "rtl/CORE_TB.VHDL", "-- vhdl\n", 0644);
+   write_file(root, "rtl/old.v", "module old; endmodule\n", 0644);
+
+   // A library directory is reported but not entered
+   dir = xasprintf("%s/work", root);
+   ck_assert_int_eq(mkdir(dir, 0755), 0);
+   free(dir);
+   write_file(root, "work/_NVC_LIB", "", 0644);
+   write_file(root, "work/leftover.vhd", "-- vhdl\n", 0644);
+
+   char *link = xasprintf("%s/link.vhd", root);
+   ck_assert_int_eq(symlink("top.vhd", link), 0);
+   free(link);
+
+   const json_t *sc = structured(tool(mp, srv, &sink, "nvc_workspace_list",
+                                      "{}"));
+   const json_t *entries = json_get(sc, "entries");
+   ck_assert_int_eq(int_field(sc, "total"), 5);
+   ck_assert(!bool_field(sc, "truncated"));
+   ck_assert_str_eq(str_field(sc, "path"), ".");
+
+   // Sorted by path; hidden files, links, text and library contents skipped
+   static const char *const expect[] = {
+      "rtl/CORE_TB.VHDL", "rtl/alu.sv", "rtl/old.v", "top.vhd", "work"
+   };
+   for (size_t i = 0; i < ARRAY_LEN(expect); i++)
+      ck_assert_str_eq(str_field(json_at(entries, i), "path"), expect[i]);
+
+   ck_assert_str_eq(str_field(json_at(entries, 0), "language"), "vhdl");
+   ck_assert_str_eq(str_field(json_at(entries, 1), "language"), "systemverilog");
+   ck_assert_str_eq(str_field(json_at(entries, 2), "language"), "verilog");
+   ck_assert_str_eq(str_field(json_at(entries, 4), "type"), "library");
+   ck_assert_int_eq(int_field(json_at(entries, 3), "size_bytes"), 8);
+
+   // Everything, then a glob, then a subdirectory
+   sc = structured(tool(mp, srv, &sink, "nvc_workspace_list",
+                        "{\"kind\":\"all\"}"));
+   ck_assert_int_eq(int_field(sc, "total"), 6);
+
+   sc = structured(tool(mp, srv, &sink, "nvc_workspace_list",
+                        "{\"pattern\":\"*_tb.vhdl\"}"));
+   ck_assert_int_eq(int_field(sc, "total"), 1);
+   ck_assert_str_eq(str_field(json_at(json_get(sc, "entries"), 0), "path"),
+                    "rtl/CORE_TB.VHDL");
+
+   sc = structured(tool(mp, srv, &sink, "nvc_workspace_list",
+                        "{\"path\":\"rtl\"}"));
+   ck_assert_str_eq(str_field(sc, "path"), "rtl");
+   ck_assert_int_eq(int_field(sc, "total"), 3);
+
+   sc = structured(tool(mp, srv, &sink, "nvc_workspace_list",
+                        "{\"max_depth\":0}"));
+   ck_assert_int_eq(int_field(sc, "total"), 2);   // top.vhd and work
+
+   // Paging
+   sc = structured(tool(mp, srv, &sink, "nvc_workspace_list",
+                        "{\"limit\":2}"));
+   ck_assert_int_eq(json_get(sc, "entries")->array.count, 2);
+   ck_assert(bool_field(sc, "truncated"));
+   ck_assert_str_eq(str_field(sc, "next_cursor"), "2");
+
+   sc = structured(tool(mp, srv, &sink, "nvc_workspace_list",
+                        "{\"limit\":2,\"cursor\":\"4\"}"));
+   ck_assert_int_eq(json_get(sc, "entries")->array.count, 1);
+   ck_assert(!bool_field(sc, "truncated"));
+
+   // Misuse is explained
+   const char *e = tool_error(tool(mp, srv, &sink, "nvc_workspace_list",
+                                   "{\"path\":\"/etc\"}"));
+   ck_assert_ptr_nonnull(strstr(e, "outside the workspace root"));
+   e = tool_error(tool(mp, srv, &sink, "nvc_workspace_list",
+                       "{\"path\":\"top.vhd\"}"));
+   ck_assert_ptr_nonnull(strstr(e, "is not a directory"));
+   e = tool_error(tool(mp, srv, &sink, "nvc_workspace_list",
+                       "{\"max_depth\":99}"));
+   ck_assert_ptr_nonnull(strstr(e, "at most 8"));
+
+   mcp_server_free(srv);
+   sink_clear(&sink);
+   pool_free(mp);
+   remove_tree(root);
+   free(root);
+}
+END_TEST
+
+START_TEST(test_library_and_elaborate)
+{
+   char *root = make_workspace();
+   char *nvc = build_path("bin/nvc");
+   char *lib = build_path("lib");
+   setenv("NVC_LIBPATH", lib, 1);
+   free(lib);
+
+   write_file(root, "counter.vhd", counter_src, 0644);
+   write_file(root, "tb.vhd", tb_src, 0644);
+
+   mem_pool_t *mp = pool_new();
+   sink_t sink = {};
+   mcp_server_t *srv = new_server(&sink, root, nvc);
+
+   // No library until something has been analysed, and asking does not
+   // create one
+   const char *e = tool_error(tool(mp, srv, &sink, "nvc_library_list", "{}"));
+   ck_assert_ptr_nonnull(strstr(e, "no library 'work'"));
+   ck_assert_ptr_nonnull(strstr(e, "none"));
+   char *workdir = xasprintf("%s/work", root);
+   ck_assert_int_ne(access(workdir, F_OK), 0);
+   free(workdir);
+
+   e = tool_error(tool(mp, srv, &sink, "nvc_library_list",
+                       "{\"library\":\"../x\"}"));
+   ck_assert_ptr_nonnull(strstr(e, "Invalid library name"));
+
+   const json_t *sc = structured(tool(
+      mp, srv, &sink, "nvc_analyse",
+      "{\"files\":[\"counter.vhd\",\"tb.vhd\"],\"std\":\"2008\"}"));
+   ck_assert(bool_field(sc, "ok"));
+
+   sc = structured(tool(mp, srv, &sink, "nvc_library_list", "{}"));
+   ck_assert_str_eq(str_field(sc, "library"), "work");
+   ck_assert_int_eq(int_field(sc, "total"), 4);
+   ck_assert_int_eq(json_get(sc, "elaborated")->array.count, 0);
+
+   const json_t *units = json_get(sc, "units");
+   ck_assert_str_eq(str_field(json_at(units, 0), "name"), "WORK.COUNTER");
+   ck_assert_str_eq(str_field(json_at(units, 0), "kind"), "entity");
+   ck_assert_str_eq(str_field(json_at(units, 1), "kind"), "architecture");
+   ck_assert_str_eq(str_field(json_at(units, 1), "entity"), "COUNTER");
+   ck_assert_str_eq(str_field(json_at(units, 1), "architecture"), "RTL");
+
+   sc = structured(tool(mp, srv, &sink, "nvc_elaborate",
+                        "{\"top\":\"tb\",\"std\":\"2008\"}"));
+   ck_assert(bool_field(sc, "ok"));
+   ck_assert_str_eq(str_field(sc, "status"), "ok");
+
+   sc = structured(tool(mp, srv, &sink, "nvc_library_list", "{}"));
+   const json_t *tops = json_get(sc, "elaborated");
+   ck_assert_int_eq(tops->array.count, 1);
+   ck_assert_str_eq(json_string(json_at(tops, 0)), "tb");
+   ck_assert_int_eq(int_field(sc, "total"), 4);
+
+   // An unknown unit explains what to do
+   sc = structured(tool(mp, srv, &sink, "nvc_elaborate",
+                        "{\"top\":\"nosuch\",\"std\":\"2008\"}"));
+   ck_assert(!bool_field(sc, "ok"));
+   ck_assert_str_eq(str_field(sc, "status"), "failed");
+   ck_assert_ptr_nonnull(strstr(str_field(sc, "worker_output"),
+                                "cannot find unit"));
+   ck_assert_ptr_nonnull(strstr(str_field(sc, "hint"), "nvc_analyse"));
+
+   // Generics
+   sc = structured(tool(mp, srv, &sink, "nvc_elaborate",
+                        "{\"top\":\"tb\",\"std\":\"2008\","
+                        "\"generics\":{\"UNUSED\":3,\"FLAG\":true}}"));
+   ck_assert(json_get(sc, "ok") != NULL);
+
+   e = tool_error(tool(mp, srv, &sink, "nvc_elaborate",
+                       "{\"top\":\"tb\",\"generics\":{\"BAD NAME\":1}}"));
+   ck_assert_ptr_nonnull(strstr(e, "Invalid generic name"));
+   e = tool_error(tool(mp, srv, &sink, "nvc_elaborate",
+                       "{\"top\":\"tb\",\"generics\":{\"N\":null}}"));
+   ck_assert_ptr_nonnull(strstr(e, "must be a string, number or boolean"));
+   e = tool_error(tool(mp, srv, &sink, "nvc_elaborate",
+                       "{\"top\":\"tb\",\"generics\":{\"N\":\"a\\nb\"}}"));
+   ck_assert_ptr_nonnull(strstr(e, "Invalid value for generic"));
+   e = tool_error(tool(mp, srv, &sink, "nvc_elaborate",
+                       "{\"top\":\"tb\",\"generics\":[1]}"));
+   ck_assert_ptr_nonnull(strstr(e, "expected object"));
+   e = tool_error(tool(mp, srv, &sink, "nvc_elaborate",
+                       "{\"top\":\"bad name!\"}"));
+   ck_assert_ptr_nonnull(strstr(e, "Invalid design unit name"));
+
+   mcp_server_free(srv);
+   sink_clear(&sink);
+   pool_free(mp);
+   remove_tree(root);
+   free(root);
+   free(nvc);
+}
+END_TEST
+
+START_TEST(test_sim_lifecycle)
+{
+   fixture_t f;
+   const char *names[] = { "tb.vhd" }, *sources[] = { tb_src };
+   const char *tops[] = { "tb" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   char id[40];
+   open_sim(&f, "tb", id);
+
+   // The open result describes the design
+   const json_t *sc = structured(sim_tool(&f, "nvc_design_list", id, ""));
+   ck_assert_str_eq(str_field(sc, "path"), "/");
+   ck_assert_int_eq(int_field(sc, "total"), 4);
+   const json_t *items = json_get(sc, "items");
+   ck_assert_str_eq(str_field(json_at(items, 0), "path"), "/clk");
+   ck_assert_str_eq(str_field(json_at(items, 0), "type"), "STD_LOGIC");
+   ck_assert_str_eq(str_field(json_at(items, 2), "path"), "/q");
+   ck_assert_int_eq(int_field(json_at(items, 2), "width"), 4);
+   ck_assert_str_eq(str_field(json_at(items, 3), "path"), "/dut");
+   ck_assert_str_eq(str_field(json_at(items, 3), "kind"), "region");
+
+   sc = structured(sim_tool(&f, "nvc_design_list", id, "\"path\":\"/dut\""));
+   ck_assert_int_eq(int_field(sc, "total"), 4);
+
+   // Search: by leaf, by full path, case insensitive, paged
+   sc = structured(sim_tool(&f, "nvc_design_search", id, "\"pattern\":\"cnt\""));
+   ck_assert_int_eq(int_field(sc, "total"), 1);
+   ck_assert_str_eq(str_field(json_at(json_get(sc, "items"), 0), "path"),
+                    "/dut/cnt");
+
+   sc = structured(sim_tool(&f, "nvc_design_search", id,
+                            "\"pattern\":\"/dut/*\",\"kind\":\"signal\""));
+   ck_assert_int_eq(int_field(sc, "total"), 4);
+
+   sc = structured(sim_tool(&f, "nvc_design_search", id, "\"pattern\":\"CLK\""));
+   ck_assert_int_eq(int_field(sc, "total"), 2);
+
+   // Globs: * may match nothing, ? matches one character
+   static const char *const globs[] = {
+      "cnt*", "*cnt*", "cn?", "CNT*", "/dut/c?t", "*/cnt"
+   };
+   for (size_t i = 0; i < ARRAY_LEN(globs); i++) {
+      char *extra = xasprintf("\"pattern\":\"%s\"", globs[i]);
+      sc = structured(sim_tool(&f, "nvc_design_search", id, extra));
+      free(extra);
+      ck_assert_msg(int_field(sc, "total") == 1, "pattern %s matched %"PRIi64,
+                    globs[i], int_field(sc, "total"));
+   }
+
+   sc = structured(sim_tool(&f, "nvc_design_search", id,
+                            "\"pattern\":\"clk\",\"limit\":1"));
+   ck_assert(bool_field(sc, "truncated"));
+   ck_assert_str_eq(str_field(sc, "next_cursor"), "1");
+   sc = structured(sim_tool(&f, "nvc_design_search", id,
+                            "\"pattern\":\"clk\",\"limit\":1,\"cursor\":\"1\""));
+   ck_assert(!bool_field(sc, "truncated"));
+   ck_assert_str_eq(str_field(json_at(json_get(sc, "items"), 0), "path"),
+                    "/dut/clk");
+
+   // The first 20 ns: the testbench reports, the design prints
+   sc = structured(sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"20 ns\""));
+   ck_assert_str_eq(str_field(sc, "stopped_because"), "time");
+   ck_assert_int_eq(int_field(sc, "now_fs"), 20000000);
+   ck_assert_str_eq(str_field(sc, "now"), "20 ns");
+   const json_t *msg = json_at(json_get(sc, "messages"), 0);
+   ck_assert_ptr_nonnull(strstr(str_field(msg, "message"), "testbench starting"));
+   ck_assert_str_eq(str_field(msg, "severity"), "note");
+   ck_assert_int_eq(int_field(msg, "time_fs"), 0);
+   ck_assert_str_eq(str_field(sc, "sim_output"), "tick q=0\n");
+
+   sc = structured(sim_tool(&f, "nvc_signal_get", id,
+                            "\"paths\":[\"/q\",\"/dut/cnt\",\"/clk\"]"));
+   const json_t *values = json_get(sc, "values");
+   ck_assert_str_eq(str_field(json_at(values, 0), "value"), "0001");
+   ck_assert_str_eq(str_field(json_at(values, 1), "value"), "0001");
+   ck_assert_str_eq(str_field(json_at(values, 2), "value"), "'0'");
+   ck_assert_str_eq(str_field(json_at(values, 0), "type"), "UNSIGNED");
+   ck_assert(!bool_field(json_at(values, 0), "forced"));
+   ck_assert_int_eq(int_field(sc, "now_fs"), 20000000);
+
+   // The default pause on an error stops exactly where it happened
+   sc = structured(sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"200 ns\""));
+   ck_assert_str_eq(str_field(sc, "stopped_because"), "severity");
+   ck_assert_int_eq(int_field(sc, "now_fs"), 65000000);
+   msg = json_at(json_get(sc, "messages"), 0);
+   ck_assert_str_eq(str_field(msg, "severity"), "error");
+   ck_assert_ptr_nonnull(strstr(str_field(msg, "message"), "q reached five"));
+   ck_assert_int_eq(int_field(msg, "time_fs"), 65000000);
+   ck_assert_int_eq(int_field(json_get(sc, "counts"), "error"), 1);
+
+   sc = structured(sim_tool(&f, "nvc_signal_get", id,
+                            "\"paths\":[\"/q\"],\"radix\":\"hex\""));
+   ck_assert_str_eq(str_field(json_at(json_get(sc, "values"), 0), "value"),
+                    "0x5");
+   sc = structured(sim_tool(&f, "nvc_signal_get", id,
+                            "\"paths\":[\"/q\"],\"radix\":\"dec\""));
+   ck_assert_str_eq(str_field(json_at(json_get(sc, "values"), 0), "value"), "5");
+
+   // Continuing counts the duration from where the run stopped, not
+   // from the target of the interrupted one
+   sc = structured(sim_tool(&f, "nvc_sim_run", id,
+                            "\"duration\":\"30 ns\",\"pause_on\":\"never\""));
+   ck_assert_str_eq(str_field(sc, "stopped_because"), "time");
+   ck_assert_int_eq(int_field(sc, "now_fs"), 95000000);
+
+   // Forcing takes effect at the next cycle and shows as forced
+   sc = structured(sim_tool(&f, "nvc_signal_set", id,
+                            "\"path\":\"/rst\",\"value\":\"'1'\""));
+   ck_assert_str_eq(str_field(sc, "mode"), "force");
+   sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"20 ns\",\"pause_on\":\"never\"");
+
+   sc = structured(sim_tool(&f, "nvc_signal_get", id,
+                            "\"paths\":[\"/q\",\"/rst\"]"));
+   values = json_get(sc, "values");
+   ck_assert_str_eq(str_field(json_at(values, 0), "value"), "0000");
+   ck_assert(bool_field(json_at(values, 1), "forced"));
+
+   sc = structured(sim_tool(&f, "nvc_signal_set", id,
+                            "\"path\":\"/rst\",\"mode\":\"release\""));
+   ck_assert_int_eq(int_field(sc, "released"), 1);
+
+   // Forcing a vector needs the right number of elements
+   const char *e = tool_error(sim_tool(&f, "nvc_signal_set", id,
+                                       "\"path\":\"/q\",\"value\":\"101\""));
+   ck_assert_ptr_nonnull(strstr(e, "has 4 elements"));
+   e = tool_error(sim_tool(&f, "nvc_signal_set", id,
+                           "\"path\":\"/rst\",\"value\":\"banana\""));
+   ck_assert_ptr_nonnull(strstr(e, "is not valid for type"));
+   e = tool_error(sim_tool(&f, "nvc_signal_set", id,
+                           "\"path\":\"/rst\",\"mode\":\"release\""));
+   ck_assert_ptr_nonnull(strstr(e, "is not forced"));
+   e = tool_error(sim_tool(&f, "nvc_signal_set", id, "\"path\":\"/rst\""));
+   ck_assert_ptr_nonnull(strstr(e, "needs a value"));
+
+   // Mistakes say how to recover
+   e = tool_error(sim_tool(&f, "nvc_signal_get", id, "\"paths\":[\"/clok\"]"));
+   ck_assert_ptr_nonnull(strstr(e, "nvc_design_search"));
+   e = tool_error(sim_tool(&f, "nvc_signal_get", id, "\"paths\":[\"/dut\"]"));
+   ck_assert_ptr_nonnull(strstr(e, "is a region"));
+   e = tool_error(sim_tool(&f, "nvc_design_list", id, "\"path\":\"/nodut\""));
+   ck_assert_ptr_nonnull(strstr(e, "was not found"));
+   e = tool_error(sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"5 parsecs\""));
+   ck_assert_ptr_nonnull(strstr(e, "Invalid duration"));
+   e = tool_error(sim_tool(&f, "nvc_sim_run", id,
+                           "\"duration\":\"5 ns\",\"until\":\"1 us\""));
+   ck_assert_ptr_nonnull(strstr(e, "not both"));
+
+   // Closing releases the handle
+   sc = structured(sim_tool(&f, "nvc_sim_close", id, ""));
+   ck_assert(bool_field(sc, "closed"));
+   ck_assert_int_eq(int_field(sc, "open_simulations"), 0);
+
+   e = tool_error(sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"5 ns\""));
+   ck_assert_ptr_nonnull(strstr(e, "is not open"));
+   e = tool_error(sim_tool(&f, "nvc_sim_close", id, ""));
+   ck_assert_ptr_nonnull(strstr(e, "is not open"));
+
+   fixture_close(&f);
+}
+END_TEST
+
+START_TEST(test_sim_run_modes)
+{
+   fixture_t f;
+   const char *names[] = { "tb.vhd", "finite.vhd", "failing.vhd", "chatty.vhd" };
+   const char *sources[] = { tb_src, finite_src, fail_src, chatty_src };
+   const char *tops[] = { "tb", "finite", "failing", "chatty" };
+   fixture_open(&f, names, sources, 4, tops, 4);
+
+   char id[40];
+   const json_t *sc;
+
+   // A design with nothing left to do finishes and stays finished
+   open_sim(&f, "finite", id);
+   sc = structured(sim_tool(&f, "nvc_sim_run", id, ""));
+   ck_assert_str_eq(str_field(sc, "stopped_because"), "finished");
+   ck_assert_int_ge(int_field(sc, "now_fs"), 50000000);
+   ck_assert_int_eq(json_get(sc, "next_event_fs")->kind, JSON_NULL);
+   ck_assert_ptr_nonnull(strstr(str_field(sc, "hint"), "has finished"));
+   const int64_t end_time = int_field(sc, "now_fs");
+   sc = structured(sim_tool(&f, "nvc_sim_run", id, ""));
+   ck_assert_str_eq(str_field(sc, "stopped_because"), "finished");
+   ck_assert_int_eq(int_field(sc, "now_fs"), end_time);
+   sim_tool(&f, "nvc_sim_close", id, "");
+
+   // A run is bounded by real time and can be continued
+   open_sim(&f, "tb", id);
+   sc = structured(sim_tool(&f, "nvc_sim_run", id,
+                            "\"max_wall_ms\":300,\"pause_on\":\"never\""));
+   ck_assert_str_eq(str_field(sc, "stopped_because"), "wall_budget");
+   ck_assert_int_ge(int_field(sc, "wall_ms"), 250);
+   // The testbench reports an error every few cycles: the hint points at
+   // pause_on rather than just saying to call again
+   ck_assert_ptr_nonnull(strstr(str_field(sc, "hint"), "real time limit"));
+   ck_assert_ptr_nonnull(strstr(str_field(sc, "hint"), "pause_on error"));
+   ck_assert_int_gt(int_field(sc, "now_fs"), 65000000);
+   const int64_t reached = int_field(sc, "now_fs");
+   ck_assert_int_gt(int_field(json_get(sc, "counts"), "error"), 0);
+
+   sc = structured(sim_tool(&f, "nvc_sim_run", id,
+                            "\"duration\":\"10 ns\",\"pause_on\":\"never\""));
+   ck_assert_str_eq(str_field(sc, "stopped_because"), "time");
+   ck_assert_int_gt(int_field(sc, "now_fs"), reached);
+   sim_tool(&f, "nvc_sim_close", id, "");
+
+   // A failure ends the simulation but the signals stay readable
+   open_sim(&f, "failing", id);
+   sc = structured(sim_tool(&f, "nvc_sim_run", id, ""));
+   ck_assert_str_eq(str_field(sc, "stopped_because"), "terminated");
+   ck_assert_ptr_nonnull(strstr(str_field(sc, "hint"), "cannot continue"));
+   ck_assert_int_ne(int_field(sc, "exit_status"), 0);
+   ck_assert_int_eq(int_field(sc, "now_fs"), 30000000);
+   ck_assert_int_ge(int_field(json_get(sc, "counts"), "failure"), 1);
+   const json_t *last = json_at(json_get(sc, "messages"),
+                                json_get(sc, "messages")->array.count - 1);
+   ck_assert_ptr_nonnull(strstr(str_field(last, "message"), "giving up"));
+
+   sc = structured(sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"10 ns\""));
+   ck_assert_str_eq(str_field(sc, "stopped_because"), "terminated");
+   sc = structured(sim_tool(&f, "nvc_signal_get", id, "\"paths\":[\"/x\"]"));
+   ck_assert_str_eq(str_field(json_at(json_get(sc, "values"), 0), "value"), "7");
+   sim_tool(&f, "nvc_sim_close", id, "");
+
+   // Too many messages are counted but not all returned
+   open_sim(&f, "chatty", id);
+   sc = structured(sim_tool(&f, "nvc_sim_run", id, ""));
+   ck_assert_str_eq(str_field(sc, "stopped_because"), "finished");
+   ck_assert_int_eq(json_get(sc, "messages")->array.count, 100);
+   ck_assert(bool_field(sc, "messages_truncated"));
+   ck_assert_int_eq(int_field(json_get(sc, "counts"), "note"), 300);
+   sim_tool(&f, "nvc_sim_close", id, "");
+
+   fixture_close(&f);
+}
+END_TEST
+
+START_TEST(test_sim_hang)
+{
+   fixture_t f;
+   const char *names[] = { "hang.vhd" }, *sources[] = { hang_src };
+   const char *tops[] = { "hang" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   char id[40];
+   open_sim(&f, "hang", id);
+
+   // The process never waits so the worker cannot give control back: it
+   // is stopped after a grace period and the handle is gone
+   const char *e = tool_error(sim_tool(&f, "nvc_sim_run", id,
+                                       "\"max_wall_ms\":200"));
+   ck_assert_ptr_nonnull(strstr(e, "did not respond within 200 ms"));
+   ck_assert_ptr_nonnull(strstr(e, "wait statement"));
+
+   e = tool_error(sim_tool(&f, "nvc_signal_get", id, "\"paths\":[\"/s\"]"));
+   ck_assert_ptr_nonnull(strstr(e, "is not open"));
+
+   // The server is fine: a new simulation can be opened
+   open_sim(&f, "hang", id);
+   sim_tool(&f, "nvc_sim_close", id, "");
+
+   fixture_close(&f);
+}
+END_TEST
+
+#define READY_JSON                                                      \
+   "{\"event\":\"ready\",\"signals\":0,\"regions\":1,\"root\":\"/\","   \
+   "\"now_fs\":0,\"now\":\"0 fs\",\"delta\":0,\"next_event_fs\":null,"  \
+   "\"messages\":[],\"messages_truncated\":false,\"counts\":{}}"
+
+// A stand-in for the worker that reports ready and then does as told
+#define FAKE_READY                                                      \
+   "#!/bin/sh\n"                                                        \
+   "for a in \"$@\"; do case \"$a\" in --fd=*) fd=${a#--fd=};; esac; done\n" \
+   "printf '%s\\n' '" READY_JSON "' >&$fd\n"
+
+static mcp_server_t *fake_sim_server(sink_t *sink, const char *root,
+                                     const char *script)
+{
+   write_file(root, "worker.sh", script, 0755);
+
+   char *exe = xasprintf("%s/worker.sh", root);
+   mcp_server_t *srv = new_server(sink, root, exe);
+   free(exe);
+   return srv;
+}
+
+START_TEST(test_sim_fake_workers)
+{
+   char *root = make_workspace();
+   mem_pool_t *mp = pool_new();
+   sink_t sink = {};
+   const char *e;
+   const json_t *sc;
+
+   // Four simulations at most
+   mcp_server_t *srv = fake_sim_server(&sink, root,
+                                       FAKE_READY "exec sleep 60\n");
+   char ids[4][40];
+   for (int i = 0; i < 4; i++) {
+      sc = structured(tool(mp, srv, &sink, "nvc_sim_open",
+                           "{\"top\":\"anything\"}"));
+      snprintf(ids[i], sizeof(ids[i]), "%s", str_field(sc, "sim_id"));
+      ck_assert_int_eq(int_field(sc, "open_simulations"), i + 1);
+   }
+
+   e = tool_error(tool(mp, srv, &sink, "nvc_sim_open",
+                       "{\"top\":\"anything\"}"));
+   ck_assert_ptr_nonnull(strstr(e, "4 simulations are already open"));
+   ck_assert_ptr_nonnull(strstr(e, ids[0]));
+
+   char args[128];
+   snprintf(args, sizeof(args), "{\"sim_id\":\"%s\"}", ids[2]);
+   sc = structured(tool(mp, srv, &sink, "nvc_sim_close", args));
+   ck_assert_int_eq(int_field(sc, "open_simulations"), 3);
+   sc = structured(tool(mp, srv, &sink, "nvc_sim_open",
+                        "{\"top\":\"anything\"}"));
+   ck_assert_int_eq(int_field(sc, "open_simulations"), 4);
+
+   // A worker that stops answering is stopped and forgotten
+   snprintf(args, sizeof(args), "{\"sim_id\":\"%s\",\"max_wall_ms\":100}",
+            ids[0]);
+   e = tool_error(tool(mp, srv, &sink, "nvc_sim_run", args));
+   ck_assert_ptr_nonnull(strstr(e, "did not respond within 100 ms"));
+   snprintf(args, sizeof(args), "{\"sim_id\":\"%s\",\"paths\":[\"/a\"]}",
+            ids[0]);
+   e = tool_error(tool(mp, srv, &sink, "nvc_signal_get", args));
+   ck_assert_ptr_nonnull(strstr(e, "is not open"));
+
+   // Freeing the server ends the workers that are left
+   mcp_server_free(srv);
+
+   // A worker that dies after starting is reported with its exit status
+   srv = fake_sim_server(&sink, root, FAKE_READY "exit 3\n");
+   sc = structured(tool(mp, srv, &sink, "nvc_sim_open", "{\"top\":\"x\"}"));
+   snprintf(args, sizeof(args), "{\"sim_id\":\"%s\"}", str_field(sc, "sim_id"));
+   usleep(200000);
+   e = tool_error(tool(mp, srv, &sink, "nvc_design_list", args));
+   ck_assert_ptr_nonnull(strstr(e, "exited with status 3"));
+   ck_assert_ptr_nonnull(strstr(e, "Open a new simulation"));
+   mcp_server_free(srv);
+
+   // A design that cannot be loaded explains why
+   srv = fake_sim_server(&sink, root,
+                         "#!/bin/sh\necho '** Fatal: WORK.X not elaborated'\n"
+                         "exit 1\n");
+   e = tool_error(tool(mp, srv, &sink, "nvc_sim_open", "{\"top\":\"x\"}"));
+   ck_assert_ptr_nonnull(strstr(e, "could not be loaded"));
+   ck_assert_ptr_nonnull(strstr(e, "not elaborated"));
+   ck_assert_ptr_nonnull(strstr(e, "nvc_elaborate"));
+   mcp_server_free(srv);
+
+   // ... and one that never starts is given up on
+   srv = fake_sim_server(&sink, root, "#!/bin/sh\nexec sleep 60\n");
+   e = tool_error(tool(mp, srv, &sink, "nvc_sim_open",
+                       "{\"top\":\"x\",\"timeout_ms\":1000}"));
+   ck_assert_ptr_nonnull(strstr(e, "took too long"));
+
+   // Bad names never reach a process
+   e = tool_error(tool(mp, srv, &sink, "nvc_sim_open", "{\"top\":\"a b\"}"));
+   ck_assert_ptr_nonnull(strstr(e, "Invalid design unit name"));
+   e = tool_error(tool(mp, srv, &sink, "nvc_sim_open",
+                       "{\"top\":\"x\",\"library\":\"a:b\"}"));
+   ck_assert_ptr_nonnull(strstr(e, "Invalid library name"));
+   mcp_server_free(srv);
+
+   sink_clear(&sink);
+   pool_free(mp);
+   remove_tree(root);
+   free(root);
+}
+END_TEST
+
+START_TEST(test_sim_not_elaborated)
+{
+   fixture_t f;
+   const char *names[] = { "tb.vhd" }, *sources[] = { tb_src };
+   fixture_open(&f, names, sources, 1, NULL, 0);   // Analysed only
+
+   const char *e = tool_error(tool(f.mp, f.srv, &f.sink, "nvc_sim_open",
+                                   "{\"top\":\"tb\",\"std\":\"2008\"}"));
+   ck_assert_ptr_nonnull(strstr(e, "not elaborated"));
+   ck_assert_ptr_nonnull(strstr(e, "nvc_elaborate"));
+
+   fixture_close(&f);
+}
+END_TEST
+
+START_TEST(test_sim_cancel_run)
+{
+   fixture_t f;
+   const char *names[] = { "tb.vhd" }, *sources[] = { tb_src };
+   const char *tops[] = { "tb" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   // Drive a second server over the same workspace from a pipe
+   int fds[2];
+   ck_assert_int_eq(pipe(fds), 0);
+
+   sink_t sink = {};
+   const mcp_options_t opts = {
+      .write     = sink_write,
+      .write_ctx = &sink,
+      .in_fd     = fds[0],
+      .exe       = f.nvc,
+      .root      = f.root,
+   };
+   mcp_server_t *srv = mcp_server_new(&opts);
+
+   const json_t *sc = structured(tool(f.mp, srv, &sink, "nvc_sim_open",
+                                      "{\"top\":\"tb\",\"std\":\"2008\"}"));
+   char id[40];
+   snprintf(id, sizeof(id), "%s", str_field(sc, "sim_id"));
+
+   char *run = xasprintf(
+      "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":"
+      "{\"name\":\"nvc_sim_run\",\"arguments\":{\"sim_id\":\"%s\","
+      "\"pause_on\":\"never\",\"max_wall_ms\":120000}," MODERN_META "}}\n", id);
+   char *later = xasprintf(
+      "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\","
+      "\"params\":{\"requestId\":7}}\n"
+      "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":"
+      "{\"name\":\"nvc_signal_get\",\"arguments\":{\"sim_id\":\"%s\","
+      "\"paths\":[\"/q\"]}," MODERN_META "}}\n", id);
+
+   ck_assert_int_eq(write(fds[1], run, strlen(run)), (ssize_t)strlen(run));
+
+   sink_clear(&sink);
+   writer_t w = { fds[1], later, 400 };
+   pthread_t thread;
+   ck_assert_int_eq(pthread_create(&thread, NULL, delayed_writer, &w), 0);
+
+   const uint64_t start = get_timestamp_us();
+   mcp_server_run(srv);
+   const uint64_t ms = (get_timestamp_us() - start) / 1000;
+   pthread_join(thread, NULL);
+
+   // The long run was cut short and got no response; the simulation kept
+   // what it had simulated and answers the next request
+   ck_assert_int_lt(ms, 30000);
+   ck_assert_int_eq(sink.count, 1);
+   json_t *r = parse_ok(f.mp, sink.lines[0]);
+   ck_assert_int_eq(int_field(r, "id"), 8);
+   sc = structured(json_get(r, "result"));
+   ck_assert_int_gt(int_field(sc, "now_fs"), 0);
+
+   mcp_server_free(srv);
+   sink_clear(&sink);
+   close(fds[0]);
+   free(run);
+   free(later);
+   fixture_close(&f);
+}
+END_TEST
+
+START_TEST(test_sim_progress)
+{
+   fixture_t f;
+   const char *names[] = { "tb.vhd" }, *sources[] = { tb_src };
+   const char *tops[] = { "tb" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   char id[40];
+   open_sim(&f, "tb", id);
+
+   char *req = xasprintf(
+      "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":"
+      "{\"name\":\"nvc_sim_run\",\"arguments\":{\"sim_id\":\"%s\","
+      "\"pause_on\":\"never\",\"max_wall_ms\":900},\"_meta\":{"
+      "\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\","
+      "\"io.modelcontextprotocol/clientCapabilities\":{},"
+      "\"progressToken\":\"tok-1\"}}}", id);
+
+   sink_clear(&f.sink);
+   mcp_server_handle_line(f.srv, req, strlen(req));
+   free(req);
+
+   // Notifications for the token come first, with rising progress, then
+   // the one response
+   ck_assert_int_ge(f.sink.count, 3);
+   int64_t previous = -1;
+   for (size_t i = 0; i + 1 < f.sink.count; i++) {
+      json_t *n = parse_ok(f.mp, f.sink.lines[i]);
+      ck_assert_str_eq(str_field(n, "method"), "notifications/progress");
+      const json_t *params = json_get(n, "params");
+      ck_assert_str_eq(str_field(params, "progressToken"), "tok-1");
+      ck_assert_int_gt(int_field(params, "progress"), previous);
+      previous = int_field(params, "progress");
+   }
+
+   json_t *last = parse_ok(f.mp, f.sink.lines[f.sink.count - 1]);
+   ck_assert_int_eq(int_field(last, "id"), 5);
+
+   // Without a token there are no notifications
+   const json_t *sc = structured(sim_tool(&f, "nvc_sim_run", id,
+                                          "\"pause_on\":\"never\","
+                                          "\"max_wall_ms\":600"));
+   ck_assert_str_eq(str_field(sc, "stopped_because"), "wall_budget");
+   ck_assert_int_eq(f.sink.count, 1);
+
+   fixture_close(&f);
+}
+END_TEST
+
 Suite *get_mcp_tests(void)
 {
    Suite *s = suite_create("mcp");
@@ -1125,6 +2042,16 @@ Suite *get_mcp_tests(void)
    tcase_add_test(tc, test_cancel_queued);
    tcase_add_test(tc, test_input_framing);
    tcase_add_test(tc, test_input_too_large);
+   tcase_add_test(tc, test_workspace_list);
+   tcase_add_test(tc, test_library_and_elaborate);
+   tcase_add_test(tc, test_sim_lifecycle);
+   tcase_add_test(tc, test_sim_run_modes);
+   tcase_add_test(tc, test_sim_hang);
+   tcase_add_test(tc, test_sim_fake_workers);
+   tcase_add_test(tc, test_sim_not_elaborated);
+   tcase_add_test(tc, test_sim_cancel_run);
+   tcase_add_test(tc, test_sim_progress);
+   tcase_set_timeout(tc, 60);
    suite_add_tcase(s, tc);
 
    return s;

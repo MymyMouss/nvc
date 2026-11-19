@@ -44,6 +44,15 @@ void model_free(rt_model_t *m);
 void model_reset(rt_model_t *m);
 void model_run(rt_model_t *m, uint64_t stop_time);
 bool model_step(rt_model_t *m);
+
+// Piecewise alternative to model_run: call model_start once, then
+// model_run_cycles as many times as needed, then model_end
+void model_start(rt_model_t *m);
+bool model_run_cycles(rt_model_t *m, uint64_t stop_time, unsigned max_cycles,
+                      const bool *halt);
+void model_end(rt_model_t *m);
+bool model_is_terminated(rt_model_t *m);   // Stopped by an error or abort
+bool model_is_finished(rt_model_t *m);     // No events remain
 bool model_can_create_delta(rt_model_t *m);
 int64_t model_now(rt_model_t *m, unsigned *deltas);
 int64_t model_next_time(rt_model_t *m);

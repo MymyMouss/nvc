@@ -118,4 +118,8 @@ void jw_bool(json_writer_t *w, bool value);
 void jw_null(json_writer_t *w);
 void jw_raw(json_writer_t *w, const char *json);   // Already serialised
 
+// Append already serialised object members such as "a":1,"b":2 to the
+// object being written
+void jw_raw_members(json_writer_t *w, const char *members);
+
 #endif   // _MCP_JSON_H

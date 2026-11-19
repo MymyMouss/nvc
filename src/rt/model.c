@@ -3439,6 +3439,53 @@ bool model_step(rt_model_t *m)
    return should_stop_now(m, TIME_HIGH);
 }
 
+void model_start(rt_model_t *m)
+{
+   MODEL_ENTRY(m);
+
+   if (!m->force_stop)
+      run_callbacks(m, START_OF_SIMULATION);
+}
+
+bool model_run_cycles(rt_model_t *m, uint64_t stop_time, unsigned max_cycles,
+                      const bool *halt)
+{
+   MODEL_ENTRY(m);
+
+   // Unlike model_run this may be called repeatedly to resume: the
+   // caller decides when to look at the clock or stop early.  The halt
+   // flag, which may be set by a callback during a cycle, is checked
+   // after every cycle so the caller can stop at an exact point.
+   for (unsigned i = 0; i < max_cycles && !should_stop_now(m, stop_time); i++) {
+      model_cycle(m);
+
+      if (halt != NULL && *halt)
+         break;
+   }
+
+   return should_stop_now(m, stop_time);
+}
+
+void model_end(rt_model_t *m)
+{
+   MODEL_ENTRY(m);
+
+   run_callbacks(m, END_OF_SIMULATION);
+
+   if (m->liveness)
+      check_liveness_properties(m, m->root);
+}
+
+bool model_is_terminated(rt_model_t *m)
+{
+   return relaxed_load(&m->force_stop);
+}
+
+bool model_is_finished(rt_model_t *m)
+{
+   return !m->next_is_delta && heap_size(m->eventq_heap) == 0;
+}
+
 static inline void check_postponed(int64_t after, rt_proc_t *proc)
 {
    if (unlikely(proc->wakeable.postponed && after == 0))

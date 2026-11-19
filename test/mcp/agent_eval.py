@@ -11,13 +11,15 @@
 #   pip install claude-agent-sdk      # needs the claude CLI, logged in
 #   python3 test/mcp/agent_eval.py --nvc build/bin/nvc
 #
-# Each scenario gets a fresh workspace.  The outcome is checked by running
-# nvc directly on the workspace, never by trusting the agent's report.
+# Each scenario gets a fresh workspace.  The outcome is checked against
+# what nvc itself reports, never by trusting the agent's account.  The
+# prompts do not name any tool: choosing them is part of the test.
 
 import argparse
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -80,25 +82,68 @@ begin
 end architecture;
 """
 
-FINISH = "Finish with exactly one line: RESULT: PASS or RESULT: FAIL."
+# The counter is expected to stay below five: it does not, at 65 ns
+CHECKED_TESTBENCH = """\
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
 
-# name, prompt, uses file tools, design has a bug, files in dependency order
+entity checked_tb is
+end entity;
+
+architecture test of checked_tb is
+  signal clk : std_logic := '0';
+  signal rst : std_logic := '1';
+  signal q   : unsigned(3 downto 0);
+begin
+  dut : entity work.counter port map (clk => clk, rst => rst, q => q);
+  clk <= not clk after 5 ns;
+  process
+  begin
+    wait for 12 ns;
+    rst <= '0';
+    wait;
+  end process;
+  process (clk)
+  begin
+    if rising_edge(clk) and rst = '0' then
+      assert q /= 5 report "counter reached five" severity error;
+    end if;
+  end process;
+end architecture;
+"""
+
+FINISH = "Finish with exactly one line: RESULT: PASS or RESULT: FAIL."
+FILE_TOOLS = ["Read", "Edit", "Glob"]
+
 SCENARIOS = [
-    ("fix-error",
-     "The directory src/ contains a small VHDL design: a counter and its "
-     "testbench. Check whether the design compiles with nvc. If it does "
-     "not, explain the problem, fix the source, and confirm that "
-     "everything now compiles. " + FINISH,
-     True, True),
-    ("order-and-std",
-     "Using the VHDL-2008 standard, compile src/counter_tb.vhd and "
-     "src/counter.vhd with nvc. Tell me whether it worked and, if not, "
-     "why. " + FINISH,
-     True, False),
-    ("wrong-path-no-file-tools",
-     "Analyse the file counter.vhd with nvc and tell me the outcome. You "
-     "only have the nvc tool. " + FINISH,
-     False, False),
+    dict(name="fix-error", files="buggy", tools=FILE_TOOLS, check="compiles",
+         prompt="The directory src/ contains a small VHDL design: a counter "
+         "and its testbench. Check whether the design compiles with nvc. If "
+         "it does not, explain the problem, fix the source, and confirm "
+         "that everything now compiles. " + FINISH),
+    dict(name="order-and-std", files="good", tools=FILE_TOOLS, check="library",
+         prompt="Using the VHDL-2008 standard, compile src/counter_tb.vhd "
+         "and src/counter.vhd with nvc. Tell me whether it worked and, if "
+         "not, why. " + FINISH),
+    dict(name="wrong-path-no-file-tools", files="good", tools=[],
+         check="library",
+         prompt="Analyse the file counter.vhd with nvc and tell me the "
+         "outcome. You only have the nvc tool. " + FINISH),
+    dict(name="discover-units", files="good", tools=[],
+         check=r"RESULT:.*counter_tb.*|RESULT:.*counter.*counter_tb",
+         both=("counter", "counter_tb"),
+         prompt="I do not know what is in this workspace. Find out which "
+         "VHDL entities it defines. Finish with exactly one line in this "
+         "form: RESULT: <entity names separated by commas>"),
+    dict(name="debug-assertion", files="checked", tools=[],
+         check=r"RESULT:\s*65\s*ns\s+5\s*$",
+         prompt="src/ holds a counter and a testbench called checked_tb. "
+         "Simulate the testbench and find out at what simulated time its "
+         "assertion fails, and the value, in decimal, of the register cnt "
+         "inside the counter instance at that moment. Finish with exactly "
+         "one line in this form: RESULT: <time in ns> <value>, for example "
+         "RESULT: 40 ns 3"),
 ]
 
 
@@ -113,13 +158,19 @@ def nvc_env(nvc):
     return env
 
 
-def make_workspace(buggy):
+def make_workspace(kind):
     ws = tempfile.mkdtemp(prefix="nvc-agent-eval-")
     os.makedirs(os.path.join(ws, "src"))
-    with open(os.path.join(ws, "src", "counter.vhd"), "w") as f:
-        f.write(COUNTER % ("count" if buggy else "cnt"))
-    with open(os.path.join(ws, "src", "counter_tb.vhd"), "w") as f:
-        f.write(TESTBENCH)
+
+    def put(name, text):
+        with open(os.path.join(ws, "src", name), "w") as f:
+            f.write(text)
+
+    put("counter.vhd", COUNTER % ("count" if kind == "buggy" else "cnt"))
+    if kind == "checked":
+        put("checked_tb.vhd", CHECKED_TESTBENCH)
+    else:
+        put("counter_tb.vhd", TESTBENCH)
     return ws
 
 
@@ -130,32 +181,30 @@ def design_compiles(nvc, ws):
     return r.returncode == 0
 
 
-async def run(nvc, model, name, prompt, file_tools, buggy):
-    ws = make_workspace(buggy)
-    allowed = ["mcp__nvc__nvc_analyse"]
-    if file_tools:
-        allowed += ["Read", "Edit", "Glob"]
+async def run(nvc, model, sc):
+    name, prompt = sc["name"], sc["prompt"]
+    ws = make_workspace(sc["files"])
 
     options = ClaudeAgentOptions(
         model=model, cwd=ws, cli_path=shutil.which("claude"),
         system_prompt={"type": "preset", "preset": "claude_code"},
         setting_sources=[],
-        tools=["Read", "Edit", "Glob"] if file_tools else [],   # no Bash
-        allowed_tools=allowed,
+        tools=sc["tools"],                       # never Bash
+        allowed_tools=["mcp__nvc"] + sc["tools"],
         mcp_servers={"nvc": {"type": "stdio", "command": nvc,
                              "args": ["--mcp", "--root", ws],
                              "env": {"NVC_LIBPATH":
                                      nvc_env(nvc)["NVC_LIBPATH"]}}},
-        max_turns=14, max_budget_usd=1.0, stderr=lambda line: None)
+        max_turns=20, max_budget_usd=1.0, stderr=lambda line: None)
 
     print("\n######## %s\nPROMPT: %s" % (name, prompt))
-    names, mcp_calls, mcp_errors, result = {}, 0, 0, None
+    names, calls, mcp_errors, result = {}, [], 0, None
     async for m in query(prompt=prompt, options=options):
         if isinstance(m, AssistantMessage):
             for b in m.content:
                 if isinstance(b, ToolUseBlock):
                     names[b.id] = b.name
-                    mcp_calls += b.name.startswith("mcp__nvc__")
+                    calls.append(b.name.replace("mcp__nvc__", "nvc:"))
                     print("  -> %s %s" % (b.name, short(b.input, 300)))
                 elif isinstance(b, TextBlock) and b.text.strip():
                     print("  [say] %s" % short(b.text, 500))
@@ -170,17 +219,25 @@ async def run(nvc, model, name, prompt, file_tools, buggy):
         elif isinstance(m, ResultMessage):
             result = m
 
-    said_pass = (result.result or "").strip().endswith("RESULT: PASS")
-    if buggy:
-        verified = design_compiles(nvc, ws)   # the agent had to repair it
+    text = (result.result or "").strip()
+    last = text.splitlines()[-1] if text else ""
+
+    check = sc["check"]
+    if check == "compiles":
+        ok = last.endswith("RESULT: PASS") and design_compiles(nvc, ws)
+    elif check == "library":
+        ok = last.endswith("RESULT: PASS") and os.path.isdir(
+            os.path.join(ws, "work"))
     else:
-        verified = os.path.isdir(os.path.join(ws, "work"))
+        ok = re.search(check, last, re.I) is not None
+        for word in sc.get("both", ()):
+            ok = ok and re.search(r"\b%s\b" % word, last, re.I) is not None
     shutil.rmtree(ws, ignore_errors=True)
 
-    return {"scenario": name, "passed": said_pass and verified,
-            "said_pass": said_pass, "verified": verified,
-            "turns": result.num_turns, "mcp_calls": mcp_calls,
-            "mcp_errors": mcp_errors,
+    print("  final line: %s" % short(last, 200))
+    return {"scenario": name, "passed": bool(ok), "turns": result.num_turns,
+            "calls": len(calls), "mcp_errors": mcp_errors,
+            "sequence": " ".join(calls),
             "seconds": round(result.duration_ms / 1000, 1),
             "cost_usd": round(result.total_cost_usd or 0, 5)}
 
@@ -194,13 +251,15 @@ async def main():
     args = ap.parse_args()
 
     nvc = os.path.abspath(args.nvc)
-    rows = [await run(nvc, args.model, *s) for s in SCENARIOS
-            if args.scenario in (None, s[0])]
+    rows = [await run(nvc, args.model, sc) for sc in SCENARIOS
+            if args.scenario in (None, sc["name"])]
 
     print("\n==== SUMMARY (model %s) ====" % args.model)
     for r in rows:
         print(json.dumps(r))
-    print("total cost: $%.4f" % sum(r["cost_usd"] for r in rows))
+    print("passed %d of %d, total cost: $%.4f"
+          % (sum(r["passed"] for r in rows), len(rows),
+             sum(r["cost_usd"] for r in rows)))
     return 0 if rows and all(r["passed"] for r in rows) else 1
 
 

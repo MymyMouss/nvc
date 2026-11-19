@@ -121,7 +121,7 @@ static int scan_cmd(int start, int argc, char **argv)
       "-a", "-e", "-r", "-c", "--dump", "--make", "--syntax", "--list",
       "--init", "--install", "--print-deps", "--do", "-i",
       "--cover-export", "--preprocess", "--cover-merge",
-      "--cover-report", "--mcp",
+      "--cover-report", "--mcp", "--mcp-worker",
    };
 
    for (int i = start; i < argc; i++) {
@@ -1684,6 +1684,74 @@ static int do_cmd(int argc, char **argv, cmd_state_t *state)
    return argc > 1 ? process_command(argc, argv, state) : EXIT_SUCCESS;
 }
 
+static int mcp_worker_cmd(int argc, char **argv, cmd_state_t *state)
+{
+   static struct option long_options[] = {
+      { "fd", required_argument, 0, 'f' },
+      { 0, 0, 0, 0 }
+   };
+
+   const int next_cmd = scan_cmd(2, argc, argv);
+   int c, index = 0, ctl_fd = -1;
+   const char *spec = ":";
+   while ((c = getopt_long(next_cmd, argv, spec, long_options, &index)) != -1) {
+      switch (c) {
+      case 0: break;  // Set a flag
+      case 'f':
+         ctl_fd = parse_int(optarg);
+         break;
+      case '?': bad_option("mcp-worker", argv);
+      case ':': missing_argument("mcp-worker", argv);
+      default: abort();
+      }
+   }
+
+   if (ctl_fd < 0)
+      fatal("the $bold$--mcp-worker$$ command requires $bold$--fd$$");
+
+   set_top_level(argv, next_cmd, state);
+
+   ident_t ename = ident_prefix(state->top_level, well_known(W_ELAB), '.');
+
+   const unit_meta_t *meta = NULL;
+   object_t *obj = lib_get_generic(state->work, ename, &meta);
+   if (obj == NULL)
+      fatal("%s not elaborated", istr(state->top_level));
+
+   tree_t top = tree_from_object(obj);
+   assert(top != NULL);
+
+   opt_set_int(OPT_NO_COLLAPSE, meta->no_collapse);
+
+   if (state->mir == NULL)
+      state->mir = mir_context_new();
+
+   if (state->registry == NULL)
+      state->registry = unit_registry_new(state->mir);
+
+   if (state->jit == NULL)
+      state->jit = get_jit(state);
+
+   state->model = model_new(state->jit, NULL);
+   reheat(top, state->registry, state->mir, NULL, state->model);
+
+   state->vhpi = vhpi_context_new();
+   state->vpi = vpi_context_new();
+
+   const int rc = mcp_worker_main(state->model, top, ctl_fd);
+
+   vhpi_context_free(state->vhpi);
+   state->vhpi = NULL;
+
+   vpi_context_free(state->vpi);
+   state->vpi = NULL;
+
+   model_free(state->model);
+   state->model = NULL;
+
+   return rc;
+}
+
 static int mcp_cmd(int argc, char **argv, cmd_state_t *state)
 {
    static struct option long_options[] = {
@@ -2602,6 +2670,7 @@ static int process_command(int argc, char **argv, cmd_state_t *state)
       { "cover-report", no_argument, 0, 'p' },
       { "preprocess",   no_argument, 0, 'R' },
       { "mcp",          no_argument, 0, 'C' },
+      { "mcp-worker",   no_argument, 0, 'K' },
       { 0, 0, 0, 0 }
    };
 
@@ -2647,6 +2716,8 @@ static int process_command(int argc, char **argv, cmd_state_t *state)
       return preprocess_cmd(argc, argv, state);
    case 'C':
       return mcp_cmd(argc, argv, state);
+   case 'K':
+      return mcp_worker_cmd(argc, argv, state);
    default:
       fatal("missing command, try $bold$%s --help$$ for usage", PACKAGE);
       return EXIT_FAILURE;
