@@ -582,6 +582,87 @@ La survie d'un run à la mort du worker, du serveur ou du client reste
 l'affaire des checkpoints (`PLAN.md` §1): ni les tâches MCP (processus stdio)
 ni le run de fond n'y répondent.
 
+## 8. Gros fichiers d'une simulation longue
+
+### 8.1 Ce qui grossit, mesuré
+
+Build de debug, 4 cœurs. Deux designs de 16 registres de 32 bits à 100 MHz:
+des compteurs (données très régulières) et des registres pseudo-aléatoires
+(cas défavorable).
+
+| Fichier | Mesure | Croît avec |
+|---|---|---|
+| FST, compteurs, tous les signaux | 12 Ko pour 2 ms (6,8 millions de changements relus) | le temps, mais se compresse presque à rien |
+| VCD, mêmes compteurs | 227 Mo pour 2 ms | le temps, sans compression |
+| FST, registres aléatoires, tous les signaux | 7,2 Mo par ms simulée, soit environ 7 Go par seconde simulée | le temps, le nombre de signaux et leur activité |
+| FST, un seul registre aléatoire | 0,45 Mo par ms, 16 fois moins | proportionnel au nombre de signaux actifs |
+| Surcoût de calcul d'un FST complet | +15 % (11,3 s contre 9,8 s); filtré: indiscernable | |
+| Journaux (`report`, `textio`) | non borné par nvc | l'activité du design |
+| Fichier de couverture | borné par la taille du design | pas le temps |
+| Checkpoints (à venir) | taille de l'état, pas du temps | le nombre d'instantanés gardés |
+
+La compression du FST dépend entièrement de la régularité des données: les
+compteurs sont un cas extrême, pas une prévision. La syntaxe des filtres de
+nvc utilise `:` comme séparateur (`--include=':top:gen(0):u:r'`), pas `/`.
+
+### 8.2 État actuel du serveur
+
+Aucun fichier d'ondes n'est produit par le serveur MCP. Ce qui existe: les
+traces en mémoire (bornées, 64 Mo au plus), `sim_output` plafonné à 16 Ko par
+appel, 100 messages par appel (compteurs exacts), et un fichier en mémoire
+pour la sortie texte qui n'est borné que par `RLIMIT_FSIZE` (256 Mo): au-delà,
+les écritures échouent sans message. Ce dernier point est un défaut à
+corriger. Le même plafond couperait un fichier d'ondes écrit par le worker:
+il faudra le traiter à part.
+
+### 8.3 Principes proposés
+
+1. **Le LLM ne lit jamais un gros fichier, il l'interroge.** Claude Code
+   écrit déjà dans un fichier tout résultat de plus de 25 000 jetons: un
+   résultat qui déborde est perdu pour le raisonnement. Les outils rendent
+   donc des réponses de taille bornée, paginées, et les gros volumes restent
+   sur disque derrière un outil de requête.
+2. **Les fichiers vivent dans l'espace de travail** (`.nvc-mcp/<sim_id>/`),
+   sous la même confinement que les sources, visibles de l'utilisateur et des
+   autres outils. Les résultats rendent le chemin, la taille, la plage de
+   temps et le débit de croissance, jamais le contenu (le type
+   `resource_link` de MCP convient à un chemin).
+3. **Le disque est borné et la limite est explicite.** Quota par simulation
+   et global. Au quota: soit l'enregistrement s'arrête avec un message qui
+   le dit, soit des **segments tournants** (un FST ne se tronque pas: un
+   nouveau fichier toutes les N Mo ou tous les T de temps simulé, en gardant
+   les K derniers). Une simulation ne remplit jamais le disque en silence.
+4. **Enregistrer peu par défaut.** Le coût et la taille dépendent du nombre
+   de signaux actifs. Ondes désactivées par défaut, activées à l'ouverture
+   avec des filtres (`include`/`exclude`, et éventuellement une fenêtre de
+   temps), et l'état annonce la taille et le débit avant qu'elle ne soit un
+   problème.
+5. **Interroger le fichier côté serveur.** La bibliothèque FST de `thirdparty`
+   contient déjà le lecteur (`fstReaderOpen`, `fstReaderIterBlocks2`,
+   `fstReaderSetFacProcessMask`), qui ne traite que les signaux demandés:
+   - `nvc_wave_summary`: signaux présents, plage de temps, nombre de
+     changements par signal;
+   - `nvc_wave_get`: une fenêtre de temps pour quelques signaux, au même
+     format que `nvc_trace_get`;
+   - `nvc_wave_find`: premier instant où un signal prend une valeur, ou
+     premier front après un instant donné.
+   Le coût est celui des signaux demandés, pas de la taille du fichier.
+6. **Les journaux suivent la même règle**: un fichier persistant avec un
+   outil de lecture par décalage et de recherche, les compteurs restant
+   exacts dans les résultats.
+7. **Rétention**: durée de vie des fichiers, option pour les garder à la
+   fermeture, nettoyage limité au répertoire `.nvc-mcp/`. Les checkpoints
+   partageront répertoire et quotas.
+
+### 8.4 Ordre de réalisation
+
+1. Corriger le plafond silencieux de la sortie texte.
+2. Ondes à l'ouverture (`wave` avec filtres, quota, segments) via le dumper de
+   nvc, et taille/débit dans `nvc_sim_status`.
+3. `nvc_wave_summary`, `nvc_wave_get`, `nvc_wave_find` par le lecteur FST.
+4. Journal persistant et sa lecture.
+5. Rétention et nettoyage.
+
 ## Références
 
 - Spécification MCP 2026-07-28, changements:
