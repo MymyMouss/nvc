@@ -793,6 +793,51 @@ mesure donc que ce que les modèles font déjà bien; il reste à lui donner des
 causes plus difficiles (plusieurs étapes, nombreux signaux, simulations
 longues) ou des bugs réels.
 
+### 8.9 Banc SoC: 23 fichiers, 10 bugs entre modules
+
+`test/mcp/bench/soc`: un SoC de 21 fichiers de design (UART, FIFO, parseur
+de commandes avec CRC et chien de garde, banc de registres, contrôleur
+d'interruptions, timer, générateur de timing vidéo, motif, filtre 3 points,
+gain/offset, statistiques, arbitre, constructeur de réponses) et un
+testbench auto-vérifiant en 7 phases (modèle de référence pixel par pixel,
+paquets de réponse vérifiés, ~416 µs simulées). Dix bugs, chacun dans un
+autre fichier ou un câblage: place libre de FIFO mal calculée
+(débordement seulement quand plusieurs réponses s'empilent), CRC non remis à
+zéro après abandon d'un paquet, bord du filtre, extension de signe de
+l'offset, effacement W1C qui efface tout, compteur de trames non remis à
+zéro, enables permutés au niveau top, statistiques sans le dernier pixel,
+taille d'image non relue au redémarrage, générique du chien de garde. La
+cause apparaît entre 48 µs et 280 µs; le testbench s'en aperçoit souvent bien
+plus tard et ailleurs. Juge: instant exact et chemin complet du signal
+(`/dut/u_ctrl/u_parser/crc_clr`), plus fichier et ligne de la faute.
+
+| Série (avec sources) | Instant et signal exacts | Bon fichier | Bonne ligne | Coût |
+|---|---|---|---|---|
+| petit modèle, sans outils temporels (2 essais) | 16/20 | 20/20 | 20/20 | 0,61 $ |
+| petit modèle, tous les outils (2 essais) | 14/20 | 19/20 | 19/20 | 1,08 $ |
+| modèle moyen, sans outils temporels | 10/10 | 10/10 | 10/10 | 1,85 $ |
+| modèle moyen, tous les outils | 10/10 | 10/10 | 10/10 | ~2,0 $ |
+
+Constats:
+- Les deux modèles **localisent la faute dans le code presque toujours**
+  (59/60 fichier et ligne). Avec les sources et une spécification en tête de
+  chaque fichier, lire les 23 fichiers (environ 11 lectures par essai) suffit
+  à trouver la plupart des bugs; la simulation sert à confirmer.
+- Les échecs du petit modèle sont presque tous des **quasi-réussites**: le
+  registre CRC un cycle après le signal `crc_clr` fautif, le signal de sortie
+  du chien de garde 10 ns avant le compteur, ou le premier pixel faux au lieu
+  du compteur de trame qui l'a causé. Un seul échec franc (un signal UART
+  sans rapport).
+- **Aucun gain mesurable des outils temporels**, et le petit modèle coûte
+  plus cher avec (1,08 $ contre 0,61 $), surtout à cause d'un essai long.
+  Ils sont peu utilisés: `nvc_wave_find` 18 fois et `nvc_wave_table` 10
+  fois en 20 essais, `nvc_signal_drivers` jamais.
+- Un défaut d'usage net: le petit modèle ouvre **3,7 simulations par essai**
+  (74 `nvc_sim_open` pour 20 essais), parce qu'il faut démarrer
+  l'enregistrement avant le run et qu'il découvre après coup quels signaux il
+  lui fallait. Un enregistrement en mémoire de tous les signaux, démarré
+  d'office à l'ouverture, éviterait ces relances.
+
 ## Références
 
 - Spécification MCP 2026-07-28, changements:
