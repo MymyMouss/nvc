@@ -746,7 +746,11 @@ static void run_finish(worker_t *w, const char *reason)
    }
    else if (!strcmp(reason, "severity"))
       hint = "Stopped at the first message of the requested severity: read "
-         "messages and signals now, then call nvc_sim_run again to continue.";
+         "messages and signals now, then call nvc_sim_run again to continue. "
+         "To see what led to it, look at the cycles before with "
+         "nvc_wave_table (around this time, on a recording started before the "
+         "run), and follow a wrong signal back with nvc_signal_drivers. The "
+         "first wrong value is the cause: the failed check only notices it.";
    else if (!strcmp(reason, "terminated"))
       hint = "The simulation cannot continue. Signals can still be read; open "
          "a new simulation with nvc_sim_open to run it again.";
@@ -2266,6 +2270,177 @@ static void op_wave_read(worker_t *w, const json_t *req)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// Drivers and readers of a signal
+
+// The design signal a nexus belongs to, for naming what a port connects to
+static const char *nexus_path(worker_t *w, const rt_nexus_t *n)
+{
+   for (size_t i = 0; i < w->nobjs; i++) {
+      if (w->objs[i].kind == OBJ_SIGNAL && w->objs[i].signal == n->signal)
+         return istr(w->objs[i].path);
+   }
+
+   return NULL;
+}
+
+static void write_process(json_writer_t *jw, const rt_proc_t *p)
+{
+   jw_begin_object(jw);
+   jw_key(jw, "kind");
+   jw_string(jw, "process");
+   jw_key(jw, "name");
+   jw_string(jw, istr(p->name));
+
+   const loc_t *loc = tree_loc(p->where);
+   if (loc != NULL && !loc_invalid_p(loc)) {
+      const char *file = loc_file_str(loc);
+      if (file != NULL) {
+         jw_key(jw, "file");
+         jw_string(jw, file);
+      }
+      jw_key(jw, "line");
+      jw_int(jw, loc->first_line);
+   }
+   jw_end_object(jw);
+}
+
+static void op_drivers(worker_t *w, const json_t *req)
+{
+   const char *path = json_string(json_get(req, "path"));
+   design_obj_t *o = path ? find_obj(w, path) : NULL;
+
+   if (o == NULL) {
+      LOCAL_TEXT_BUF hint = tb_new();
+      suggest_paths(w, path ?: "", hint);
+      reply_error(w, "Signal '%s' was not found%s", path ?: "",
+                  tb_get(hint));
+      return;
+   }
+   else if (o->kind != OBJ_SIGNAL) {
+      reply_error(w, "'%s' is a region, not a signal", path);
+      return;
+   }
+
+   rt_signal_t *sig = o->signal;
+
+   const rt_proc_t *seen[64];
+   size_t nseen = 0;
+
+   LOCAL_TEXT_BUF tb = tb_new();
+   json_writer_t jw;
+   jw_init(&jw, tb);
+   begin_reply(&jw, true);
+   jw_key(&jw, "result");
+   jw_begin_object(&jw);
+   jw_key(&jw, "path");
+   jw_string(&jw, istr(o->path));
+
+   // What writes the signal
+   jw_key(&jw, "drivers");
+   jw_begin_array(&jw);
+   rt_nexus_t *n = &(sig->nexus);
+   for (unsigned i = 0; i < sig->n_nexus; i++, n = n->chain) {
+      for (rt_source_t *src = &(n->sources); src; src = src->chain_input) {
+         if (src->tag == SOURCE_DRIVER) {
+            const rt_proc_t *p = src->u.driver.proc;
+            bool dup = false;
+            for (size_t k = 0; k < nseen; k++)
+               dup |= seen[k] == p;
+            if (dup || nseen == ARRAY_LEN(seen))
+               continue;
+            seen[nseen++] = p;
+            write_process(&jw, p);
+         }
+         else if (src->tag == SOURCE_PORT && src->u.port.input != NULL) {
+            const char *from = nexus_path(w, src->u.port.input);
+            if (from == NULL || !strcmp(from, istr(o->path)))
+               continue;
+
+            jw_begin_object(&jw);
+            jw_key(&jw, "kind");
+            jw_string(&jw, "port");
+            jw_key(&jw, "from");
+            jw_string(&jw, from);
+            jw_end_object(&jw);
+         }
+         else if (src->tag == SOURCE_FORCING || src->tag == SOURCE_DEPOSIT) {
+            jw_begin_object(&jw);
+            jw_key(&jw, "kind");
+            jw_string(&jw, "forced");
+            jw_end_object(&jw);
+         }
+      }
+   }
+   jw_end_array(&jw);
+
+   // Processes waiting for the signal to change, which is what reads it
+   // (a process also reads signals that are not in its sensitivity list)
+   jw_key(&jw, "waiting_processes");
+   jw_begin_array(&jw);
+   nseen = 0;
+   n = &(sig->nexus);
+   for (unsigned i = 0; i < sig->n_nexus; i++, n = n->chain) {
+      const void *pending = n->pending;
+      rt_wakeable_t *list[64];
+      size_t count = 0;
+
+      if (pending != NULL && pointer_tag(pending) == 1)
+         list[count++] = untag_pointer(pending, rt_wakeable_t);
+      else if (pending != NULL) {
+         const rt_pending_t *pp = untag_pointer(pending, rt_pending_t);
+         for (unsigned k = 0; k < pp->count && count < ARRAY_LEN(list); k++) {
+            if (pp->wake[k] != NULL)
+               list[count++] = untag_pointer(pp->wake[k], rt_wakeable_t);
+         }
+      }
+
+      for (size_t k = 0; k < count; k++) {
+         if (list[k]->kind != W_PROC)
+            continue;
+
+         const rt_proc_t *p = container_of(list[k], rt_proc_t, wakeable);
+         bool dup = false;
+         for (size_t m = 0; m < nseen; m++)
+            dup |= seen[m] == p;
+         if (dup || nseen == ARRAY_LEN(seen))
+            continue;
+         seen[nseen++] = p;
+         write_process(&jw, p);
+      }
+   }
+   jw_end_array(&jw);
+
+   // Where the signal goes through ports
+   jw_key(&jw, "connected_to");
+   jw_begin_array(&jw);
+   n = &(sig->nexus);
+   const char *last = NULL;
+   for (unsigned i = 0; i < sig->n_nexus; i++, n = n->chain) {
+      for (rt_source_t *out = n->outputs; out; out = out->chain_output) {
+         if (out->tag != SOURCE_PORT || out->u.port.output == NULL)
+            continue;
+
+         const char *to = nexus_path(w, out->u.port.output);
+         if (to == NULL || (last != NULL && !strcmp(last, to)))
+            continue;
+
+         last = to;
+         jw_string(&jw, to);
+      }
+   }
+   jw_end_array(&jw);
+
+   jw_key(&jw, "hint");
+   jw_string(&jw, "Read the source of a driving process at its file and line "
+             "to see what it computes and which signals it reads, then call "
+             "this again on those signals to follow the cause back.");
+
+   jw_end_object(&jw);
+   jw_end_object(&jw);
+   ctl_send(w, tb);
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // Entry point
 
 int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
@@ -2384,6 +2559,8 @@ int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
          op_search(&w, req);
       else if (!strcmp(op, "get"))
          op_get(&w, req);
+      else if (!strcmp(op, "drivers"))
+         op_drivers(&w, req);
       else if (!strcmp(op, "wave_read"))
          op_wave_read(&w, req);
       else if (!strcmp(op, "wave_start"))

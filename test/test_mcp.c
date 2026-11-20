@@ -2765,6 +2765,20 @@ START_TEST(test_sim_queries)
    ck_assert_ptr_nonnull(strstr(json_string(json_at(json_at(rows, 2), 3)),
                                 "q reached five"));
 
+   // What drives a signal, and what waits for it
+   sc = structured(sim_tool(&f, "nvc_signal_drivers", id,
+                            "\"path\":\"/dut/cnt\""));
+   ck_assert_int_eq(json_get(sc, "drivers")->array.count, 1);
+   const json_t *drv = json_at(json_get(sc, "drivers"), 0);
+   ck_assert_str_eq(str_field(drv, "kind"), "process");
+   ck_assert_int_gt(int_field(drv, "line"), 0);
+   ck_assert_ptr_nonnull(strstr(str_field(drv, "file"), "counter.vhd"));
+   sc = structured(sim_tool(&f, "nvc_signal_drivers", id, "\"path\":\"/clk\""));
+   ck_assert_int_ge(json_get(sc, "waiting_processes")->array.count, 1);
+   e = tool_error(sim_tool(&f, "nvc_signal_drivers", id,
+                           "\"path\":\"/dut/nope\""));
+   ck_assert_ptr_nonnull(strstr(e, "was not found"));
+
    // A finished file answers the same questions
    sc = structured(sim_tool(&f, "nvc_wave_stop", id, ""));
    char *file = xstrdup(str_field(sc, "file"));
