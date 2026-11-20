@@ -737,9 +737,23 @@ static bool looks_bits(const char *v)
    return true;
 }
 
+// A live simulation prints a character as 'x': keep just the character, as
+// a waveform file does
+static const char *unquote(const char *v, size_t *len)
+{
+   if (*len == 3 && v[0] == '\'' && v[2] == '\'') {
+      *len = 1;
+      return v + 1;
+   }
+
+   return v;
+}
+
 static void series_add(series_t *s, uint64_t time, const char *value,
                        size_t len)
 {
+   value = unquote(value, &len);
+
    if (s->n == s->alloc) {
       s->alloc = MAX(s->alloc * 2, 64);
       s->chg = xrealloc_array(s->chg, s->alloc, sizeof(change_t));
@@ -855,6 +869,35 @@ static bool load_series(mcp_call_t *call, const json_t *args,
       }
 
       free(c.changes);
+
+      // The file cannot give the value of a signal written as text, such
+      // as an enumeration, at a time: take the last change before the
+      // window instead
+      bool missing = false;
+      for (size_t i = 0; i < npaths; i++)
+         missing |= set->s[i].initial == NULL;
+
+      if (missing && early > 0) {
+         collect_t b = { .wave = &w, .sel = sel, .nsel = npaths,
+                         .max = MAX_LOAD_CHANGES, .from = 0,
+                         .until = early };
+         fstReaderClrFacProcessMaskAll(w.ctx);
+         for (size_t i = 0; i < npaths; i++)
+            fstReaderSetFacProcessMask(w.ctx, sel[i]->handle);
+         fstReaderSetLimitTimeRange(w.ctx, 0, early / w.unit_fs);
+         fstReaderIterBlocks2(w.ctx, collect_cb1, collect_cb, &b, NULL);
+         qsort(b.changes, b.kept, sizeof(struct change), change_order);
+
+         for (size_t j = 0; j < b.kept; j++) {
+            series_t *sr = &(set->s[b.changes[j].sig]);
+            if (sr->initial == NULL || b.changes[j].time <= early) {
+               free(sr->initial);
+               sr->initial = xstrdup(b.changes[j].value);
+            }
+            free(b.changes[j].value);
+         }
+         free(b.changes);
+      }
       free(sel);
       wave_close(&w);
    }
@@ -875,7 +918,7 @@ static bool load_series(mcp_call_t *call, const json_t *args,
       jw_key(&jw, "op");
       jw_string(&jw, "wave_read");
       jw_key(&jw, "from_fs");
-      jw_int(&jw, from_fs);
+      jw_int(&jw, from_fs > 0 ? from_fs - 1 : 0);   // As for a file
       jw_key(&jw, "to_fs");
       jw_int(&jw, until_fs);
       jw_key(&jw, "max_changes");
@@ -917,8 +960,11 @@ static bool load_series(mcp_call_t *call, const json_t *args,
          set->s[i].width = width;
 
          const char *init = json_string(json_get(sj, "value_at_from"));
-         if (init != NULL)
-            set->s[i].initial = xstrdup(init);
+         if (init != NULL) {
+            size_t ilen = strlen(init);
+            init = unquote(init, &ilen);
+            set->s[i].initial = xstrndup(init, ilen);
+         }
 
          const json_t *chg = json_get(sj, "changes");
          for (size_t k = 0; chg != NULL && k < chg->array.count; k++) {
@@ -1780,6 +1826,15 @@ static bool tool_wave_table(mcp_call_t *call, const json_t *args,
    }
    const json_t *msgs = json_get(status, "messages");
    size_t next_msg = 0;
+
+   // Skip messages from before the window
+   while (msgs != NULL && next_msg < msgs->array.count) {
+      int64_t mt = 0;
+      json_as_int(json_get(json_at(msgs, next_msg), "time_fs"), &mt);
+      if ((uint64_t)mt >= set.from)
+         break;
+      next_msg++;
+   }
 
    // Build the rows, folding identical consecutive cycles
    typedef struct {

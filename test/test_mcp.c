@@ -2730,7 +2730,7 @@ START_TEST(test_sim_queries)
    ck_assert_ptr_nonnull(strstr(e, "Invalid condition"));
    e = tool_error(sim_tool(&f, "nvc_wave_find", id,
                            "\"when\":\"/dut/nope = 1\""));
-   ck_assert_ptr_nonnull(strstr(e, "nvc_wave_summary"));
+   ck_assert_ptr_nonnull(strstr(e, "in-memory recording"));
    e = tool_error(sim_tool(&f, "nvc_wave_find", id,
                            "\"when\":\"/dut/cnt = 5\",\"at_least_cycles\":2"));
    ck_assert_ptr_nonnull(strstr(e, "clock"));
@@ -2759,7 +2759,7 @@ START_TEST(test_sim_queries)
    ck_assert_int_eq(rows->array.count, 5);
    ck_assert_int_eq(json_get(sc, "columns")->array.count, 5);
    ck_assert_str_eq(json_string(json_at(json_at(rows, 0), 1)), "45 ns");
-   ck_assert_str_eq(json_string(json_at(json_at(rows, 0), 2)), "0x4");
+   ck_assert_str_eq(json_string(json_at(json_at(rows, 0), 2)), "0x3");
    ck_assert_str_eq(json_string(json_at(json_at(rows, 2), 1)), "65 ns");
    ck_assert_str_eq(json_string(json_at(json_at(rows, 2), 2)), "0x5");
    ck_assert_ptr_nonnull(strstr(json_string(json_at(json_at(rows, 2), 3)),
@@ -2781,7 +2781,7 @@ START_TEST(test_sim_queries)
    sc = structured(tool(f.mp, f.srv, &f.sink, "nvc_wave_table", args));
    ck_assert_int_eq(json_get(sc, "rows")->array.count, 4);
    ck_assert_str_eq(json_string(json_at(json_at(json_get(sc, "rows"), 0), 2)),
-                    "10");
+                    "9");
    free(args);
    free(file);
 

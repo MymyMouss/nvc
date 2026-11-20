@@ -169,6 +169,7 @@ static bool live_pick(worker_t *w, const json_t *include,
 static bool live_start(worker_t *w, design_obj_t **picked, size_t npicked,
                        int64_t max_changes, text_buf_t *err);
 static void live_stop(worker_t *w);
+static bool live_active(const worker_t *w);
 static void live_free(worker_t *w);
 static void write_live(worker_t *w, json_writer_t *jw);
 
@@ -1180,7 +1181,7 @@ static void op_wave_start(worker_t *w, const json_t *req)
       reply_error(w, "This simulation has no file directory");
       return;
    }
-   else if (w->wave != NULL || (w->live != NULL && !w->live->stopped)) {
+   else if (w->wave != NULL || live_active(w)) {
       reply_error(w, "A recording is already active: end it with "
                   "nvc_wave_stop, which also lets you start another");
       return;
@@ -1321,7 +1322,7 @@ static void op_wave_start(worker_t *w, const json_t *req)
 
 static void op_wave_stop(worker_t *w)
 {
-   if (w->wave == NULL && (w->live == NULL || w->live->stopped)) {
+   if (w->wave == NULL && !live_active(w)) {
       reply_error(w, "No recording is active");
       return;
    }
@@ -1996,6 +1997,11 @@ static void live_free(worker_t *w)
    free(t->buf);
    free(t);
    w->live = NULL;
+}
+
+static bool live_active(const worker_t *w)
+{
+   return w->live != NULL && !w->live->stopped;
 }
 
 // Stop recording changes.  What was recorded stays readable.

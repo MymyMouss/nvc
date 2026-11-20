@@ -159,9 +159,36 @@ def cmd_check(args):
     return 0 if ok else 1
 
 
-def prompt_for(bug, tb):
+def spec_of(design):
+    lines = []
+    for line in read(design).splitlines():
+        if not line.startswith("--"):
+            break
+        lines.append(line[2:].strip())
+    return " ".join(x for x in lines if x)
+
+
+def prompt_for(bug, tb, blind=False):
     design = BUGS[bug][0]
     what = PROMPTS[bug]
+    if blind:
+        # No file tools: the specification is in the prompt and the agent
+        # has to work from the simulation alone
+        if bug.endswith("silent"):
+            fail = ("Its testbench %s runs without any complaint, yet the "
+                    "outputs are wrong." % tb)
+        else:
+            fail = "The testbench %s fails." % tb
+        return ("src/%s.vhd holds %s and src/%s.vhd its testbench. %s You "
+                "cannot read the source files, only analyse and simulate "
+                "them. Specification of the design: %s Find the root cause: "
+                "the earliest simulated time at which a signal inside the "
+                "instance dut holds a wrong value (not the time the "
+                "testbench notices the problem), and which signal it is. "
+                "Finish with exactly one line in this form: "
+                "RESULT: <time in ns> ns <signal path>, for example "
+                "RESULT: 40 ns /dut/count"
+                % (design, what, tb, fail, spec_of(design)))
     if bug.endswith("silent"):
         fail = ("Its testbench %s runs without any complaint, yet the "
                 "outputs are wrong." % tb)
@@ -192,16 +219,18 @@ def judge(answer, expected):
     return True, "ok"
 
 
-async def run_one(nvc, model, bug, expected, tools, label):
+async def run_one(nvc, model, bug, expected, tools, label, blind=False,
+                  disallowed=()):
     from claude_agent_sdk import (query, ClaudeAgentOptions, AssistantMessage,
                                   ResultMessage, ToolUseBlock)
     ws, design, tb = make_workspace(bug, True)
-    prompt = prompt_for(bug, tb)
+    prompt = prompt_for(bug, tb, blind)
     options = ClaudeAgentOptions(
         model=model, cwd=ws, cli_path=shutil.which("claude"),
         system_prompt={"type": "preset", "preset": "claude_code"},
         setting_sources=[], tools=tools,
         allowed_tools=["mcp__nvc"] + tools,
+        disallowed_tools=["mcp__nvc__" + x for x in disallowed],
         mcp_servers={"nvc": {"type": "stdio", "command": nvc,
                              "args": ["--mcp", "--root", ws],
                              "env": {"NVC_LIBPATH":
@@ -237,8 +266,10 @@ async def cmd_run(args):
         t, _, _ = truth(args.nvc, bug)
         cache[bug] = t
         for trial in range(args.trials):
-            rows.append(await run_one(args.nvc, args.model, bug, t,
-                                      ["Read", "Glob"], args.label))
+            rows.append(await run_one(
+                args.nvc, args.model, bug, t,
+                [] if args.blind else ["Read", "Glob"], args.label,
+                args.blind, args.disable or []))
     n = len(rows)
     print("\n==== %s, model %s ====" % (args.label, args.model))
     for bug in BUGS:
@@ -266,6 +297,10 @@ def main():
     ap.add_argument("--trials", type=int, default=1)
     ap.add_argument("--scenario", action="append")
     ap.add_argument("--label", default="baseline")
+    ap.add_argument("--blind", action="store_true",
+                    help="no file tools, specification in the prompt")
+    ap.add_argument("--disable", action="append",
+                    help="MCP tool to hide, such as nvc_wave_table")
     ap.add_argument("--out")
     a = ap.parse_args()
     a.nvc = os.path.abspath(a.nvc)
