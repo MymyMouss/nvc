@@ -2547,6 +2547,55 @@ START_TEST(test_sim_log_limit)
 }
 END_TEST
 
+START_TEST(test_sim_busy)
+{
+   static const char busy[] =
+      "entity busy is end entity;\n"
+      "architecture test of busy is\n"
+      "begin\n"
+      "  process\n"
+      "    variable v : natural := 0;\n"
+      "  begin\n"
+      "    wait for 1 ns;\n"
+      "    for i in 1 to 2000000000 loop\n"
+      "      v := (v + i) mod 1000;\n"
+      "    end loop;\n"
+      "    wait;\n"
+      "  end process;\n"
+      "end architecture;\n";
+
+   fixture_t f;
+   const char *names[] = { "busy.vhd" }, *sources[] = { busy };
+   const char *tops[] = { "busy" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   char id[40];
+   open_sim(&f, "busy", id);
+
+   const json_t *sc = structured(sim_tool(&f, "nvc_sim_run", id,
+                                          "\"background\":true"));
+   ck_assert_str_eq(str_field(sc, "state"), "running");
+
+   // The process is inside one long step, so it cannot answer, but the
+   // call still returns and says what it knows
+   sc = structured(sim_tool(&f, "nvc_sim_status", id, ""));
+   ck_assert_str_eq(str_field(sc, "state"), "running");
+   bool responsive = true;
+   json_as_bool(json_get(sc, "responsive"), &responsive);
+   ck_assert(!responsive);
+   ck_assert_ptr_nonnull(json_get(json_get(sc, "worker"), "cpu_seconds"));
+   ck_assert_ptr_nonnull(json_get(sc, "hint"));
+
+   // A wait gives up at once instead of sitting through its timeout
+   sc = structured(sim_tool(&f, "nvc_sim_wait", id, "\"timeout_ms\":20000"));
+   ck_assert_str_eq(str_field(sc, "woke_because"), "unresponsive");
+
+   // The simulation is still open and can be closed
+   sc = structured(sim_tool(&f, "nvc_sim_close", id, ""));
+   fixture_close(&f);
+}
+END_TEST
+
 Suite *get_mcp_tests(void)
 {
    Suite *s = suite_create("mcp");
@@ -2583,6 +2632,7 @@ Suite *get_mcp_tests(void)
    tcase_add_test(tc, test_sim_wait_cancel);
    tcase_add_test(tc, test_sim_files_misc);
    tcase_add_test(tc, test_sim_log_limit);
+   tcase_add_test(tc, test_sim_busy);
    tcase_set_timeout(tc, 60);
    suite_add_tcase(s, tc);
 

@@ -28,6 +28,7 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include "mcp/mcp.h"
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -48,10 +49,9 @@
 
 #define MAX_SIMS            4
 #define IDLE_TIMEOUT_S      1800
-#define BACKGROUND_MAX_S    (24 * 3600)
+#define STATUS_REPLY_MS     3000
 #define MAX_WAIT_MS         30000
 #define WAIT_POLL_MS        250
-#define MAX_BACKGROUND_MS   (24 * 3600 * 1000)
 #define KILL_GRACE_MS       3000
 #define DEFAULT_OPEN_MS     60000
 #define MAX_REPLY_BYTES     (8 * 1024 * 1024)
@@ -67,6 +67,10 @@ typedef struct {
    char    *files_dir;     // Relative to the workspace root
    uint64_t last_used_us;
    bool     background;     // A background run was in progress at last look
+   unsigned stale;          // Status replies still owed by a busy worker
+   int64_t  last_now_fs;
+   uint64_t last_status_us;
+   uint64_t unresponsive_since_us;
    char    *buf;
    size_t   len;
    size_t   alloc;
@@ -138,8 +142,9 @@ void mcp_sims_reap(mcp_sims_t *sims)
 
    for (size_t i = 0; i < sims->count; ) {
       sim_t *s = sims->sims[i];
-      const uint64_t limit = s->background ? BACKGROUND_MAX_S : IDLE_TIMEOUT_S;
-      if (now - s->last_used_us > limit * 1000000)
+      // A background run is never expired: it may take days
+      if (!s->background
+          && now - s->last_used_us > (uint64_t)IDLE_TIMEOUT_S * 1000000)
          sims_remove(sims, s);   // Swaps in another entry
       else
          i++;
@@ -309,6 +314,14 @@ static json_t *sim_exchange(mcp_call_t *call, sim_t *s, mem_pool_t *mp,
             int64_t now_fs;
             if (json_as_int(json_get(msg, "now_fs"), &now_fs))
                mcp_call_progress(call, now_fs, "simulating");
+            free(line);
+            continue;
+         }
+
+         if (s->stale > 0 && json_is(msg, JSON_OBJECT)
+             && json_get(msg, "ok") != NULL) {
+            // The late answer to a status request that gave up waiting
+            s->stale--;
             free(line);
             continue;
          }
@@ -829,12 +842,12 @@ static const char run_input[] = MCP_JSON({
       "max_wall_ms": {
          "type": "integer",
          "minimum": 100,
-         "maximum": 86400000,
+         "maximum": 31536000000,
          "description": "Real time allowed for this call. Defaults to 10000, with a maximum of 300000 unless background is true. When it runs out the call returns with stopped_because wall_budget and the simulation can be continued."
       },
       "background": {
          "type": "boolean",
-         "description": "Start the run and return at once instead of waiting for it. The simulation keeps running while you do other things; follow it with nvc_sim_wait or nvc_sim_status and end it with nvc_sim_stop. Use it for anything that may take more than a few seconds. While it runs only reading tools work (nvc_signal_get, nvc_design_*, nvc_trace_get). Without max_wall_ms a background run has no real time limit (24 hours at most)."
+         "description": "Start the run and return at once instead of waiting for it. The simulation keeps running while you do other things; follow it with nvc_sim_wait or nvc_sim_status and end it with nvc_sim_stop. Use it for anything that may take more than a few seconds. While it runs only reading tools work (nvc_signal_get, nvc_design_*, nvc_trace_get). Without max_wall_ms a background run has no real time limit and is never expired, even when it takes days. nvc_sim_status shows whether it is still alive (see responsive and worker.cpu_seconds)."
       },
       "pause_on": {
          "type": "string",
@@ -1014,6 +1027,195 @@ static bool tool_sim_run(mcp_call_t *call, const json_t *args,
 ////////////////////////////////////////////////////////////////////////////////
 // nvc_sim_status, nvc_sim_wait and nvc_sim_stop
 
+// Add members to the end of a JSON object held in a heap string
+static char *append_members(char *object, const char *members)
+{
+   const size_t len = strlen(object);
+   const size_t add = strlen(members);
+   object = xrealloc(object, len + add + 2);
+   object[len - 1] = ',';
+   memcpy(object + len, members, add);
+   object[len + add] = '}';
+   object[len + add + 1] = '\0';
+   return object;
+}
+
+// CPU time and memory of the worker, so a caller can tell a simulation
+// that is working from one that is stuck
+static char *worker_health(const sim_t *s)
+{
+#ifdef __linux__
+   char path[64];
+   checked_sprintf(path, sizeof(path), "/proc/%d/stat", (int)s->pid);
+
+   FILE *f = fopen(path, "r");
+   if (f != NULL) {
+      char buf[1024];
+      const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+      fclose(f);
+      buf[n] = '\0';
+
+      // Fields after the command name, which is in parentheses
+      const char *p = strrchr(buf, ')');
+      unsigned long utime = 0, stime = 0;
+      long rss = 0;
+      char state = '?';
+      if (p != NULL
+          && sscanf(p + 2, "%c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u "
+                    "%lu %lu %*d %*d %*d %*d %*d %*d %*u %*u %ld",
+                    &state, &utime, &stime, &rss) == 4) {
+         const long hz = sysconf(_SC_CLK_TCK);
+         const long page = sysconf(_SC_PAGESIZE);
+         return xasprintf("\"worker\":{\"alive\":true,\"os_state\":\"%c\","
+                          "\"cpu_seconds\":%.1f,\"memory_mb\":%ld}", state,
+                          (double)(utime + stime) / hz, rss * page / (1 << 20));
+      }
+   }
+#endif
+
+   return xasprintf("\"worker\":{\"alive\":%s}",
+                    s->pid > 0 && kill(s->pid, 0) == 0 ? "true" : "false");
+}
+
+// Ask a worker for its status.  A worker busy in one long step of the
+// design may not answer for a while: that is reported, not treated as a
+// failure, and the late reply is dropped when it comes.
+static char *sim_status(mcp_call_t *call, sim_t *s, const char *request)
+{
+   LOCAL_TEXT_BUF line_out = tb_new();
+   tb_cat(line_out, request);
+   tb_append(line_out, '\n');
+   send_all(s->fd, tb_get(line_out), tb_len(line_out));
+
+   const uint64_t start_us = get_timestamp_us();
+   char *raw = NULL;
+   mem_pool_t *mp = pool_new();
+
+   while (raw == NULL) {
+      char *line = take_line(s);
+      if (line != NULL) {
+         const char *perr;
+         json_t *msg = json_parse(mp, line, strlen(line), NULL, &perr);
+         const char *event = json_string(json_get(msg, "event"));
+         if (event != NULL || !json_is(msg, JSON_OBJECT)) {
+            free(line);
+            continue;
+         }
+         else if (s->stale > 0) {
+            s->stale--;
+            free(line);
+            continue;
+         }
+
+         raw = line;
+         break;
+      }
+
+      if (mcp_call_cancelled(call) || (get_timestamp_us() - start_us)
+          / 1000 >= STATUS_REPLY_MS)
+         break;
+
+      bool ready = false;
+      mcp_call_wait(call, &s->fd, 1, &ready, 200);
+      if (ready && !fill_buffer(s)) {
+         pool_free(mp);
+         worker_lost(call, s, "The request failed");
+         return NULL;
+      }
+   }
+
+   pool_free(mp);
+
+   const uint64_t now_us = get_timestamp_us();
+   char *health = worker_health(s);
+   char *result;
+
+   if (raw == NULL) {
+      if (mcp_call_cancelled(call)) {
+         free(health);
+         mcp_call_error(call, "The request was cancelled");
+         s->stale++;
+         return NULL;
+      }
+
+      s->stale++;
+      if (s->unresponsive_since_us == 0)
+         s->unresponsive_since_us = start_us;
+
+      char seen[48];
+      mcp_format_time(s->last_now_fs, seen, sizeof(seen));
+
+      char *members = xasprintf(
+         "\"responsive\":false,\"unresponsive_ms\":%"PRIu64","
+         "\"last_seen_now_fs\":%"PRIi64",\"last_seen_now\":\"%s\","
+         "\"last_seen_ms_ago\":%"PRIu64",%s,"
+         "\"hint\":\"The simulation process did not answer within %d ms. "
+         "A process in the design may be busy in a long computation or "
+         "looping without a wait statement. Look at worker.cpu_seconds: if "
+         "it keeps growing between calls the process is working, if it "
+         "stays flat or os_state is Z or T it is stuck. Call again later; "
+         "nvc_sim_stop or nvc_sim_close ends a stuck simulation.\"",
+         (now_us - s->unresponsive_since_us) / 1000, s->last_now_fs, seen,
+         s->last_status_us ? (now_us - s->last_status_us) / 1000 : 0, health,
+         STATUS_REPLY_MS);
+
+      result = xasprintf("{\"state\":\"running\",\"now_fs\":%"PRIi64","
+                         "\"now\":\"%s\"}", s->last_now_fs, seen);
+      result = append_members(result, members);
+      free(members);
+      free(health);
+      return result;
+   }
+
+   // The reply is {"ok":true,"result":{...}}
+   const char *marker = strstr(raw, "\"result\":");
+   const size_t len = strlen(raw);
+   if (marker == NULL || raw[len - 1] != '}') {
+      // An error reply: let the ordinary path report it
+      mem_pool_t *mp2 = pool_new();
+      const char *perr;
+      json_t *msg = json_parse(mp2, raw, len, NULL, &perr);
+      const char *err = json_string(json_get(msg, "error"));
+      mcp_call_error(call, "%s", err ?: "The simulation reported an error");
+      pool_free(mp2);
+      free(raw);
+      free(health);
+      return NULL;
+   }
+
+   const char *start = marker + strlen("\"result\":");
+   result = xstrndup(start, len - 1 - (start - raw));
+   free(raw);
+
+   mem_pool_t *mp3 = pool_new();
+   const char *perr;
+   json_t *j = json_parse(mp3, result, strlen(result), NULL, &perr);
+   const char *state = json_string(json_get(j, "state"));
+   int64_t now_fs = s->last_now_fs;
+   json_as_int(json_get(j, "now_fs"), &now_fs);
+
+   char *members;
+   if (state != NULL && !strcmp(state, "running")) {
+      members = xasprintf(
+         "\"responsive\":true,\"advanced_since_last_status_fs\":%"PRIi64","
+         "\"ms_since_last_status\":%"PRIu64",%s",
+         now_fs - s->last_now_fs,
+         s->last_status_us ? (now_us - s->last_status_us) / 1000 : 0, health);
+   }
+   else
+      members = xasprintf("\"responsive\":true,%s", health);
+
+   result = append_members(result, members);
+   free(members);
+   free(health);
+   pool_free(mp3);
+
+   s->last_now_fs = now_fs;
+   s->last_status_us = now_us;
+   s->unresponsive_since_us = 0;
+   return result;
+}
+
 static const char status_input[] = MCP_JSON({
    "type": "object",
    "properties": {
@@ -1075,6 +1277,14 @@ static const char status_output[] = MCP_JSON({
       "messages": { "type": "array", "items": { "type": "object" } },
       "messages_truncated": { "type": "boolean" },
       "files": { "type": "object" },
+      "responsive": { "type": "boolean" },
+      "unresponsive_ms": { "type": "integer" },
+      "last_seen_now_fs": { "type": "integer" },
+      "last_seen_now": { "type": "string" },
+      "last_seen_ms_ago": { "type": "integer" },
+      "advanced_since_last_status_fs": { "type": "integer" },
+      "ms_since_last_status": { "type": "integer" },
+      "worker": { "type": "object" },
       "next_seq": { "type": "integer" },
       "counts": { "type": "object" },
       "sim_output": { "type": "string" },
@@ -1119,7 +1329,7 @@ static bool tool_sim_status(mcp_call_t *call, const json_t *args,
    if (s == NULL)
       return false;
 
-   char *result = sim_call(call, s, tb_get(req), 10000);
+   char *result = sim_status(call, s, tb_get(req));
    if (result == NULL)
       return false;
 
@@ -1155,7 +1365,7 @@ static bool tool_sim_wait(mcp_call_t *call, const json_t *args,
       if (s == NULL)
          return false;
 
-      char *result = sim_call(call, s, tb_get(req), 10000);
+      char *result = sim_status(call, s, tb_get(req));
       if (result == NULL)
          return false;
 
@@ -1180,8 +1390,13 @@ static bool tool_sim_wait(mcp_call_t *call, const json_t *args,
       const uint64_t waited_ms = (get_timestamp_us() - start_us) / 1000;
 
       const char *why = NULL;
+      bool responsive = true;
+      json_as_bool(json_get(j, "responsive"), &responsive);
+
       if (!running)
          why = "stopped";
+      else if (!responsive)
+         why = "unresponsive";
       else if (bad > bad_at_start)
          why = "new_errors";
       else if (mcp_call_cancelled(call)) {
@@ -1986,7 +2201,12 @@ static const mcp_tool_t sim_tools[] = {
          "nvc_sim_run), finished or terminated.  While running it reports "
          "the simulated time reached, how fast simulated time advances in "
          "femtoseconds per real second, and with a run target the percent "
-         "done and an estimate of the real time left (eta_ms).  messages "
+         "done and an estimate of the real time left (eta_ms).  To tell a "
+         "slow simulation from a stuck one compare calls: now_fs should "
+         "advance (advanced_since_last_status_fs) and worker.cpu_seconds "
+         "should grow.  If the process is busy inside one long step of the "
+         "design it does not answer: responsive is then false and the last "
+         "known time is given.  messages "
          "holds the report and assert messages since since_seq, each with "
          "its simulated time; counts totals them.  Pass next_seq back as "
          "since_seq to see only new ones.  Messages and sim_output come "
@@ -2007,7 +2227,7 @@ static const mcp_tool_t sim_tools[] = {
          "Wait up to timeout_ms (at most 30 seconds) for a background run "
          "to stop or for the design to report a new error, then return what "
          "nvc_sim_status returns plus woke_because: stopped, new_errors, "
-         "or timeout.  Call it again after a timeout while the "
+         "unresponsive or timeout.  Call it again after a timeout while the "
          "state is still running: each call is cheap and keeps you in "
          "touch with the run.  Use the percent and eta_ms fields to decide "
          "how long to keep waiting.",

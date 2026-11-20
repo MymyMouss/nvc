@@ -668,7 +668,7 @@ il faudra le traiter à part.
 Étapes 1 à 3 de §8.4 et le run de fond de §7.4:
 
 - **Run de fond.** `nvc_sim_run` accepte `background:true` (sans limite de
-  temps réel, 24 h au plus); le worker avance alors le run par tranches entre
+  temps réel, aucune limite); le worker avance alors le run par tranches entre
   deux requêtes et répond aux lectures (`list`, `search`, `get`, `trace_get`,
   `status`, `wave_start`, `wave_stop`) pendant qu'il tourne. `nvc_sim_status`
   donne l'état (`running`, `idle`, `finished`, `terminated`), le temps simulé,
@@ -677,8 +677,16 @@ il faudra le traiter à part.
   les tailles de fichiers. `nvc_sim_wait` (≤ 30 s) sonde le worker toutes les
   250 ms côté serveur et rend la main à l'arrêt du run, à l'apparition de
   nouvelles erreurs, à l'annulation ou au délai. `nvc_sim_stop` termine le
-  run sans fermer la simulation. Une simulation en run de fond n'est pas
-  expirée par l'inactivité (limite de 24 h).
+  run sans fermer la simulation. Un run de fond n'a aucune limite de durée et
+  n'est jamais expiré (il peut durer des jours; le front-end étant lié à son
+  client, les workers disparaissent avec lui).
+- **Vivant ou planté ?** `nvc_sim_status` donne `advanced_since_last_status_fs`
+  (le temps simulé doit avancer), `worker.cpu_seconds`, `memory_mb` et
+  `os_state` (lus dans `/proc`). Si le worker est occupé dans un seul pas long
+  d'un process du design et ne répond pas sous 3 s, l'appel ne échoue pas:
+  il rend `responsive:false`, la dernière heure connue et un conseil (CPU qui
+  croît = travaille, plat ou état Z/T = bloqué); `nvc_sim_wait` rend alors
+  la main avec `woke_because:unresponsive`. La réponse tardive est écartée.
 - **Fichiers.** Chaque simulation a un répertoire `.nvc-mcp/<sim_id>/` dans
   l'espace de travail, jamais supprimé automatiquement. La sortie du design
   y est écrite (`output.log`, plafond 1 Gio puis abandon avec un message:
