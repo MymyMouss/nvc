@@ -183,8 +183,8 @@ des options typées (liste fermée), pour éviter l'injection d'options.
 | `nvc_design_search` | Chercher signaux/régions par motif, paginé | oui | non | oui |
 | `nvc_signal_get` | Lire des signaux (jusqu'à 64), radix choisi | oui | non | oui |
 | `nvc_signal_set` | `force` / `deposit` / `release` | non | non | oui |
-| `nvc_trace_start` | Enregistrer les changements de signaux en mémoire (anneau borné) | non | non | oui |
-| `nvc_trace_get` | Lire les changements sur une fenêtre, paginé | oui | non | oui |
+| `nvc_wave_start` | Enregistrer des signaux (mémoire, fichier FST, ou les deux) | non | non | oui |
+| `nvc_wave_get` | Lire les changements sur une fenêtre (mémoire ou fichier) | oui | non | oui |
 | `nvc_coverage_report` | Résumé/éléments non couverts d'un `.ncdb` | oui | non | oui |
 | `nvc_sim_checkpoint` | Plus tard: sauvegarder l'état | non | non | non |
 | `nvc_sim_restore` | Plus tard: reprendre d'un checkpoint | non | non | non |
@@ -717,6 +717,24 @@ l'intervalle à partir du démarrage; `nvc_wave_find` compare des valeurs
 binaires (les énumérations multi-bits se donnent telles qu'écrites dans le
 fichier); la rétention automatique des répertoires (étape 5) reste à faire;
 les tâches MCP (extension `tasks`) ne sont pas encore proposées.
+
+### 8.6 Diagnostic par les ondes (voir `MCP-DEBUG-PLAN.md`)
+
+Réalisé: `nvc_trace_*` a été fusionné dans `nvc_wave_*` (un seul
+enregistrement, `to: memory|file|both`, lecture par `sim_id` ou `file`),
+un petit langage de conditions (`mcp-cond.c`: `/dut/valid = '1' and
+/dut/ready = '0'`, `rose()`, `fell()`, `changed()`, `stable()`),
+`nvc_wave_find` (stretches vraies, par front d'horloge, `at_least_cycles`),
+`nvc_wave_measure` (ordre et délais entre deux événements, en temps et en
+cycles), `nvc_wave_table` (une ligne par front d'horloge, lignes identiques
+repliées, messages du design placés sur leur cycle) et `nvc_signal_drivers`
+(process qui écrivent un signal, avec fichier et ligne, process en attente,
+connexions de ports). Échantillonnage par front: la valeur juste avant le
+front, ce que voient les registres.
+
+Banc (`test/mcp/bench`): 5 designs, 8 bugs, vérité terrain calculée par
+comparaison des ondes avec et sans le bug. Mesures avec le plus petit
+modèle (3 essais par bug): voir §8.7.
 
 ## Références
 
