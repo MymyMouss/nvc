@@ -16,6 +16,7 @@
 //
 
 #include "test_util.h"
+#include "mcp/mcp-cond.h"
 #include "mcp/mcp-json.h"
 #include "mcp/mcp-schema.h"
 #include "mcp/mcp-server.h"
@@ -1766,97 +1767,78 @@ START_TEST(test_sim_trace)
    open_sim(&f, "tb", id);
 
    // Mistakes first
-   const char *e = tool_error(sim_tool(&f, "nvc_trace_start", id, ""));
-   ck_assert_ptr_nonnull(strstr(e, "either paths or pattern"));
-   e = tool_error(sim_tool(&f, "nvc_trace_start", id,
-                           "\"paths\":[\"/q\"],\"pattern\":\"q\""));
-   ck_assert_ptr_nonnull(strstr(e, "either paths or pattern"));
-   e = tool_error(sim_tool(&f, "nvc_trace_start", id, "\"paths\":[\"/nope\"]"));
+   const char *e = tool_error(sim_tool(&f, "nvc_wave_start", id,
+                                       "\"include\":[\"/nope\"]"));
    ck_assert_ptr_nonnull(strstr(e, "nvc_design_search"));
-   e = tool_error(sim_tool(&f, "nvc_trace_start", id, "\"paths\":[\"/dut\"]"));
+   e = tool_error(sim_tool(&f, "nvc_wave_start", id,
+                           "\"include\":[\"/dut\"]"));
    ck_assert_ptr_nonnull(strstr(e, "is a region"));
-   e = tool_error(sim_tool(&f, "nvc_trace_start", id, "\"pattern\":\"zzz*\""));
+   e = tool_error(sim_tool(&f, "nvc_wave_start", id,
+                           "\"include\":[\"zzz*\"]"));
    ck_assert_ptr_nonnull(strstr(e, "No signal matches"));
-   e = tool_error(sim_tool(&f, "nvc_trace_get", id, "\"trace_id\":3"));
-   ck_assert_ptr_nonnull(strstr(e, "Trace 3 does not exist"));
+   e = tool_error(sim_tool(&f, "nvc_wave_get", id, "\"paths\":[\"/q\"]"));
+   ck_assert_ptr_nonnull(strstr(e, "Nothing is recorded in memory"));
 
-   const json_t *sc = structured(sim_tool(&f, "nvc_trace_start", id,
-                                          "\"paths\":[\"/rst\",\"/q\"]"));
-   ck_assert_int_eq(int_field(sc, "trace_id"), 1);
-   ck_assert_int_eq(json_get(sc, "signals")->array.count, 2);
-   ck_assert_int_eq(int_field(sc, "started_fs"), 0);
-
-   // A pattern works too, and several traces can be active
-   sc = structured(sim_tool(&f, "nvc_trace_start", id, "\"pattern\":\"/dut/c*\""));
-   ck_assert_int_eq(int_field(sc, "trace_id"), 2);
-   ck_assert_int_eq(json_get(sc, "signals")->array.count, 2);
+   const json_t *sc = structured(sim_tool(&f, "nvc_wave_start", id,
+                                          "\"include\":[\"/rst\",\"/q\"],"
+                                          "\"to\":\"memory\""));
+   ck_assert_int_eq(int_field(sc, "signals"), 2);
 
    sc = structured(sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"200 ns\""));
    ck_assert_str_eq(str_field(sc, "stopped_because"), "severity");
    ck_assert_int_eq(int_field(sc, "now_fs"), 65000000);
 
    // The window before the failure, without running again
-   sc = structured(sim_tool(&f, "nvc_trace_get", id,
-                            "\"trace_id\":1,\"from\":\"40 ns\",\"to\":\"70 ns\""));
-   ck_assert_int_eq(int_field(sc, "total"), 2);
+   sc = structured(sim_tool(&f, "nvc_wave_get", id,
+                            "\"paths\":[\"/q\"],\"from\":\"40 ns\","
+                            "\"until\":\"70 ns\",\"radix\":\"binary\""));
+   ck_assert_str_eq(str_field(sc, "source"), "memory");
+   ck_assert_int_eq(int_field(sc, "changes_total"), 2);
    ck_assert(!bool_field(sc, "truncated"));
    ck_assert_int_eq(int_field(sc, "dropped"), 0);
    ck_assert_int_eq(int_field(sc, "now_fs"), 65000000);
-   const json_t *changes = json_get(sc, "changes");
-   ck_assert_int_eq(int_field(json_at(changes, 0), "time_fs"), 45000000);
-   ck_assert_str_eq(str_field(json_at(changes, 0), "time"), "45 ns");
-   ck_assert_str_eq(str_field(json_get(json_at(changes, 0), "values"), "/q"),
-                    "0100");
-   ck_assert_int_eq(int_field(json_at(changes, 1), "time_fs"), 55000000);
-   ck_assert_str_eq(str_field(json_get(json_at(changes, 1), "values"), "/q"),
-                    "0101");
+   const json_t *sig = json_at(json_get(sc, "signals"), 0);
+   ck_assert_str_eq(str_field(sig, "value_at_from"), "0011");
+   const json_t *changes = json_get(sig, "changes");
+   ck_assert_int_eq(json_at(json_at(changes, 0), 0)->integer, 45000000);
+   ck_assert_str_eq(json_string(json_at(json_at(changes, 0), 1)), "0100");
+   ck_assert_int_eq(json_at(json_at(changes, 1), 0)->integer, 55000000);
+   ck_assert_str_eq(json_string(json_at(json_at(changes, 1), 1)), "0101");
 
-   // The first entry holds the values when the trace started
-   sc = structured(sim_tool(&f, "nvc_trace_get", id,
-                            "\"trace_id\":1,\"to\":\"0 fs\""));
-   ck_assert_int_eq(int_field(sc, "total"), 1);
+   // The first entry holds the values when the recording started
+   sc = structured(sim_tool(&f, "nvc_wave_get", id,
+                            "\"paths\":[\"/rst\",\"/q\"],"
+                            "\"until\":\"0 fs\""));
    ck_assert_int_eq(int_field(sc, "oldest_time_fs"), 0);
-   const json_t *first = json_get(json_at(json_get(sc, "changes"), 0), "values");
-   ck_assert_str_eq(str_field(first, "/rst"), "'1'");
-   ck_assert_str_eq(str_field(first, "/q"), "UUUU");
+   ck_assert_str_eq(str_field(json_at(json_get(sc, "signals"), 0),
+                              "value_at_from"), "'1'");
+   ck_assert_str_eq(str_field(json_at(json_get(sc, "signals"), 1),
+                              "value_at_from"), "UUUU");
 
-   // One signal, in decimal, paged
-   sc = structured(sim_tool(&f, "nvc_trace_get", id,
-                            "\"trace_id\":1,\"paths\":[\"/q\"],"
-                            "\"radix\":\"dec\",\"limit\":3"));
-   ck_assert_int_eq(int_field(sc, "total"), 7);
+   // Paged by max_changes, and in decimal
+   sc = structured(sim_tool(&f, "nvc_wave_get", id,
+                            "\"paths\":[\"/q\"],\"radix\":\"decimal\","
+                            "\"max_changes\":3"));
+   ck_assert_int_eq(int_field(sc, "changes_total"), 7);
    ck_assert(bool_field(sc, "truncated"));
-   ck_assert_str_eq(str_field(sc, "next_cursor"), "3");
-   changes = json_get(sc, "changes");
-   ck_assert_int_eq(changes->array.count, 3);
-   ck_assert_str_eq(str_field(json_get(json_at(changes, 1), "values"), "/q"), "0");
-   ck_assert_str_eq(str_field(json_get(json_at(changes, 2), "values"), "/q"), "1");
+   ck_assert_int_eq(json_get(json_at(json_get(sc, "signals"), 0),
+                             "changes")->array.count, 3);
 
-   sc = structured(sim_tool(&f, "nvc_trace_get", id,
-                            "\"trace_id\":1,\"paths\":[\"/q\"],"
-                            "\"radix\":\"dec\",\"limit\":10,\"cursor\":\"6\""));
-   ck_assert_int_eq(json_get(sc, "changes")->array.count, 1);
-   ck_assert(!bool_field(sc, "truncated"));
-   ck_assert_str_eq(str_field(json_get(json_at(json_get(sc, "changes"), 0),
-                                       "values"), "/q"), "5");
-
-   e = tool_error(sim_tool(&f, "nvc_trace_get", id,
-                           "\"trace_id\":1,\"paths\":[\"/clk\"]"));
-   ck_assert_ptr_nonnull(strstr(e, "is not part of trace 1"));
+   e = tool_error(sim_tool(&f, "nvc_wave_get", id, "\"paths\":[\"/clk\"]"));
+   ck_assert_ptr_nonnull(strstr(e, "not in the in-memory recording"));
    ck_assert_ptr_nonnull(strstr(e, "/rst, /q"));
 
-   // Stopping frees it
-   sc = structured(sim_tool(&f, "nvc_trace_stop", id, "\"trace_id\":1"));
-   ck_assert(bool_field(sc, "stopped"));
-   ck_assert_int_eq(int_field(sc, "changes_kept"), 9);
-   e = tool_error(sim_tool(&f, "nvc_trace_get", id, "\"trace_id\":1"));
-   ck_assert_ptr_nonnull(strstr(e, "Active traces: 2"));
+   // Stopping ends the recording but what was kept stays readable
+   sc = structured(sim_tool(&f, "nvc_wave_stop", id, ""));
+   const json_t *mem = json_get(json_get(sc, "files"), "memory");
+   ck_assert(!bool_field(mem, "active"));
+   ck_assert_int_eq(int_field(mem, "changes_kept"), 9);
 
-   // The other trace goes on recording
-   sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"40 ns\",\"pause_on\":\"never\"");
-   sc = structured(sim_tool(&f, "nvc_trace_get", id,
-                            "\"trace_id\":2,\"from\":\"70 ns\""));
-   ck_assert_int_ge(int_field(sc, "total"), 1);
+   sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"40 ns\","
+            "\"pause_on\":\"never\"");
+   sc = structured(sim_tool(&f, "nvc_wave_get", id,
+                            "\"paths\":[\"/q\"],\"from\":\"70 ns\""));
+   ck_assert_int_eq(int_field(sc, "changes_total"), 0);
 
    sim_tool(&f, "nvc_sim_close", id, "");
    fixture_close(&f);
@@ -1874,24 +1856,28 @@ START_TEST(test_sim_trace_overflow)
    open_sim(&f, "tb", id);
 
    // A small buffer keeps only the most recent changes
-   const json_t *sc = structured(sim_tool(&f, "nvc_trace_start", id,
-                                          "\"paths\":[\"/clk\"],"
+   const json_t *sc = structured(sim_tool(&f, "nvc_wave_start", id,
+                                          "\"include\":[\"/clk\"],"
+                                          "\"to\":\"memory\","
                                           "\"max_changes\":100"));
+   sc = json_get(json_get(sc, "files"), "memory");
    ck_assert_int_eq(int_field(sc, "capacity"), 100);
 
-   sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"2 us\",\"pause_on\":\"never\"");
+   sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"2 us\","
+            "\"pause_on\":\"never\"");
 
-   sc = structured(sim_tool(&f, "nvc_trace_get", id,
-                            "\"trace_id\":1,\"limit\":500"));
-   ck_assert_int_eq(int_field(sc, "total"), 100);
+   sc = structured(sim_tool(&f, "nvc_wave_get", id,
+                            "\"paths\":[\"/clk\"],\"max_changes\":5000"));
+   ck_assert_int_eq(int_field(sc, "changes_total"), 100);
    ck_assert_int_gt(int_field(sc, "dropped"), 100);
    ck_assert_int_gt(int_field(sc, "oldest_time_fs"), 0);
 
-   // Entries are in time order
-   const json_t *changes = json_get(sc, "changes");
+   // Changes are in time order
+   const json_t *changes = json_get(json_at(json_get(sc, "signals"), 0),
+                                    "changes");
    int64_t previous = -1;
    for (size_t i = 0; i < changes->array.count; i++) {
-      const int64_t t = int_field(json_at(changes, i), "time_fs");
+      const int64_t t = json_at(json_at(changes, i), 0)->integer;
       ck_assert_int_gt(t, previous);
       previous = t;
    }
@@ -2293,11 +2279,11 @@ START_TEST(test_sim_waves)
    free(call_args);
    free(extra);
 
-   extra = xasprintf("{%s,\"path\":\"/dut/cnt\",\"value\":\"0x5\","
+   extra = xasprintf("{%s,\"when\":\"/dut/cnt = x\\\"5\\\"\","
                      "\"max_matches\":2}", args);
    sc = structured(tool(f.mp, f.srv, &f.sink, "nvc_wave_find", extra));
    ck_assert_int_eq(json_get(sc, "matches")->array.count, 2);
-   ck_assert_int_eq(int_field(json_at(json_get(sc, "matches"), 0), "time_fs"),
+   ck_assert_int_eq(int_field(json_at(json_get(sc, "matches"), 0), "start_fs"),
                     55000000);
    free(extra);
 
@@ -2436,7 +2422,7 @@ START_TEST(test_sim_files_misc)
                                          "\"name\":\"../x\""));
    ck_assert_ptr_nonnull(strstr(err, "Invalid name"));
    err = tool_error(sim_tool(&f, "nvc_wave_stop", id, ""));
-   ck_assert_ptr_nonnull(strstr(err, "No waveform"));
+   ck_assert_ptr_nonnull(strstr(err, "No recording"));
 
    // Start recording in the middle of a background run
    const json_t *sc = structured(sim_tool(&f, "nvc_sim_run", id,
@@ -2611,27 +2597,195 @@ START_TEST(test_sim_live_trace)
                                           "\"pause_on\":\"never\""));
    ck_assert_str_eq(str_field(sc, "state"), "running");
 
-   // A trace can be started in the middle of the run and read at once
-   sc = structured(sim_tool(&f, "nvc_trace_start", id,
-                            "\"pattern\":\"/dut/*\",\"max_changes\":1000"));
-   const int64_t trace = int_field(sc, "trace_id");
-   const int64_t started = int_field(sc, "started_fs");
+   // A recording can be started in the middle of the run and read at once
+   sc = structured(sim_tool(&f, "nvc_wave_start", id,
+                            "\"include\":[\"/dut/*\"],\"to\":\"memory\","
+                            "\"max_changes\":1000"));
+   const int64_t started = int_field(sc, "now_fs");
 
    struct timespec ts = { 0, 300 * 1000 * 1000 };
    nanosleep(&ts, NULL);
 
-   char *extra = xasprintf("\"trace_id\":%"PRIi64",\"limit\":5", trace);
-   sc = structured(sim_tool(&f, "nvc_trace_get", id, extra));
-   free(extra);
-   ck_assert_int_gt(int_field(sc, "total"), 5);
+   sc = structured(sim_tool(&f, "nvc_wave_get", id,
+                            "\"paths\":[\"/dut/cnt\"],\"max_changes\":5"));
+   ck_assert_int_gt(int_field(sc, "changes_total"), 5);
    ck_assert_int_gt(int_field(sc, "now_fs"), started);
 
-   extra = xasprintf("\"trace_id\":%"PRIi64, trace);
-   sc = structured(sim_tool(&f, "nvc_trace_stop", id, extra));
-   free(extra);
-
+   sc = structured(sim_tool(&f, "nvc_wave_stop", id, ""));
    sc = structured(sim_tool(&f, "nvc_sim_stop", id, ""));
    ck_assert_str_ne(str_field(sc, "state"), "running");
+   fixture_close(&f);
+}
+END_TEST
+
+START_TEST(test_cond)
+{
+   char err[800];
+
+   cond_t *c = cond_parse("/a = '1' and /b = x\"0F\" and not /c = IDLE", err,
+                          sizeof(err));
+   ck_assert_ptr_nonnull(c);
+   ck_assert_int_eq(cond_nrefs(c), 3);
+   ck_assert_str_eq(cond_ref(c, 1), "/b");
+
+   cond_val_t v[3] = {
+      { .cur = "1", .bits = true },
+      { .cur = "00001111", .bits = true },
+      { .cur = "SEND", .bits = false },
+   };
+   ck_assert(cond_eval(c, v));
+   v[2].cur = "IDLE";
+   ck_assert(!cond_eval(c, v));
+   v[2].cur = "SEND";
+   v[1].cur = "00001110";
+   ck_assert(!cond_eval(c, v));
+   cond_free(c);
+
+   // Ordering compares vectors as unsigned numbers
+   c = cond_parse("/n >= 16 and /n < 32 or /n = 7", err, sizeof(err));
+   ck_assert_ptr_nonnull(c);
+   cond_val_t n = { .cur = "00010000", .bits = true };
+   ck_assert(cond_eval(c, &n));
+   n.cur = "00100000";
+   ck_assert(!cond_eval(c, &n));
+   n.cur = "0111";
+   ck_assert(cond_eval(c, &n));
+   n.cur = "01UX";   // Not a number: only equality can hold
+   ck_assert(!cond_eval(c, &n));
+   cond_free(c);
+
+   // Edges need the previous sample
+   c = cond_parse("rose(/s) or fell(/t)", err, sizeof(err));
+   ck_assert_ptr_nonnull(c);
+   cond_val_t e[2] = { { .cur = "1", .prev = "0", .bits = true },
+                       { .cur = "1", .prev = "1", .bits = true } };
+   ck_assert(cond_eval(c, e));
+   e[0].prev = NULL;
+   ck_assert(!cond_eval(c, e));
+   e[1].prev = "1";
+   e[1].cur = "0";
+   ck_assert(cond_eval(c, e));
+   cond_free(c);
+
+   // Paths with generate indexes and a signal on its own
+   c = cond_parse("/gen(0)/u/c and (/q /= 3)", err, sizeof(err));
+   ck_assert_ptr_nonnull(c);
+   ck_assert_str_eq(cond_ref(c, 0), "/gen(0)/u/c");
+   cond_free(c);
+
+   // Mistakes say where and give an example
+   static const char *bad[] = {
+      "", "/a =", "/a = '1' and", "(/a = '1'", "/a ! '1'", "a = '1'",
+      "/a = '1' /b = '0'", "/a = \"01", "rose(/a",
+   };
+   for (size_t i = 0; i < ARRAY_LEN(bad); i++) {
+      ck_assert_ptr_null(cond_parse(bad[i], err, sizeof(err)));
+      ck_assert_ptr_nonnull(strstr(err, "Invalid condition at character"));
+      ck_assert_ptr_nonnull(strstr(err, "/dut/valid"));
+   }
+}
+END_TEST
+
+START_TEST(test_sim_queries)
+{
+   fixture_t f;
+   const char *names[] = { "tb.vhd" }, *sources[] = { tb_src };
+   const char *tops[] = { "tb" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   char id[40];
+   open_sim(&f, "tb", id);
+
+   sim_tool(&f, "nvc_wave_start", id, "\"include\":[\"/clk\",\"/dut/*\"],"
+            "\"name\":\"q\"");
+   const json_t *sc = structured(sim_tool(&f, "nvc_sim_run", id,
+                                          "\"duration\":\"300 ns\","
+                                          "\"pause_on\":\"never\""));
+
+   // Without a clock the condition is tested after every change: cnt
+   // becomes 5 at 55 ns.  With the clock it is tested on the values the
+   // registers see just before each edge, so the first sample is 65 ns.
+   sc = structured(sim_tool(&f, "nvc_wave_find", id,
+                            "\"when\":\"/dut/cnt = 5\",\"max_matches\":2"));
+   ck_assert_int_eq(json_get(sc, "matches")->array.count, 2);
+   ck_assert_int_eq(int_field(json_at(json_get(sc, "matches"), 0), "start_fs"),
+                    55000000);
+
+   sc = structured(sim_tool(&f, "nvc_wave_find", id,
+                            "\"when\":\"/dut/cnt = 5\",\"clock\":\"/clk\","
+                            "\"max_matches\":1"));
+   ck_assert_int_eq(int_field(json_at(json_get(sc, "matches"), 0), "start_fs"),
+                    65000000);
+   ck_assert_int_eq(int_field(json_at(json_get(sc, "matches"), 0), "cycles"), 1);
+   ck_assert_int_ge(int_field(sc, "matches_total"), 2);
+
+   // A condition that never holds says so
+   sc = structured(sim_tool(&f, "nvc_wave_find", id,
+                            "\"when\":\"/dut/cnt = 99\",\"clock\":\"/clk\""));
+   ck_assert_int_eq(int_field(sc, "matches_total"), 0);
+   ck_assert_ptr_nonnull(json_get(sc, "hint"));
+
+   const char *e = tool_error(sim_tool(&f, "nvc_wave_find", id,
+                                       "\"when\":\"/dut/cnt =\""));
+   ck_assert_ptr_nonnull(strstr(e, "Invalid condition"));
+   e = tool_error(sim_tool(&f, "nvc_wave_find", id,
+                           "\"when\":\"/dut/nope = 1\""));
+   ck_assert_ptr_nonnull(strstr(e, "nvc_wave_summary"));
+   e = tool_error(sim_tool(&f, "nvc_wave_find", id,
+                           "\"when\":\"/dut/cnt = 5\",\"at_least_cycles\":2"));
+   ck_assert_ptr_nonnull(strstr(e, "clock"));
+
+   // From cnt = 3 to cnt = 5 is two cycles
+   sc = structured(sim_tool(&f, "nvc_wave_measure", id,
+                            "\"event_a\":\"/dut/cnt = 3\","
+                            "\"event_b\":\"/dut/cnt = 5\",\"clock\":\"/clk\""));
+   ck_assert_str_eq(str_field(sc, "first_event"), "a");
+   ck_assert_int_ge(int_field(sc, "pairs_total"), 1);
+   ck_assert_int_eq(int_field(json_get(sc, "delay_cycles"), "min"), 2);
+   ck_assert_int_eq(int_field(json_get(sc, "delay_fs"), "min"), 20000000);
+   ck_assert_ptr_nonnull(strstr(str_field(sc, "summary"), "2 cycles"));
+
+   // The other way round: five comes before 3 only after the wrap
+   sc = structured(sim_tool(&f, "nvc_wave_measure", id,
+                            "\"event_a\":\"/dut/cnt = 5\","
+                            "\"event_b\":\"/dut/cnt = 3\",\"clock\":\"/clk\""));
+   ck_assert_int_eq(int_field(json_get(sc, "delay_cycles"), "min"), 14);
+
+   // One row per clock edge, around a time, with the assertion on its cycle
+   sc = structured(sim_tool(&f, "nvc_wave_table", id,
+                            "\"clock\":\"/clk\",\"signals\":[\"/dut/cnt\"],"
+                            "\"around\":\"65 ns\",\"cycles\":2"));
+   const json_t *rows = json_get(sc, "rows");
+   ck_assert_int_eq(rows->array.count, 5);
+   ck_assert_int_eq(json_get(sc, "columns")->array.count, 5);
+   ck_assert_str_eq(json_string(json_at(json_at(rows, 0), 1)), "45 ns");
+   ck_assert_str_eq(json_string(json_at(json_at(rows, 0), 2)), "0x4");
+   ck_assert_str_eq(json_string(json_at(json_at(rows, 2), 1)), "65 ns");
+   ck_assert_str_eq(json_string(json_at(json_at(rows, 2), 2)), "0x5");
+   ck_assert_ptr_nonnull(strstr(json_string(json_at(json_at(rows, 2), 3)),
+                                "q reached five"));
+
+   // A finished file answers the same questions
+   sc = structured(sim_tool(&f, "nvc_wave_stop", id, ""));
+   char *file = xstrdup(str_field(sc, "file"));
+   char *args = xasprintf("{\"file\":\"%s\",\"when\":\"/dut/cnt = 5\","
+                          "\"clock\":\"/clk\",\"max_matches\":1}", file);
+   sc = structured(tool(f.mp, f.srv, &f.sink, "nvc_wave_find", args));
+   ck_assert_int_eq(int_field(json_at(json_get(sc, "matches"), 0), "start_fs"),
+                    65000000);
+   free(args);
+
+   args = xasprintf("{\"file\":\"%s\",\"clock\":\"/clk\","
+                    "\"signals\":[\"/dut/cnt\"],\"from\":\"100 ns\","
+                    "\"until\":\"140 ns\",\"radix\":\"decimal\"}", file);
+   sc = structured(tool(f.mp, f.srv, &f.sink, "nvc_wave_table", args));
+   ck_assert_int_eq(json_get(sc, "rows")->array.count, 4);
+   ck_assert_str_eq(json_string(json_at(json_at(json_get(sc, "rows"), 0), 2)),
+                    "10");
+   free(args);
+   free(file);
+
+   sim_tool(&f, "nvc_sim_close", id, "");
    fixture_close(&f);
 }
 END_TEST
@@ -2646,6 +2800,7 @@ Suite *get_mcp_tests(void)
    tcase_add_test(tc, test_json_limits);
    tcase_add_test(tc, test_json_writer);
    tcase_add_test(tc, test_schema);
+   tcase_add_test(tc, test_cond);
    tcase_add_test(tc, test_proto_modern);
    tcase_add_test(tc, test_proto_errors);
    tcase_add_test(tc, test_proto_legacy);
@@ -2674,6 +2829,7 @@ Suite *get_mcp_tests(void)
    tcase_add_test(tc, test_sim_log_limit);
    tcase_add_test(tc, test_sim_busy);
    tcase_add_test(tc, test_sim_live_trace);
+   tcase_add_test(tc, test_sim_queries);
    tcase_set_timeout(tc, 60);
    suite_add_tcase(s, tc);
 

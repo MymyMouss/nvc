@@ -72,7 +72,6 @@
 
 #define CLAMP_INT(v, lo, hi) ((v) < (lo) ? (lo) : (v) > (hi) ? (hi) : (v))
 
-#define MAX_TRACES           4
 #define MAX_TRACE_SIGNALS    512
 #define MAX_TRACE_BYTES      256
 #define DEFAULT_TRACE_CHANGES 10000
@@ -157,13 +156,21 @@ typedef struct {
    int64_t       last_wall_ms;
    uint64_t      msg_base;       // Sequence number of msgs[0]
 
-   trace_t      *traces[MAX_TRACES];
+   trace_t      *live;             // In-memory recording, if any
    unsigned      next_trace_id;
 } worker_t;
 
 static void files_check(worker_t *w, bool force);
 static void write_files(worker_t *w, json_writer_t *jw);
 static void wave_finish(worker_t *w);
+static bool live_pick(worker_t *w, const json_t *include,
+                      const json_t *exclude, design_obj_t ***picked,
+                      size_t *npicked, text_buf_t *err);
+static bool live_start(worker_t *w, design_obj_t **picked, size_t npicked,
+                       int64_t max_changes, text_buf_t *err);
+static void live_stop(worker_t *w);
+static void live_free(worker_t *w);
+static void write_live(worker_t *w, json_writer_t *jw);
 
 ////////////////////////////////////////////////////////////////////////////////
 // Helpers
@@ -1111,6 +1118,8 @@ static void write_files(worker_t *w, json_writer_t *jw)
    jw_end_array(jw);
    jw_end_object(jw);
 
+   write_live(w, jw);
+
    jw_end_object(jw);
 }
 
@@ -1150,18 +1159,36 @@ static bool valid_file_name(const char *name)
    return true;
 }
 
+// The include and exclude entries as the patterns the waveform filter
+// matches, which are full lower case paths with colons
+static char *wave_filter_pattern(worker_t *w, const char *entry)
+{
+   if (strchr(entry, '/') == NULL && entry[0] != ':') {
+      // A name or glob without a path matches in every region
+      LOCAL_TEXT_BUF tb = tb_new();
+      tb_printf(tb, "*:%s", entry);
+      tb_downcase(tb);
+      return tb_claim(tb);
+   }
+
+   return wave_pattern(w, entry);
+}
+
 static void op_wave_start(worker_t *w, const json_t *req)
 {
    if (w->files_dir == NULL) {
       reply_error(w, "This simulation has no file directory");
       return;
    }
-   else if (w->wave != NULL) {
-      reply_error(w, "A waveform dump is already active (%s): stop it with "
-                  "nvc_wave_stop, which also lets you start another file",
-                  w->wave_file);
+   else if (w->wave != NULL || (w->live != NULL && !w->live->stopped)) {
+      reply_error(w, "A recording is already active: end it with "
+                  "nvc_wave_stop, which also lets you start another");
       return;
    }
+
+   const char *to = json_string(json_get(req, "to")) ?: "both";
+   const bool want_file = strcmp(to, "memory") != 0;
+   const bool want_memory = strcmp(to, "file") != 0;
 
    const char *name = json_string(json_get(req, "name"));
    char *auto_name = NULL;
@@ -1173,8 +1200,9 @@ static void op_wave_start(worker_t *w, const json_t *req)
       return;
    }
 
-   int64_t max_bytes = DEFAULT_WAVE_MAX;
+   int64_t max_bytes = DEFAULT_WAVE_MAX, max_changes = DEFAULT_TRACE_CHANGES;
    json_as_int(json_get(req, "max_bytes"), &max_bytes);
+   json_as_int(json_get(req, "max_changes"), &max_changes);
    max_bytes = CLAMP_INT(max_bytes, 1, (int64_t)MAX_WAVE_MAX);
 
    char *file = xasprintf("%s/%s%s", w->files_dir, name,
@@ -1182,43 +1210,86 @@ static void op_wave_start(worker_t *w, const json_t *req)
    free(auto_name);
 
    struct stat st;
-   if (stat(file, &st) == 0) {
+   if (want_file && stat(file, &st) == 0) {
       reply_error(w, "The file %s already exists: choose another name", file);
       free(file);
       return;
    }
 
-   wave_clear_globs();
-
    const json_t *incl = json_get(req, "include");
    const json_t *excl = json_get(req, "exclude");
-   for (int pass = 0; pass < 2; pass++) {
-      const json_t *list = pass == 0 ? incl : excl;
-      const size_t n = list != NULL ? list->array.count : 0;
-      for (size_t i = 0; i < n && i < MAX_WAVE_PATTERNS; i++) {
-         const char *pat = json_string(json_at(list, i));
-         if (pat == NULL)
-            continue;
 
-         char *glob = wave_pattern(w, pat);
-         if (pass == 0)
-            wave_include_glob(glob);
-         else
-            wave_exclude_glob(glob);
-         free(glob);
+   // The signals selected, for the in-memory recording and to check the
+   // patterns before anything is started
+   design_obj_t **picked = NULL;
+   size_t npicked = 0;
+   LOCAL_TEXT_BUF err = tb_new();
+   if (!live_pick(w, incl, excl, &picked, &npicked, err)) {
+      reply_error(w, "%s", tb_get(err));
+      free(file);
+      return;
+   }
+
+   if (npicked == 0) {
+      reply_error(w, "Every signal selected by include was removed by "
+                  "exclude: nothing would be recorded");
+      free(picked);
+      free(file);
+      return;
+   }
+
+   char *memory_note = NULL;
+   if (want_memory) {
+      tb_rewind(err);
+      if (!live_start(w, picked, npicked, max_changes, err)) {
+         if (!want_file) {
+            reply_error(w, "Cannot record in memory: %s", tb_get(err));
+            free(picked);
+            free(file);
+            return;
+         }
+
+         // The file alone still works for a large selection
+         memory_note = xasprintf("Not recorded in memory: %s. The file "
+                                 "has everything, and can be read once "
+                                 "finished with nvc_wave_stop", tb_get(err));
       }
    }
 
-   w->wave = wave_dumper_new(file, NULL, w->top, WAVE_FORMAT_FST);
-   w->wave_file = file;
-   w->wave_max = max_bytes;
-   w->wave_quota_hit = false;
-   w->wave_bytes = w->wave_rate = 0;
-   w->wave_seq++;
+   free(picked);
 
-   // The initial values are those at the current time
-   wave_dumper_restart(w->wave, w->model, w->jit);
-   wave_clear_globs();
+   if (want_file) {
+      wave_clear_globs();
+      for (int pass = 0; pass < 2; pass++) {
+         const json_t *list = pass == 0 ? incl : excl;
+         const size_t n = json_is(list, JSON_ARRAY) ? list->array.count : 0;
+         for (size_t i = 0; i < n; i++) {
+            const char *pat = json_string(json_at(list, i));
+            if (pat == NULL)
+               continue;
+
+            char *glob = wave_filter_pattern(w, pat);
+            if (pass == 0)
+               wave_include_glob(glob);
+            else
+               wave_exclude_glob(glob);
+            free(glob);
+         }
+      }
+
+      w->wave = wave_dumper_new(file, NULL, w->top, WAVE_FORMAT_FST);
+      w->wave_file = file;
+      w->wave_max = max_bytes;
+      w->wave_quota_hit = false;
+      w->wave_bytes = w->wave_rate = 0;
+      w->wave_seq++;
+
+      // The initial values are those at the current time
+      wave_dumper_restart(w->wave, w->model, w->jit);
+      wave_clear_globs();
+   }
+   else
+      free(file);
 
    w->files_check_us = 0;
 
@@ -1228,10 +1299,19 @@ static void op_wave_start(worker_t *w, const json_t *req)
    begin_reply(&jw, true);
    jw_key(&jw, "result");
    jw_begin_object(&jw);
-   jw_key(&jw, "file");
-   jw_string(&jw, w->wave_file);
-   jw_key(&jw, "max_bytes");
-   jw_int(&jw, max_bytes);
+   jw_key(&jw, "signals");
+   jw_int(&jw, npicked);
+   if (w->wave != NULL) {
+      jw_key(&jw, "file");
+      jw_string(&jw, w->wave_file);
+      jw_key(&jw, "max_bytes");
+      jw_int(&jw, max_bytes);
+   }
+   if (memory_note != NULL) {
+      jw_key(&jw, "hint");
+      jw_string(&jw, memory_note);
+      free(memory_note);
+   }
    write_state(w, &jw);
    write_files(w, &jw);
    jw_end_object(&jw);
@@ -1241,18 +1321,25 @@ static void op_wave_start(worker_t *w, const json_t *req)
 
 static void op_wave_stop(worker_t *w)
 {
-   if (w->wave == NULL) {
-      reply_error(w, "No waveform dump is active");
+   if (w->wave == NULL && (w->live == NULL || w->live->stopped)) {
+      reply_error(w, "No recording is active");
       return;
    }
 
-   char *file = xstrdup(w->wave_file);
-   wave_finish(w);
+   char *file = w->wave_file ? xstrdup(w->wave_file) : NULL;
+   uint64_t bytes = 0;
 
-   char *base = xstrdup(file);
-   char *slash = strrchr(base, '/');
-   *slash = '\0';
-   const uint64_t bytes = prefix_bytes(base, slash + 1);
+   if (w->wave != NULL) {
+      wave_finish(w);
+
+      char *base = xstrdup(file);
+      char *slash = strrchr(base, '/');
+      *slash = '\0';
+      bytes = prefix_bytes(base, slash + 1);
+      free(base);
+   }
+
+   live_stop(w);
 
    LOCAL_TEXT_BUF tb = tb_new();
    json_writer_t jw;
@@ -1260,17 +1347,18 @@ static void op_wave_stop(worker_t *w)
    begin_reply(&jw, true);
    jw_key(&jw, "result");
    jw_begin_object(&jw);
-   jw_key(&jw, "file");
-   jw_string(&jw, file);
-   jw_key(&jw, "bytes");
-   jw_int(&jw, bytes);
+   if (file != NULL) {
+      jw_key(&jw, "file");
+      jw_string(&jw, file);
+      jw_key(&jw, "bytes");
+      jw_int(&jw, bytes);
+   }
    write_state(w, &jw);
    write_files(w, &jw);
    jw_end_object(&jw);
    jw_end_object(&jw);
    ctl_send(w, tb);
 
-   free(base);
    free(file);
 }
 
@@ -1719,6 +1807,7 @@ typedef struct {
 
 struct _trace {
    unsigned       id;
+   bool           stopped;   // Watches removed, buffer still readable
    unsigned       nsigs;
    design_obj_t **objs;
    rt_watch_t   **watches;
@@ -1758,18 +1847,6 @@ static void trace_event_cb(uint64_t now, rt_signal_t *s, rt_watch_t *w,
    trace_record(ctx->trace, now, ctx->index, signal_value(s), s->shared.size);
 }
 
-static void trace_free(worker_t *w, trace_t *t)
-{
-   for (unsigned i = 0; i < t->nsigs; i++)
-      watch_free(w->model, t->watches[i]);
-
-   free(t->objs);
-   free(t->watches);
-   free(t->ctx);
-   free(t->buf);
-   free(t);
-}
-
 static print_flags_t radix_flags(const char *radix)
 {
    if (!strcmp(radix, "hex"))
@@ -1794,107 +1871,153 @@ static void format_raw(worker_t *w, design_obj_t *o, const void *data,
       tb_cat(out, printed);
 }
 
-static trace_t *find_trace(worker_t *w, int64_t id)
+static bool glob_wanted(const char *p)
 {
-   for (unsigned i = 0; i < MAX_TRACES; i++) {
-      if (w->traces[i] != NULL && (int64_t)w->traces[i]->id == id)
-         return w->traces[i];
-   }
-
-   return NULL;
+   return strpbrk(p, "*?") != NULL;
 }
 
-static void trace_not_found(worker_t *w, int64_t id)
+// Mark the signals an include or exclude entry names.  Returns the number
+// of signals marked, or -1 after writing the reason to err.
+static int mark_entry(worker_t *w, const char *entry, bool *mark, bool value,
+                      text_buf_t *err)
 {
-   LOCAL_TEXT_BUF active = tb_new();
-   unsigned n = 0;
-   for (unsigned i = 0; i < MAX_TRACES; i++) {
-      if (w->traces[i] != NULL)
-         tb_printf(active, "%s%u", n++ ? ", " : "", w->traces[i]->id);
-   }
+   int count = 0;
 
-   reply_error(w, "Trace %"PRIi64" does not exist. Active traces: %s. Start "
-               "one with nvc_trace_start", id, n > 0 ? tb_get(active) : "none");
-}
-
-static void op_trace_start(worker_t *w, const json_t *req)
-{
-   const json_t *paths = json_get(req, "paths");
-   const char *pattern = json_string(json_get(req, "pattern"));
-
-   int64_t max_changes = DEFAULT_TRACE_CHANGES;
-   json_as_int(json_get(req, "max_changes"), &max_changes);
-   max_changes = CLAMP_INT(max_changes, 100, MAX_TRACE_CHANGES);
-
-   unsigned slot = 0;
-   while (slot < MAX_TRACES && w->traces[slot] != NULL)
-      slot++;
-
-   if (slot == MAX_TRACES) {
-      reply_error(w, "%d traces are already active. Stop one with "
-                  "nvc_trace_stop first", MAX_TRACES);
-      return;
-   }
-
-   design_obj_t *picked[MAX_TRACE_SIGNALS];
-   size_t npicked = 0;
-   size_t matches = 0;
-
-   if (json_is(paths, JSON_ARRAY)) {
-      for (size_t i = 0; i < paths->array.count; i++) {
-         const char *path = json_string(paths->array.items[i]);
-         design_obj_t *o = path ? find_obj(w, path) : NULL;
-
-         if (o == NULL) {
-            LOCAL_TEXT_BUF hint = tb_new();
-            suggest_paths(w, path ?: "", hint);
-            reply_error(w, "Signal '%s' was not found%s", path ?: "",
-                        tb_get(hint));
-            return;
-         }
-         else if (o->kind != OBJ_SIGNAL) {
-            reply_error(w, "'%s' is a region, not a signal", path);
-            return;
-         }
-
-         bool seen = false;
-         for (size_t j = 0; j < npicked; j++)
-            seen |= picked[j] == o;
-
-         matches++;
-         if (!seen && npicked < MAX_TRACE_SIGNALS)
-            picked[npicked++] = o;
-      }
-   }
-   else if (pattern != NULL) {
+   if (glob_wanted(entry)) {
       LOCAL_TEXT_BUF glob = tb_new();
-      tb_cat(glob, pattern);
+      tb_cat(glob, entry);
       tb_downcase(glob);
-      const bool by_leaf = strchr(pattern, '/') == NULL;
+      const bool by_leaf = strchr(entry, '/') == NULL;
 
       for (size_t i = 0; i < w->nobjs; i++) {
          design_obj_t *o = &(w->objs[i]);
          if (o->kind == OBJ_SIGNAL && obj_matches(o, tb_get(glob), by_leaf)) {
-            matches++;
-            if (npicked < MAX_TRACE_SIGNALS)
-               picked[npicked++] = o;
+            mark[i] = value;
+            count++;
          }
       }
    }
    else {
-      reply_error(w, "Give paths or a pattern: the signals to record");
-      return;
+      design_obj_t *o = find_obj(w, entry);
+      if (o == NULL) {
+         LOCAL_TEXT_BUF hint = tb_new();
+         suggest_paths(w, entry, hint);
+         tb_printf(err, "Signal '%s' was not found%s", entry, tb_get(hint));
+         return -1;
+      }
+      else if (o->kind != OBJ_SIGNAL) {
+         tb_printf(err, "'%s' is a region, not a signal: add /* to include "
+                   "everything below it", entry);
+         return -1;
+      }
+
+      mark[o - w->objs] = value;
+      count = 1;
    }
 
-   if (matches == 0) {
-      reply_error(w, "No signal matches. Find signals with nvc_design_search");
-      return;
+   return count;
+}
+
+static bool live_pick(worker_t *w, const json_t *include,
+                      const json_t *exclude, design_obj_t ***picked,
+                      size_t *npicked, text_buf_t *err)
+{
+   bool *mark = xcalloc_array(w->nobjs, sizeof(bool));
+   const size_t ninc = json_is(include, JSON_ARRAY) ? include->array.count : 0;
+   const size_t nexc = json_is(exclude, JSON_ARRAY) ? exclude->array.count : 0;
+
+   if (ninc == 0) {
+      for (size_t i = 0; i < w->nobjs; i++)
+         mark[i] = w->objs[i].kind == OBJ_SIGNAL;
    }
-   else if (matches > MAX_TRACE_SIGNALS) {
-      reply_error(w, "%zu signals match but at most %d can be traced at "
-                  "once. Narrow the pattern or list the paths you need",
-                  matches, MAX_TRACE_SIGNALS);
+
+   for (size_t i = 0; i < ninc; i++) {
+      const char *entry = json_string(include->array.items[i]);
+      if (entry == NULL)
+         continue;
+
+      const int n = mark_entry(w, entry, mark, true, err);
+      if (n < 0) {
+         free(mark);
+         return false;
+      }
+      else if (n == 0) {
+         tb_printf(err, "No signal matches '%s'. Find signals with "
+                   "nvc_design_search", entry);
+         free(mark);
+         return false;
+      }
+   }
+
+   for (size_t i = 0; i < nexc; i++) {
+      const char *entry = json_string(exclude->array.items[i]);
+      if (entry != NULL && mark_entry(w, entry, mark, false, err) < 0) {
+         free(mark);
+         return false;
+      }
+   }
+
+   size_t n = 0;
+   for (size_t i = 0; i < w->nobjs; i++)
+      n += mark[i];
+
+   *picked = xmalloc_array(MAX(n, 1), sizeof(design_obj_t *));
+   *npicked = 0;
+   for (size_t i = 0; i < w->nobjs; i++) {
+      if (mark[i])
+         (*picked)[(*npicked)++] = &(w->objs[i]);
+   }
+
+   free(mark);
+   return true;
+}
+
+static void live_detach(worker_t *w, trace_t *t)
+{
+   if (t->stopped)
       return;
+
+   for (unsigned i = 0; i < t->nsigs; i++)
+      watch_free(w->model, t->watches[i]);
+
+   t->stopped = true;
+}
+
+static void live_free(worker_t *w)
+{
+   trace_t *t = w->live;
+   if (t == NULL)
+      return;
+
+   live_detach(w, t);
+   free(t->objs);
+   free(t->watches);
+   free(t->ctx);
+   free(t->buf);
+   free(t);
+   w->live = NULL;
+}
+
+// Stop recording changes.  What was recorded stays readable.
+static void live_stop(worker_t *w)
+{
+   if (w->live != NULL)
+      live_detach(w, w->live);
+}
+
+// Start the in-memory recording.  Returns false after saying why not.
+static bool live_start(worker_t *w, design_obj_t **picked, size_t npicked,
+                       int64_t max_changes, text_buf_t *err)
+{
+   if (npicked == 0) {
+      tb_cat(err, "no signal selected");
+      return false;
+   }
+   else if (npicked > MAX_TRACE_SIGNALS) {
+      tb_printf(err, "%zu signals are selected but the in-memory recording "
+                "holds at most %d: narrow include", npicked,
+                MAX_TRACE_SIGNALS);
+      return false;
    }
 
    size_t maxbytes = 0;
@@ -1903,19 +2026,23 @@ static void op_trace_start(worker_t *w, const json_t *req)
       const size_t bytes = o->signal->shared.size;
 
       if (bytes > MAX_TRACE_BYTES) {
-         reply_error(w, "Signal '%s' is too wide to trace (%zu bytes, the "
-                     "limit is %d). Trace a narrower signal", istr(o->path),
-                     bytes, MAX_TRACE_BYTES);
-         return;
+         tb_printf(err, "signal '%s' is too wide for the in-memory "
+                   "recording (%zu bytes, the limit is %d)", istr(o->path),
+                   bytes, MAX_TRACE_BYTES);
+         return false;
       }
       else if (!obj_printer(w, o)) {
-         reply_error(w, "Signals of type %s cannot be displayed",
-                     type_pp(tree_type(o->signal->where)));
-         return;
+         tb_printf(err, "signals of type %s cannot be displayed",
+                   type_pp(tree_type(o->signal->where)));
+         return false;
       }
 
       maxbytes = MAX(maxbytes, bytes);
    }
+
+   live_free(w);
+
+   max_changes = CLAMP_INT(max_changes, 100, MAX_TRACE_CHANGES);
 
    trace_t *t = xcalloc(sizeof(trace_t));
    t->id      = ++w->next_trace_id;
@@ -1942,129 +2069,90 @@ static void op_trace_start(worker_t *w, const json_t *req)
       trace_record(t, now, i, signal_value(s), s->shared.size);
    }
 
-   w->traces[slot] = t;
-
-   char timestr[32];
-   mcp_format_time(now, timestr, sizeof(timestr));
-
-   LOCAL_TEXT_BUF tb = tb_new();
-   json_writer_t jw;
-   jw_init(&jw, tb);
-   begin_reply(&jw, true);
-   jw_key(&jw, "result");
-   jw_begin_object(&jw);
-   jw_key(&jw, "trace_id");
-   jw_int(&jw, t->id);
-   jw_key(&jw, "signals");
-   jw_begin_array(&jw);
-   for (size_t i = 0; i < npicked; i++)
-      jw_string(&jw, istr(picked[i]->path));
-   jw_end_array(&jw);
-   jw_key(&jw, "capacity");
-   jw_int(&jw, t->cap);
-   jw_key(&jw, "started_fs");
-   jw_int(&jw, now);
-   jw_key(&jw, "started");
-   jw_string(&jw, timestr);
-   jw_end_object(&jw);
-   jw_end_object(&jw);
-   ctl_send(w, tb);
+   w->live = t;
+   return true;
 }
 
-static void op_trace_stop(worker_t *w, const json_t *req)
+static void write_live(worker_t *w, json_writer_t *jw)
 {
-   int64_t id = 0;
-   json_as_int(json_get(req, "trace_id"), &id);
+   const trace_t *t = w->live;
 
-   trace_t *t = find_trace(w, id);
+   jw_key(jw, "memory");
+   jw_begin_object(jw);
+   jw_key(jw, "active");
+   jw_bool(jw, t != NULL && !t->stopped);
+   if (t != NULL) {
+      jw_key(jw, "signals");
+      jw_int(jw, t->nsigs);
+      jw_key(jw, "changes_kept");
+      jw_int(jw, t->count);
+      jw_key(jw, "changes_dropped");
+      jw_int(jw, t->dropped);
+      jw_key(jw, "capacity");
+      jw_int(jw, t->cap);
+      if (t->count > 0) {
+         int64_t oldest;
+         const size_t first = t->head - t->count;
+         memcpy(&oldest, t->buf + (first % t->cap) * t->stride,
+                sizeof(oldest));
+         jw_key(jw, "oldest_time_fs");
+         jw_int(jw, oldest);
+      }
+   }
+   jw_end_object(jw);
+}
+
+// Read changes of recorded signals from the in-memory recording
+static void op_wave_read(worker_t *w, const json_t *req)
+{
+   trace_t *t = w->live;
    if (t == NULL) {
-      trace_not_found(w, id);
+      reply_error(w, "Nothing is recorded in memory. Start a recording with "
+                  "nvc_wave_start (to memory or both), or give file to read "
+                  "a finished waveform file");
       return;
    }
 
-   for (unsigned i = 0; i < MAX_TRACES; i++) {
-      if (w->traces[i] == t)
-         w->traces[i] = NULL;
-   }
-
-   const size_t kept = t->count, dropped = t->dropped;
-   trace_free(w, t);
-
-   LOCAL_TEXT_BUF tb = tb_new();
-   json_writer_t jw;
-   jw_init(&jw, tb);
-   begin_reply(&jw, true);
-   jw_key(&jw, "result");
-   jw_begin_object(&jw);
-   jw_key(&jw, "stopped");
-   jw_bool(&jw, true);
-   jw_key(&jw, "trace_id");
-   jw_int(&jw, id);
-   jw_key(&jw, "changes_kept");
-   jw_int(&jw, kept);
-   jw_key(&jw, "changes_dropped");
-   jw_int(&jw, dropped);
-   jw_end_object(&jw);
-   jw_end_object(&jw);
-   ctl_send(w, tb);
-}
-
-static void op_trace_get(worker_t *w, const json_t *req)
-{
-   int64_t id = 0, from_fs = 0, to_fs = INT64_MAX, limit = 100, cursor = 0;
-   json_as_int(json_get(req, "trace_id"), &id);
+   int64_t from_fs = 0, to_fs = INT64_MAX, max_changes = 200;
    json_as_int(json_get(req, "from_fs"), &from_fs);
    json_as_int(json_get(req, "to_fs"), &to_fs);
-   json_as_int(json_get(req, "limit"), &limit);
-   limit = CLAMP_INT(limit, 1, 500);
-
-   const char *cursor_str = json_string(json_get(req, "cursor"));
-   if (cursor_str != NULL)
-      cursor = MAX(strtoll(cursor_str, NULL, 10), 0);
+   json_as_int(json_get(req, "max_changes"), &max_changes);
+   max_changes = CLAMP_INT(max_changes, 1, 200000);
 
    const char *radix = json_string(json_get(req, "radix")) ?: "default";
-   const json_t *only = json_get(req, "paths");
+   const json_t *paths = json_get(req, "paths");
+   const size_t npaths = json_is(paths, JSON_ARRAY) ? paths->array.count : 0;
 
-   trace_t *t = find_trace(w, id);
-   if (t == NULL) {
-      trace_not_found(w, id);
-      return;
-   }
+   unsigned *which = xmalloc_array(MAX(npaths, 1), sizeof(unsigned));
+   for (size_t i = 0; i < npaths; i++) {
+      const char *path = json_string(paths->array.items[i]);
+      design_obj_t *o = path ? find_obj(w, path) : NULL;
 
-   // Which of the traced signals to show
-   bool *show = xcalloc_array(t->nsigs, sizeof(bool));
-   if (json_is(only, JSON_ARRAY)) {
-      for (size_t i = 0; i < only->array.count; i++) {
-         const char *path = json_string(only->array.items[i]);
-         design_obj_t *o = path ? find_obj(w, path) : NULL;
-
-         bool found = false;
-         for (unsigned j = 0; o != NULL && j < t->nsigs; j++) {
-            if (t->objs[j] == o) {
-               show[j] = true;
-               found = true;
-            }
-         }
-
-         if (!found) {
-            LOCAL_TEXT_BUF recorded = tb_new();
-            for (unsigned j = 0; j < t->nsigs && j < 10; j++)
-               tb_printf(recorded, "%s%s", j > 0 ? ", " : "",
-                         istr(t->objs[j]->path));
-            if (t->nsigs > 10)
-               tb_cat(recorded, ", ...");
-
-            reply_error(w, "Signal '%s' is not part of trace %"PRIi64". It "
-                        "records: %s", path ?: "", id, tb_get(recorded));
-            free(show);
-            return;
+      bool found = false;
+      for (unsigned j = 0; o != NULL && j < t->nsigs; j++) {
+         if (t->objs[j] == o) {
+            which[i] = j;
+            found = true;
          }
       }
+
+      if (!found) {
+         LOCAL_TEXT_BUF recorded = tb_new();
+         for (unsigned j = 0; j < t->nsigs && j < 10; j++)
+            tb_printf(recorded, "%s%s", j > 0 ? ", " : "",
+                      istr(t->objs[j]->path));
+         if (t->nsigs > 10)
+            tb_cat(recorded, ", ...");
+
+         reply_error(w, "Signal '%s' is not in the in-memory recording. It "
+                     "holds: %s", path ?: "", tb_get(recorded));
+         free(which);
+         return;
+      }
    }
-   else {
-      for (unsigned j = 0; j < t->nsigs; j++)
-         show[j] = true;
-   }
+
+   const size_t first = t->head - t->count;
+   const int64_t now = model_now(w->model, NULL);
 
    LOCAL_TEXT_BUF tb = tb_new();
    json_writer_t jw;
@@ -2072,115 +2160,103 @@ static void op_trace_get(worker_t *w, const json_t *req)
    begin_reply(&jw, true);
    jw_key(&jw, "result");
    jw_begin_object(&jw);
-   jw_key(&jw, "trace_id");
-   jw_int(&jw, id);
-   jw_key(&jw, "changes");
+   jw_key(&jw, "source");
+   jw_string(&jw, "memory");
+   jw_key(&jw, "from_fs");
+   jw_int(&jw, from_fs);
+   jw_key(&jw, "until_fs");
+   jw_int(&jw, MIN(to_fs, now));
+
+   int64_t total = 0, kept = 0;
+
+   jw_key(&jw, "signals");
    jw_begin_array(&jw);
 
-   // Records come oldest first.  Those with the same time are one entry,
-   // showing the last value each signal took at that time.
-   const size_t first = t->head - t->count;
-   int64_t group_time = -1;
-   int64_t groups = 0, shown = 0;
-   int64_t oldest = -1;
+   for (size_t i = 0; i < npaths; i++) {
+      const unsigned sig = which[i];
+      design_obj_t *o = t->objs[sig];
 
-   size_t *latest = xmalloc_array(t->nsigs, sizeof(size_t));
-   bool *have = xcalloc_array(t->nsigs, sizeof(bool));
-   bool open = false;
+      jw_begin_object(&jw);
+      jw_key(&jw, "path");
+      jw_string(&jw, istr(o->path));
+      jw_key(&jw, "width");
+      jw_int(&jw, signal_width(o->signal));
 
-   for (size_t n = 0; n <= t->count; n++) {
-      int64_t time = INT64_MAX;
-      uint32_t sig = 0;
-      const uint8_t *rec = NULL;
-      bool wanted = false;
-
-      if (n < t->count) {
-         rec = t->buf + ((first + n) % t->cap) * t->stride;
+      // The value when the window opens is the last change before it
+      const uint8_t *before = NULL;
+      for (size_t n = 0; n < t->count; n++) {
+         const uint8_t *rec = t->buf + ((first + n) % t->cap) * t->stride;
+         int64_t time;
+         uint32_t rsig;
          memcpy(&time, rec, sizeof(time));
-         memcpy(&sig, rec + 8, sizeof(sig));
-         if (oldest < 0)
-            oldest = time;
-
-         wanted = show[sig] && time >= from_fs && time <= to_fs;
+         memcpy(&rsig, rec + 8, sizeof(rsig));
+         if (rsig == sig && time <= from_fs)
+            before = rec;
       }
 
-      // A different time (or the end) closes the entry being built
-      if (open && (n == t->count || (wanted && time != group_time))) {
-         if (groups >= cursor && shown < limit) {
-            char timestr[32];
-            mcp_format_time(group_time, timestr, sizeof(timestr));
-
-            jw_begin_object(&jw);
-            jw_key(&jw, "time_fs");
-            jw_int(&jw, group_time);
-            jw_key(&jw, "time");
-            jw_string(&jw, timestr);
-            jw_key(&jw, "values");
-            jw_begin_object(&jw);
-            for (unsigned j = 0; j < t->nsigs; j++) {
-               if (!have[j])
-                  continue;
-
-               const uint8_t *r = t->buf + latest[j] * t->stride;
-               uint32_t len;
-               memcpy(&len, r + 12, sizeof(len));
-
-               LOCAL_TEXT_BUF value = tb_new();
-               format_raw(w, t->objs[j], r + TRACE_HEADER, len, radix, value);
-
-               jw_key(&jw, istr(t->objs[j]->path));
-               jw_string(&jw, tb_get(value));
-            }
-            jw_end_object(&jw);
-            jw_end_object(&jw);
-            shown++;
-         }
-
-         groups++;
-         open = false;
-         memset(have, 0, t->nsigs * sizeof(bool));
+      if (before != NULL) {
+         uint32_t len;
+         memcpy(&len, before + 12, sizeof(len));
+         LOCAL_TEXT_BUF value = tb_new();
+         format_raw(w, o, before + TRACE_HEADER, len, radix, value);
+         jw_key(&jw, "value_at_from");
+         jw_string(&jw, tb_get(value));
       }
 
-      if (!wanted)
-         continue;
+      jw_key(&jw, "changes");
+      jw_begin_array(&jw);
+      for (size_t n = 0; n < t->count; n++) {
+         const uint8_t *rec = t->buf + ((first + n) % t->cap) * t->stride;
+         int64_t time;
+         uint32_t rsig, len;
+         memcpy(&time, rec, sizeof(time));
+         memcpy(&rsig, rec + 8, sizeof(rsig));
+         memcpy(&len, rec + 12, sizeof(len));
 
-      if (!open) {
-         open = true;
-         group_time = time;
+         if (rsig != sig || time < from_fs || time > to_fs)
+            continue;
+
+         total++;
+         if (kept >= max_changes)
+            continue;
+
+         kept++;
+         LOCAL_TEXT_BUF value = tb_new();
+         format_raw(w, o, rec + TRACE_HEADER, len, radix, value);
+         jw_begin_array(&jw);
+         jw_int(&jw, time);
+         jw_string(&jw, tb_get(value));
+         jw_end_array(&jw);
       }
-
-      latest[sig] = (first + n) % t->cap;
-      have[sig] = true;
+      jw_end_array(&jw);
+      jw_end_object(&jw);
    }
 
    jw_end_array(&jw);
-   jw_key(&jw, "total");
-   jw_int(&jw, groups);
+   jw_key(&jw, "changes_total");
+   jw_int(&jw, total);
    jw_key(&jw, "truncated");
-   jw_bool(&jw, cursor + shown < groups);
-   if (cursor + shown < groups) {
-      char *next = cursor_string(cursor + shown);
-      jw_key(&jw, "next_cursor");
-      jw_string(&jw, next);
-      free(next);
+   jw_bool(&jw, total > kept);
+   if (total > kept) {
+      jw_key(&jw, "hint");
+      jw_string(&jw, "More changes exist than were returned. Narrow the "
+                "window with from and until, or raise max_changes.");
    }
 
+   if (t->count > 0) {
+      int64_t oldest;
+      memcpy(&oldest, t->buf + (first % t->cap) * t->stride, sizeof(oldest));
+      jw_key(&jw, "oldest_time_fs");
+      jw_int(&jw, oldest);
+   }
    jw_key(&jw, "dropped");
    jw_int(&jw, t->dropped);
-   jw_key(&jw, "oldest_time_fs");
-   if (oldest < 0)
-      jw_null(&jw);
-   else
-      jw_int(&jw, oldest);
    write_state(w, &jw);
    jw_end_object(&jw);
    jw_end_object(&jw);
 
    ctl_send(w, tb);
-
-   free(latest);
-   free(have);
-   free(show);
+   free(which);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -2302,16 +2378,12 @@ int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
          op_search(&w, req);
       else if (!strcmp(op, "get"))
          op_get(&w, req);
-      else if (!strcmp(op, "trace_get"))
-         op_trace_get(&w, req);
+      else if (!strcmp(op, "wave_read"))
+         op_wave_read(&w, req);
       else if (!strcmp(op, "wave_start"))
          op_wave_start(&w, req);
       else if (!strcmp(op, "wave_stop"))
          op_wave_stop(&w);
-      else if (!strcmp(op, "trace_start"))
-         op_trace_start(&w, req);   // Between slices, so safe during a run
-      else if (!strcmp(op, "trace_stop"))
-         op_trace_stop(&w, req);
       else if (busy)
          reply_error(&w, "The simulation is running a background run, which "
                      "only allows reading: wait for it with nvc_sim_wait or "
@@ -2326,6 +2398,7 @@ int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
 
    // Leave the waveform files complete
    wave_finish(&w);
+   live_free(&w);
 
    diag_set_consumer(NULL, NULL);
    printer_free(w.printer);

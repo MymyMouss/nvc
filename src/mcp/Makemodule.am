@@ -1,6 +1,8 @@
 lib_libnvc_a_SOURCES += \
 	src/mcp/mcp.h \
 	src/mcp/mcp-child.c \
+	src/mcp/mcp-cond.c \
+	src/mcp/mcp-cond.h \
 	src/mcp/mcp-child.h \
 	src/mcp/mcp-diag.c \
 	src/mcp/mcp-json.c \

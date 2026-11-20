@@ -115,6 +115,15 @@ bool mcp_parse_sim_time(mcp_call_t *call, const char *what, const char *text,
 
 const mcp_tool_t *mcp_file_tools(size_t *count);
 
+// Run one worker request for a live simulation and return its result
+// object as JSON text for the caller to free, or NULL after an error
+char *mcp_sim_query(mcp_call_t *call, const char *sim_id,
+                    const char *request);
+
+// nvc_wave_get on the in-memory recording of a live simulation
+bool mcp_sim_wave_read(mcp_call_t *call, const json_t *args,
+                       json_writer_t *out);
+
 // Wait up to timeout_ms (negative for no limit) for any of the file
 // descriptors to become readable while still servicing the client's
 // input, which may cancel the call.  ready[i] is set for each

@@ -165,7 +165,7 @@ SCENARIOS = [
          "form: RESULT: <entity names separated by commas>"),
     dict(name="trace-lookback", files="checked", tools=[],
          check=r"RESULT:\s*(2\s*,\s*)?3\s*,\s*4\s*,\s*5\s*$",
-         must_call="nvc_trace_get",
+         must_call="nvc_wave_start",
          prompt="src/ holds a counter and a testbench called checked_tb whose "
          "assertion fails at some point. Simulate the testbench to that "
          "failure, running the simulation only once and never restarting "
