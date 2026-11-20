@@ -1911,7 +1911,7 @@ static const char trace_start_input[] = MCP_JSON({
       "paths": {
          "type": "array",
          "minItems": 1,
-         "maxItems": 64,
+         "maxItems": 512,
          "items": { "type": "string", "minLength": 1, "maxLength": 1024 },
          "description": "Full paths of the signals to record, for example /q or /dut/cnt."
       },
@@ -1919,7 +1919,7 @@ static const char trace_start_input[] = MCP_JSON({
          "type": "string",
          "minLength": 1,
          "maxLength": 256,
-         "description": "Instead of paths: a glob such as /dut/* or *state*, as for nvc_design_search. At most 64 signals can match."
+         "description": "Instead of paths: a glob such as /dut/* or *state*, as for nvc_design_search. At most 512 signals can match."
       },
       "max_changes": {
          "type": "integer",
@@ -1998,7 +1998,7 @@ static const char trace_get_input[] = MCP_JSON({
       "paths": {
          "type": "array",
          "minItems": 1,
-         "maxItems": 64,
+         "maxItems": 512,
          "items": { "type": "string", "minLength": 1, "maxLength": 1024 },
          "description": "Show only these traced signals. Defaults to all of them."
       },
@@ -2389,7 +2389,12 @@ static const mcp_tool_t sim_tools[] = {
          "dropped in nvc_trace_get says how many.  Values are those at the "
          "end of each simulated time step, as in a waveform file.  Give "
          "the paths of the signals or a pattern.  Read the recording with "
-         "nvc_trace_get.  At most 4 traces can be active.",
+         "nvc_trace_get.  At most 4 traces of up to 512 signals can be active.  "
+         "This is also the way to watch a simulation live: a trace can be "
+         "started and read while a background run is in progress, and "
+         "nvc_trace_get shows the latest changes up to the present "
+         "without stopping anything, unlike a waveform file, which can "
+         "only be read once finished.",
       .input_schema  = trace_start_input,
       .output_schema = trace_start_output,
       .example       = trace_start_example,

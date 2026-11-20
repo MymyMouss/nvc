@@ -73,7 +73,7 @@
 #define CLAMP_INT(v, lo, hi) ((v) < (lo) ? (lo) : (v) > (hi) ? (hi) : (v))
 
 #define MAX_TRACES           4
-#define MAX_TRACE_SIGNALS    64
+#define MAX_TRACE_SIGNALS    512
 #define MAX_TRACE_BYTES      256
 #define DEFAULT_TRACE_CHANGES 10000
 #define MAX_TRACE_CHANGES    500000
@@ -2308,16 +2308,16 @@ int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
          op_wave_start(&w, req);
       else if (!strcmp(op, "wave_stop"))
          op_wave_stop(&w);
+      else if (!strcmp(op, "trace_start"))
+         op_trace_start(&w, req);   // Between slices, so safe during a run
+      else if (!strcmp(op, "trace_stop"))
+         op_trace_stop(&w, req);
       else if (busy)
          reply_error(&w, "The simulation is running a background run, which "
                      "only allows reading: wait for it with nvc_sim_wait or "
                      "end it with nvc_sim_stop, then repeat this call");
       else if (!strcmp(op, "set"))
          op_set(&w, req);
-      else if (!strcmp(op, "trace_start"))
-         op_trace_start(&w, req);
-      else if (!strcmp(op, "trace_stop"))
-         op_trace_stop(&w, req);
       else
          reply_error(&w, "unknown operation '%s'", op);
 

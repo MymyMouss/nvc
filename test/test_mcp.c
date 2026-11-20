@@ -2596,6 +2596,46 @@ START_TEST(test_sim_busy)
 }
 END_TEST
 
+START_TEST(test_sim_live_trace)
+{
+   fixture_t f;
+   const char *names[] = { "tb.vhd" }, *sources[] = { tb_src };
+   const char *tops[] = { "tb" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   char id[40];
+   open_sim(&f, "tb", id);
+
+   const json_t *sc = structured(sim_tool(&f, "nvc_sim_run", id,
+                                          "\"background\":true,"
+                                          "\"pause_on\":\"never\""));
+   ck_assert_str_eq(str_field(sc, "state"), "running");
+
+   // A trace can be started in the middle of the run and read at once
+   sc = structured(sim_tool(&f, "nvc_trace_start", id,
+                            "\"pattern\":\"/dut/*\",\"max_changes\":1000"));
+   const int64_t trace = int_field(sc, "trace_id");
+   const int64_t started = int_field(sc, "started_fs");
+
+   struct timespec ts = { 0, 300 * 1000 * 1000 };
+   nanosleep(&ts, NULL);
+
+   char *extra = xasprintf("\"trace_id\":%"PRIi64",\"limit\":5", trace);
+   sc = structured(sim_tool(&f, "nvc_trace_get", id, extra));
+   free(extra);
+   ck_assert_int_gt(int_field(sc, "total"), 5);
+   ck_assert_int_gt(int_field(sc, "now_fs"), started);
+
+   extra = xasprintf("\"trace_id\":%"PRIi64, trace);
+   sc = structured(sim_tool(&f, "nvc_trace_stop", id, extra));
+   free(extra);
+
+   sc = structured(sim_tool(&f, "nvc_sim_stop", id, ""));
+   ck_assert_str_ne(str_field(sc, "state"), "running");
+   fixture_close(&f);
+}
+END_TEST
+
 Suite *get_mcp_tests(void)
 {
    Suite *s = suite_create("mcp");
@@ -2633,6 +2673,7 @@ Suite *get_mcp_tests(void)
    tcase_add_test(tc, test_sim_files_misc);
    tcase_add_test(tc, test_sim_log_limit);
    tcase_add_test(tc, test_sim_busy);
+   tcase_add_test(tc, test_sim_live_trace);
    tcase_set_timeout(tc, 60);
    suite_add_tcase(s, tc);
 

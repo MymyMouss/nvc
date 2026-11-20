@@ -704,6 +704,13 @@ il faudra le traiter à part.
   la fin ou les lignes contenant un motif. Seuls les fichiers sous
   `.nvc-mcp/` sont lisibles (`realpath`).
 
+- **Lecture en direct.** Le tampon en mémoire est celui des traces:
+  `nvc_trace_start` et `nvc_trace_stop` sont acceptés pendant un run de fond
+  (entre deux tranches) et `nvc_trace_get` lit les derniers changements
+  jusqu'à l'instant présent, sans rien arrêter. Jusqu'à 512 signaux par
+  trace, 4 traces, 64 Mio. À la différence d'un FST, cela ne demande aucune
+  fermeture.
+
 Limites connues: un FST en cours d'écriture n'est pas lisible (il faut
 `nvc_wave_stop`); l'enregistrement démarré en cours de run ne couvre que
 l'intervalle à partir du démarrage; `nvc_wave_find` compare des valeurs
