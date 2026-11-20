@@ -116,6 +116,79 @@ PROMPTS = {
 }
 
 
+SOC_DIR = os.path.join(HERE, "soc")
+SOC_FILES = ["pkg_soc", "uart_rx", "uart_tx", "sync_fifo", "crc8_unit",
+             "watchdog", "cmd_parser", "reg_bank", "irq_ctrl", "timer",
+             "video_timing", "pattern_gen", "filter3", "gain_offset",
+             "threshold_stats", "rr_arbiter", "rsp_builder", "tx_path",
+             "ctrl_path", "video_pipe", "soc_top", "tb_pkg", "tb_soc"]
+
+# name -> (file patched, patches, short description for the prompt)
+SOC_BUGS = {
+    "soc_rsp_space": ("rsp_builder", [(
+        "space_ok <= '1' when to_integer(tx_count) <= FIFO_DEPTH - MAX_PKT",
+        "space_ok <= '1' when to_integer(tx_count) <= FIFO_DEPTH - 4")]),
+    "soc_crc_abort": ("cmd_parser", [(
+        "      elsif timeout = '1' then\n        crc_clr <= '1';\n",
+        "      elsif timeout = '1' then\n")]),
+    "soc_filter_edge": ("filter3", [(
+        "o_pix   <= tap(left, cur, cur, enable);",
+        "o_pix   <= tap(left, cur, left, enable);")]),
+    "soc_offset_sign": ("gain_offset", [(
+        "to_integer(signed(offset))", "to_integer(unsigned(offset))")]),
+    "soc_irq_clear": ("irq_ctrl", [(
+        "        nxt := (p and not clr) or s;\n",
+        "        if clr /= x\"00\" then\n          nxt := s;\n        else\n"
+        "          nxt := p or s;\n        end if;\n")]),
+    "soc_frame_restart": ("pattern_gen", [(
+        "if rst = '1' or enable = '0' then", "if rst = '1' then")]),
+    "soc_port_swap": ("soc_top", [(
+        "filter_en => ctrl(1), stats_en => ctrl(2),",
+        "filter_en => ctrl(2), stats_en => ctrl(1),")],
+        # The miswired enables are the cause even though a port that
+        # follows a register is not dumped: accept them, at the time the
+        # control register changes, shortly before the first wrong pixel
+        ["u_video/filter_en", "u_video/stats_en", "u_video/u_filter/enable",
+         "u_video/u_stats/enable"]),
+    "soc_stats_last": ("threshold_stats", [(
+        "            count <= n;\n            sum   <= s;",
+        "            count <= acc_n;\n            sum   <= acc_s;")]),
+    "soc_size_latch": ("video_timing", [(
+        "        running <= '1';\n        hc <= 0;\n        vc <= 0;\n"
+        "        w  <= to_integer(unsigned(width));\n"
+        "        h  <= to_integer(unsigned(height));\n",
+        "        running <= '1';\n        hc <= 0;\n        vc <= 0;\n")]),
+    "soc_watchdog": ("cmd_parser", [(
+        "generic map (LIMIT => 200)", "generic map (LIMIT => 2000)")]),
+}
+SOC_STOP = "3ms"
+
+
+def soc_sources(bug, buggy):
+    """(name, text) of every file in compile order"""
+    out = []
+    target, patches = SOC_BUGS[bug][:2] if bug else (None, [])
+    for name in SOC_FILES:
+        with open(os.path.join(SOC_DIR, name + ".vhd")) as f:
+            text = f.read()
+        if buggy and name == target:
+            for old, new in patches:
+                assert old in text, (bug, old)
+                text = text.replace(old, new)
+        out.append((name, text))
+    return out
+
+
+def soc_bug_line(bug):
+    """File and line numbers of the faulty code in the buggy design"""
+    target, patches = SOC_BUGS[bug][:2]
+    text = dict(soc_sources(bug, True))[target]
+    old, new = patches[0]
+    start = text.index(new) if new.strip() else text.index(old)
+    first = text[:start].count("\n") + 1
+    return target + ".vhd", first, first + max(new.count("\n"), 1)
+
+
 def read(name):
     with open(os.path.join(HERE, name + ".vhd")) as f:
         return f.read()
@@ -143,6 +216,13 @@ def sources(bug, buggy):
 def make_workspace(bug, buggy):
     ws = tempfile.mkdtemp(prefix="nvc-bench-")
     os.makedirs(os.path.join(ws, "src"))
+    if bug in SOC_BUGS:
+        for name, text in soc_sources(bug, buggy):
+            with open(os.path.join(ws, "src", name + ".vhd"), "w") as f:
+                f.write(text)
+        with open(os.path.join(ws, "src", "files.txt"), "w") as f:
+            f.write("\n".join("src/%s.vhd" % n for n in SOC_FILES) + "\n")
+        return ws, "soc_top", "tb_soc"
     design, src, tb, tbsrc = sources(bug, buggy)
     for name, text in ((design, src), (tb, tbsrc)):
         with open(os.path.join(ws, "src", name + ".vhd"), "w") as f:
@@ -162,9 +242,15 @@ def simulate(nvc, bug, buggy):
     try:
         env = nvc_env(nvc)
         fst = os.path.join(ws, "w.fst")
+        if bug in SOC_BUGS:
+            files = ["src/%s.vhd" % n for n in SOC_FILES]
+            stop = SOC_STOP
+        else:
+            files = ["src/%s.vhd" % design, "src/%s.vhd" % tb]
+            stop = BUGS[bug][3]
         r = subprocess.run(
-            [nvc, "--std=2008", "-a", "src/%s.vhd" % design,
-             "src/%s.vhd" % tb, "-e", tb, "-r", "--stop-time=" + BUGS[bug][3], "--wave=" + fst],
+            [nvc, "--std=2008", "-a"] + files +
+            ["-e", tb, "-r", "--stop-time=" + stop, "--wave=" + fst],
             cwd=ws, env=env, capture_output=True, text=True)
         events = []
         if os.path.exists(fst):
@@ -174,7 +260,7 @@ def simulate(nvc, bug, buggy):
                 m = re.match(r"#(\d+) (\S+) (.*)", line)
                 if m and ".dut." in m.group(2):
                     path = m.group(2).split(".dut.", 1)[1]
-                    path = re.sub(r"\[.*\]$", "", path)
+                    path = re.sub(r"\[.*\]$", "", path).replace(".", "/")
                     events.append((int(m.group(1)), path, m.group(3)))
         return r.returncode, r.stdout + r.stderr, events
     finally:
@@ -192,9 +278,21 @@ def truth(nvc, bug):
     return (first, sorted({p for t, p, v in diff if t == first})), status, text
 
 
+def selected(args):
+    fam = getattr(args, "family", "all")
+    names = []
+    if fam in ("all", "basic"):
+        names += list(BUGS)
+    if fam in ("all", "soc"):
+        names += list(SOC_BUGS)
+    if getattr(args, "scenario", None):
+        names = [n for n in names if n in args.scenario]
+    return names
+
+
 def cmd_check(args):
     ok = True
-    for bug in BUGS:
+    for bug in selected(args):
         gstatus, gtext, _ = simulate(args.nvc, bug, False)
         t, status, text = truth(args.nvc, bug)
         silent = bug.endswith("silent")
@@ -212,8 +310,9 @@ def cmd_check(args):
             flag = "SILENT TESTBENCH FAILS"
             ok = False
         when = "%g ns" % (t[0] / 1e6) if t else "-"
-        print("%-12s good=%d bad=%d first difference %s %s  %s"
-              % (bug, gstatus, status, when, t[1] if t else "", flag))
+        print("%-17s good=%d bad=%d first difference %s %s  %s"
+              % (bug, gstatus, status, when, t[1] if t else "", flag),
+              flush=True)
     return 0 if ok else 1
 
 
@@ -226,7 +325,26 @@ def spec_of(design):
     return " ".join(x for x in lines if x)
 
 
+SOC_PROMPT = (
+    "src/ holds a VHDL design of {n} files: a small SoC (top level soc_top) "
+    "with a UART command interface, registers, an interrupt controller, a "
+    "timer and a video pipeline, and its self-checking testbench tb_soc. "
+    "src/files.txt lists the files in compilation order (VHDL-2008). The "
+    "comment at the top of each file is its specification. One bug has "
+    "been introduced in the design (not in the testbench, tb_pkg or "
+    "pkg_soc), so the testbench fails. Find the root cause: the earliest "
+    "simulated time at which a signal inside the instance dut holds a "
+    "wrong value according to the specification (not the time the "
+    "testbench notices the problem), which signal it is, and the file and "
+    "line of the faulty code. Do not edit any file. Finish with exactly "
+    "one line in this form: RESULT: <time in ns> ns <signal path> "
+    "<file>:<line>, for example RESULT: 1234 ns /dut/u_video/u_filter/cur "
+    "filter3.vhd:57")
+
+
 def prompt_for(bug, tb, blind=False):
+    if bug in SOC_BUGS:
+        return SOC_PROMPT.format(n=len(SOC_FILES))
     design = BUGS[bug][0]
     what = PROMPTS[bug]
     if blind:
@@ -262,23 +380,46 @@ def prompt_for(bug, tb, blind=False):
             "RESULT: 40 ns /dut/count" % (what, fail, design))
 
 
-def judge(answer, expected):
-    m = re.search(r"RESULT:\s*([0-9.]+)\s*ns\s+(\S+)\s*$", answer.strip(),
-                  re.I | re.M)
+def norm_path(p):
+    p = p.strip().strip("`").rstrip("/").lower()
+    p = re.sub(r"\[.*?\]", "", p).replace(".", "/").replace(":", "/")
+    p = p.lstrip("/")
+    if p.startswith("dut/"):
+        p = p[4:]
+    return p
+
+
+def judge(answer, expected, bug=None):
+    """(passed, details): time and signal must match; for the SoC bugs the
+    file must too, and the line is reported"""
+    m = re.search(r"RESULT:\s*([0-9.]+)\s*ns\s+(\S+)(?:\s+(\S+))?\s*$",
+                  answer.strip(), re.I | re.M)
     if not m:
-        return False, "no RESULT line"
+        return False, {"why": "no RESULT line"}
     when = float(m.group(1)) * 1e6
-    leaf = m.group(2).rstrip("/").split("/")[-1].lower()
-    leaf = re.sub(r"\[.*\]$", "", leaf)
+    path = norm_path(m.group(2))
     t, sigs = expected
-    if abs(when - t) > 1 or leaf not in [x.lower() for x in sigs]:
-        return False, "answered %s ns %s, expected %g ns %s" % (
-            m.group(1), m.group(2), t / 1e6, sigs)
-    return True, "ok"
+    d = {"time_ok": abs(when - t) <= 1,
+         "near_time": abs(when - t) <= 10e6 + 1,
+         "signal_ok": path in [norm_path(x) for x in sigs]}
+    if bug in SOC_BUGS and len(SOC_BUGS[bug]) > 2 and not d["signal_ok"]:
+        alt = [norm_path(x) for x in SOC_BUGS[bug][2]]
+        if path in alt and t - 2e9 <= when <= t:
+            d["signal_ok"] = d["time_ok"] = d["near_time"] = True
+    if bug in SOC_BUGS:
+        fname, lo, hi = soc_bug_line(bug)
+        loc = m.group(3) or ""
+        lm = re.match(r"(?:.*/)?([\w.]+?):(\d+)", loc)
+        d["file_ok"] = bool(lm) and lm.group(1).lower() == fname
+        d["line_ok"] = d["file_ok"] and lo - 3 <= int(lm.group(2)) <= hi + 3
+    ok = d["time_ok"] and d["signal_ok"]
+    d["why"] = "ok" if ok else "answered %s ns %s %s, expected %g ns %s" % (
+        m.group(1), m.group(2), m.group(3) or "", t / 1e6, sigs)
+    return ok, d
 
 
 async def run_one(nvc, model, bug, expected, tools, label, blind=False,
-                  disallowed=()):
+                  disallowed=(), max_turns=40, budget=1.0):
     from claude_agent_sdk import (query, ClaudeAgentOptions, AssistantMessage,
                                   ResultMessage, ToolUseBlock)
     ws, design, tb = make_workspace(bug, True)
@@ -293,7 +434,7 @@ async def run_one(nvc, model, bug, expected, tools, label, blind=False,
                              "args": ["--mcp", "--root", ws],
                              "env": {"NVC_LIBPATH":
                                      nvc_env(nvc)["NVC_LIBPATH"]}}},
-        max_turns=40, max_budget_usd=1.0, stderr=lambda line: None)
+        max_turns=max_turns, max_budget_usd=budget, stderr=lambda line: None)
     calls, result = [], None
     async for m in query(prompt=prompt, options=options):
         if isinstance(m, AssistantMessage):
@@ -304,9 +445,9 @@ async def run_one(nvc, model, bug, expected, tools, label, blind=False,
             result = m
     shutil.rmtree(ws, ignore_errors=True)
     text = (result.result or "") if result else ""
-    ok, why = judge(text, expected)
+    ok, det = judge(text, expected, bug)
     row = {"bug": bug, "label": label, "model": model, "passed": ok,
-           "why": why, "calls": len(calls),
+           "why": det.pop("why"), **det, "calls": len(calls),
            "turns": result.num_turns if result else 0,
            "cost_usd": round((result.total_cost_usd or 0) if result else 0, 4),
            "seconds": round(result.duration_ms / 1000, 1) if result else 0,
@@ -318,25 +459,31 @@ async def run_one(nvc, model, bug, expected, tools, label, blind=False,
 async def cmd_run(args):
     rows = []
     cache = {}
-    for bug in BUGS:
-        if args.scenario and bug not in args.scenario:
-            continue
+    for bug in selected(args):
         t, _, _ = truth(args.nvc, bug)
         cache[bug] = t
         for trial in range(args.trials):
             rows.append(await run_one(
                 args.nvc, args.model, bug, t,
-                [] if args.blind else ["Read", "Glob"], args.label,
-                args.blind, args.disable or []))
+                [] if args.blind else ["Read", "Glob", "Grep"], args.label,
+                args.blind, args.disable or [], args.max_turns,
+                args.budget))
     n = len(rows)
     print("\n==== %s, model %s ====" % (args.label, args.model))
-    for bug in BUGS:
+    for bug in selected(args):
         r = [x for x in rows if x["bug"] == bug]
         if r:
-            print("%-12s %d/%d  calls %.1f  cost $%.4f" % (
+            extra = ""
+            if bug in SOC_BUGS:
+                extra = "  file %d/%d  line %d/%d  near %d/%d" % (
+                    sum(x.get("file_ok", 0) for x in r), len(r),
+                    sum(x.get("line_ok", 0) for x in r), len(r),
+                    sum(x.get("near_time", 0) and x.get("signal_ok", 0)
+                        for x in r), len(r))
+            print("%-17s %d/%d  calls %.1f  cost $%.4f%s" % (
                 bug, sum(x["passed"] for x in r), len(r),
                 sum(x["calls"] for x in r) / len(r),
-                sum(x["cost_usd"] for x in r) / len(r)))
+                sum(x["cost_usd"] for x in r) / len(r), extra))
     print("passed %d of %d, calls %.1f, cost $%.4f" % (
         sum(x["passed"] for x in rows), n,
         sum(x["calls"] for x in rows) / max(n, 1),
@@ -354,6 +501,11 @@ def main():
     ap.add_argument("--model", default="claude-haiku-5-5")
     ap.add_argument("--trials", type=int, default=1)
     ap.add_argument("--scenario", action="append")
+    ap.add_argument("--family", choices=["all", "basic", "soc"],
+                    default="all")
+    ap.add_argument("--max-turns", type=int, default=40)
+    ap.add_argument("--budget", type=float, default=1.0,
+                    help="maximum cost of one agent run in dollars")
     ap.add_argument("--label", default="baseline")
     ap.add_argument("--blind", action="store_true",
                     help="no file tools, specification in the prompt")
