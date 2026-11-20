@@ -22,28 +22,69 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# name -> (design file, testbench file, top, (old, new) patch on the design)
+# name -> (design file, testbench file, patches on the design, stop time)
+# A patch is (old, new) text or a list of them.  A testbench named X_silent
+# is X without its checks, so the bug is only visible in the outputs.
 BUGS = {
     "ctrl_skip": ("ctrl", "ctrl_tb",
-                  ("state <= WAIT_ACK;", "state <= FINISH;")),
+                  ("state <= WAIT_ACK;", "state <= FINISH;"), "5us"),
     "ctrl_stuck": ("ctrl", "ctrl_tb",
                    ("            state <= WAIT_ACK;\n            if ack = '1' then\n"
                     "              ack_seen <= '1';\n            end if;\n",
-                    "            state <= WAIT_ACK;\n")),
+                    "            state <= WAIT_ACK;\n"), "5us"),
     "fifo_drop": ("fifo", "fifo_tb",
                   [("count < 4 else '0'", "count <= 4 else '0'"),
-                   ("valid_in = '1' and count < 4", "valid_in = '1' and count <= 4")]),
+                   ("valid_in = '1' and count < 4",
+                    "valid_in = '1' and count <= 4")], "5us"),
     "fifo_dup": ("fifo", "fifo_tb",
-                 ("if pop then\n          rd_p", "if pop and count > 1 then\n          rd_p")),
+                 ("if pop then\n          rd_p",
+                  "if pop and count > 1 then\n          rd_p"), "5us"),
     "uart_parity": ("uart_tx", "uart_tx_tb",
                     ("data(4) xor data(5) xor data(6) xor data(7)",
-                     "data(4) xor data(5) xor data(6)")),
+                     "data(4) xor data(5) xor data(6)"), "5us"),
     "video_line": ("video_sync", "video_sync_tb",
-                   ("elsif hcount = 15 then", "elsif hcount = 16 then")),
-    "pipe_valid": ("pipe", "pipe_tb", ("v2 <= v1;", "v2 <= in_valid;")),
-    # Same bug without any checking in the testbench: only the spec
-    # tells what is wrong
-    "pipe_silent": ("pipe", "pipe_tb_silent", ("v2 <= v1;", "v2 <= in_valid;")),
+                   ("elsif hcount = 15 then", "elsif hcount = 16 then"), "5us"),
+    "pipe_valid": ("pipe", "pipe_tb", ("v2 <= v1;", "v2 <= in_valid;"), "5us"),
+    "pipe_silent": ("pipe", "pipe_tb_silent",
+                    ("v2 <= v1;", "v2 <= in_valid;"), "5us"),
+    # Larger designs with bugs that only show late or through a chain of
+    # signals
+    "dma_burst_end": ("dma", "dma_tb", (
+        "            if idx = len - 1 then\n              rd    <= '0';\n"
+        "              state <= DRAIN;\n            elsif bcnt = 3 then\n"
+        "              bcnt  <= (others => '0');\n              idx   <= idx + 1;\n"
+        "              rd    <= '0';\n              gcnt  <= (others => '0');\n"
+        "              state <= GAP;\n            else\n",
+        "            if bcnt = 3 then\n"
+        "              bcnt  <= (others => '0');\n              idx   <= idx + 1;\n"
+        "              rd    <= '0';\n              gcnt  <= (others => '0');\n"
+        "              state <= GAP;\n            elsif idx = len - 1 then\n"
+        "              rd    <= '0';\n              state <= DRAIN;\n            else\n"),
+        "40us"),
+    "arb_starve": ("arb", "arb_tb",
+                   ("for k in 1 to 3 loop", "for k in 0 to 2 loop"), "3us"),
+    "rx_noclear": ("uart_rx", "uart_rx_tb", (
+        "              if rx /= even then\n                parity_err <= '1';\n"
+        "              else\n                parity_err <= '0';\n              end if;\n",
+        "              if rx /= even then\n                parity_err <= '1';\n"
+        "              end if;\n"), "15us"),
+    "rx_7bit": ("uart_rx", "uart_rx_tb",
+                ("xor shift(4) xor shift(5) xor shift(6) xor shift(7);",
+                 "xor shift(4) xor shift(5) xor shift(6);"), "15us"),
+    "crc_noreset": ("crc_tx", "crc_tx_tb",
+                    ("          word <= data;\n          crc  <= (others => '0');\n",
+                     "          word <= data;\n"), "100us"),
+    "crc_poly": ("crc_tx", "crc_tx_tb",
+                 ("& '0') xor x\"07\";", "& '0') xor x\"0F\";"), "100us"),
+    "crc_silent": ("crc_tx", "crc_tx_tb_silent",
+                   ("          word <= data;\n          crc  <= (others => '0');\n",
+                    "          word <= data;\n"), "100us"),
+    "timer_carry": ("timer", "timer_tb",
+                    ("if lo = 4095 then", "if lo = 4094 then"), "300us"),
+    "timer_prescale": ("timer", "timer_tb",
+                       ("elsif pre = 3 then", "elsif pre = 2 then"), "300us"),
+    "timer_silent": ("timer", "timer_tb_silent",
+                     ("if lo = 4095 then", "if lo = 4094 then"), "300us"),
 }
 
 PROMPTS = {
@@ -56,6 +97,22 @@ PROMPTS = {
     "pipe_valid": "the pipeline (instance dut in pipe_tb)",
     "pipe_silent": "the pipeline (instance dut in pipe_tb_silent), whose "
                    "testbench checks nothing",
+    "dma_burst_end": "the DMA copy engine (instance dut in dma_tb)",
+    "arb_starve": "the round-robin arbiter (instance dut in arb_tb)",
+    "rx_noclear": "the UART receiver (instance dut in uart_rx_tb)",
+    "rx_7bit": "the UART receiver (instance dut in uart_rx_tb)",
+    "crc_noreset": "the serial transmitter with a CRC (instance dut in "
+                   "crc_tx_tb)",
+    "crc_poly": "the serial transmitter with a CRC (instance dut in "
+                "crc_tx_tb)",
+    "crc_silent": "the serial transmitter with a CRC (instance dut in "
+                  "crc_tx_tb_silent), whose testbench checks only the data "
+                  "frames' length",
+    "timer_carry": "the tick counter (instance dut in timer_tb)",
+    "timer_prescale": "the tick counter (instance dut in timer_tb)",
+    "timer_silent": "the tick counter (instance dut in timer_tb_silent), "
+                    "whose testbench only reports the final count: "
+                    "280 us is 28000 clocks, so 7000 ticks",
 }
 
 
@@ -64,21 +121,22 @@ def read(name):
         return f.read()
 
 
-def silent_tb():
-    text = read("pipe_tb")
+def silent_tb(tb):
+    base = tb[:-len("_silent")]
+    text = read(base)
     text = re.sub(r"  --CHECK-BEGIN.*--CHECK-END\n", "", text, flags=re.S)
-    return text.replace("entity pipe_tb ", "entity pipe_tb_silent ") \
-               .replace("of pipe_tb ", "of pipe_tb_silent ")
+    return text.replace("entity %s " % base, "entity %s " % tb) \
+               .replace("of %s " % base, "of %s " % tb)
 
 
 def sources(bug, buggy):
-    design, tb, patch = BUGS[bug]
+    design, tb, patch, _ = BUGS[bug]
     src = read(design)
     if buggy:
         for old, new in (patch if isinstance(patch, list) else [patch]):
             assert old in src, (bug, old)
             src = src.replace(old, new)
-    tbsrc = silent_tb() if tb == "pipe_tb_silent" else read(tb)
+    tbsrc = silent_tb(tb) if tb.endswith("_silent") else read(tb)
     return design, src, tb, tbsrc
 
 
@@ -106,7 +164,7 @@ def simulate(nvc, bug, buggy):
         fst = os.path.join(ws, "w.fst")
         r = subprocess.run(
             [nvc, "--std=2008", "-a", "src/%s.vhd" % design,
-             "src/%s.vhd" % tb, "-e", tb, "-r", "--stop-time=5us", "--wave=" + fst],
+             "src/%s.vhd" % tb, "-e", tb, "-r", "--stop-time=" + BUGS[bug][3], "--wave=" + fst],
             cwd=ws, env=env, capture_output=True, text=True)
         events = []
         if os.path.exists(fst):
