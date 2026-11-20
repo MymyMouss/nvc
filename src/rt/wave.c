@@ -1264,7 +1264,7 @@ void wave_dumper_restart(wave_dumper_t *wd, rt_model_t *m, jit_t *jit)
    // are created to avoid expensive mmap/munmap calls
    for (int i = 0; i < wd->dumped.count; i++) {
       fst_data_t *data = wd->dumped.items[i];
-      fst_event_cb(0, data->signal, data->watch, data);
+      fst_event_cb(model_now(m, NULL), data->signal, data->watch, data);
    }
 
    model_set_phase_cb(m, END_OF_SIMULATION, fst_close, wd);

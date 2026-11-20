@@ -113,6 +113,33 @@ begin
 end architecture;
 """
 
+# Runs for about half a minute of real time, which no single call may wait for
+LONG_TESTBENCH = """\
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity long_tb is
+end entity;
+
+architecture test of long_tb is
+  signal clk : std_logic := '0';
+  signal rst : std_logic := '1';
+  signal q   : unsigned(3 downto 0);
+begin
+  dut : entity work.counter port map (clk => clk, rst => rst, q => q);
+  clk <= not clk after 5 ns;
+  process
+  begin
+    wait for 12 ns;
+    rst <= '0';
+    wait for 200 ms;
+    report "long run complete" severity note;
+    std.env.finish;
+  end process;
+end architecture;
+"""
+
 FINISH = "Finish with exactly one line: RESULT: PASS or RESULT: FAIL."
 FILE_TOOLS = ["Read", "Edit", "Glob"]
 
@@ -154,6 +181,12 @@ SCENARIOS = [
          "inside the counter instance at that moment. Finish with exactly "
          "one line in this form: RESULT: <time in ns> <value>, for example "
          "RESULT: 40 ns 3"),
+    dict(name="long-run", files="long", tools=[],
+         check=r"RESULT:.*long run complete", must_call="nvc_sim_wait",
+         prompt="src/ holds a counter and a testbench called long_tb that "
+         "takes about half a minute of real time to finish. Run it to its "
+         "end and tell me the message it prints when it completes. Finish "
+         "with exactly one line in this form: RESULT: <message>"),
     dict(name="wave-find", files="checked", tools=[],
          check=r"RESULT:\s*55\s*ns\s*$", must_call="nvc_wave_start",
          prompt="src/ holds a counter and a testbench called checked_tb. "
@@ -187,6 +220,8 @@ def make_workspace(kind):
     put("counter.vhd", COUNTER % ("count" if kind == "buggy" else "cnt"))
     if kind == "checked":
         put("checked_tb.vhd", CHECKED_TESTBENCH)
+    elif kind == "long":
+        put("long_tb.vhd", LONG_TESTBENCH)
     else:
         put("counter_tb.vhd", TESTBENCH)
     return ws

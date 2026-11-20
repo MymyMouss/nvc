@@ -1184,8 +1184,12 @@ static bool tool_sim_wait(mcp_call_t *call, const json_t *args,
          why = "stopped";
       else if (bad > bad_at_start)
          why = "new_errors";
-      else if (mcp_call_cancelled(call))
-         why = "cancelled";
+      else if (mcp_call_cancelled(call)) {
+         free(result);
+         pool_free(mp);
+         mcp_call_error(call, "The request was cancelled");
+         return false;
+      }
       else if ((int64_t)waited_ms >= timeout_ms)
          why = "timeout";
 
@@ -2003,7 +2007,7 @@ static const mcp_tool_t sim_tools[] = {
          "Wait up to timeout_ms (at most 30 seconds) for a background run "
          "to stop or for the design to report a new error, then return what "
          "nvc_sim_status returns plus woke_because: stopped, new_errors, "
-         "timeout or cancelled.  Call it again after a timeout while the "
+         "or timeout.  Call it again after a timeout while the "
          "state is still running: each call is cheap and keeps you in "
          "touch with the run.  Use the percent and eta_ms fields to decide "
          "how long to keep waiting.",

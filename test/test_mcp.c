@@ -2339,6 +2339,214 @@ START_TEST(test_sim_waves)
 }
 END_TEST
 
+START_TEST(test_sim_wait_cancel)
+{
+   fixture_t f;
+   const char *names[] = { "tb.vhd" }, *sources[] = { tb_src };
+   const char *tops[] = { "tb" };
+   static const char quiet[] =
+      "entity quiet is end entity;\n"
+      "architecture test of quiet is\n"
+      "  signal clk : bit;\n"
+      "begin\n"
+      "  clk <= not clk after 5 ns;\n"
+      "end architecture;\n";
+   names[0] = "quiet.vhd";
+   sources[0] = quiet;
+   tops[0] = "quiet";
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   int fds[2];
+   ck_assert_int_eq(pipe(fds), 0);
+
+   sink_t sink = {};
+   const mcp_options_t opts = {
+      .write     = sink_write,
+      .write_ctx = &sink,
+      .in_fd     = fds[0],
+      .exe       = f.nvc,
+      .root      = f.root,
+   };
+   mcp_server_t *srv = mcp_server_new(&opts);
+
+   const json_t *sc = structured(tool(f.mp, srv, &sink, "nvc_sim_open",
+                                      "{\"top\":\"quiet\",\"std\":\"2008\"}"));
+   char id[40];
+   snprintf(id, sizeof(id), "%s", str_field(sc, "sim_id"));
+
+   char *args = xasprintf("{\"sim_id\":\"%s\",\"background\":true,"
+                          "\"pause_on\":\"never\"}", id);
+   sc = structured(tool(f.mp, srv, &sink, "nvc_sim_run", args));
+   free(args);
+   ck_assert_str_eq(str_field(sc, "state"), "running");
+
+   char *wait = xasprintf(
+      "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":"
+      "{\"name\":\"nvc_sim_wait\",\"arguments\":{\"sim_id\":\"%s\","
+      "\"timeout_ms\":30000}," MODERN_META "}}\n", id);
+   char *later = xasprintf(
+      "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\","
+      "\"params\":{\"requestId\":9}}\n"
+      "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":"
+      "{\"name\":\"nvc_sim_status\",\"arguments\":{\"sim_id\":\"%s\"},"
+      MODERN_META "}}\n", id);
+
+   ck_assert_int_eq(write(fds[1], wait, strlen(wait)), (ssize_t)strlen(wait));
+
+   sink_clear(&sink);
+   writer_t w = { fds[1], later, 400 };
+   pthread_t thread;
+   ck_assert_int_eq(pthread_create(&thread, NULL, delayed_writer, &w), 0);
+
+   const uint64_t start = get_timestamp_us();
+   mcp_server_run(srv);
+   const uint64_t ms = (get_timestamp_us() - start) / 1000;
+   pthread_join(thread, NULL);
+
+   // The wait ends early and the run itself carries on
+   ck_assert_int_lt(ms, 20000);
+   ck_assert_int_eq(sink.count, 1);
+   json_t *r = parse_ok(f.mp, sink.lines[0]);
+   ck_assert_int_eq(int_field(r, "id"), 10);
+   sc = structured(json_get(r, "result"));
+   ck_assert_str_eq(str_field(sc, "state"), "running");
+
+   mcp_server_free(srv);
+   sink_clear(&sink);
+   close(fds[0]);
+   close(fds[1]);
+   free(wait);
+   free(later);
+   fixture_close(&f);
+}
+END_TEST
+
+START_TEST(test_sim_files_misc)
+{
+   fixture_t f;
+   const char *names[] = { "tb.vhd" }, *sources[] = { tb_src };
+   const char *tops[] = { "tb" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   char id[40];
+   open_sim(&f, "tb", id);
+
+   // Bad and repeated names
+   const char *err = tool_error(sim_tool(&f, "nvc_wave_start", id,
+                                         "\"name\":\"../x\""));
+   ck_assert_ptr_nonnull(strstr(err, "Invalid name"));
+   err = tool_error(sim_tool(&f, "nvc_wave_stop", id, ""));
+   ck_assert_ptr_nonnull(strstr(err, "No waveform"));
+
+   // Start recording in the middle of a background run
+   const json_t *sc = structured(sim_tool(&f, "nvc_sim_run", id,
+                                          "\"duration\":\"20 ns\","
+                                          "\"pause_on\":\"never\""));
+   ck_assert_int_gt(int_field(sc, "next_seq"), 0);
+   const int64_t seq = int_field(sc, "next_seq");
+
+   sc = structured(sim_tool(&f, "nvc_wave_start", id, "\"name\":\"late\","
+                            "\"include\":[\"/dut/cnt\"]"));
+   char *file = xstrdup(str_field(sc, "file"));
+   err = tool_error(sim_tool(&f, "nvc_wave_start", id, "\"name\":\"late\""));
+   ck_assert_ptr_nonnull(strstr(err, "already active"));
+
+   sc = structured(sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"500 ns\","
+                            "\"pause_on\":\"never\",\"background\":true"));
+   sc = structured(sim_tool(&f, "nvc_wave_stop", id, ""));
+   ck_assert_int_gt(int_field(sc, "bytes"), 0);
+   sc = structured(sim_tool(&f, "nvc_sim_wait", id, "\"timeout_ms\":20000"));
+   ck_assert_str_eq(str_field(sc, "state"), "idle");
+
+   // Only messages after since_seq come back
+   char *extra = xasprintf("\"since_seq\":%"PRIi64, int_field(sc, "next_seq"));
+   sc = structured(sim_tool(&f, "nvc_sim_status", id, extra));
+   free(extra);
+   ck_assert_int_eq(json_get(sc, "messages")->array.count, 0);
+   (void)seq;
+
+   // The recording starts at the time it was asked for, in hex on request
+   char *call_args = xasprintf("{\"file\":\"%s\",\"paths\":[\"/dut/cnt\"],"
+                               "\"radix\":\"hex\",\"max_changes\":3}", file);
+   sc = structured(tool(f.mp, f.srv, &f.sink, "nvc_wave_get", call_args));
+   free(call_args);
+   ck_assert_int_eq(int_field(sc, "from_fs"), 20000000);
+   ck_assert_int_eq(json_get(json_at(json_get(sc, "signals"), 0),
+                             "changes")->array.count, 3);
+   bool truncated = false;
+   json_as_bool(json_get(sc, "truncated"), &truncated);
+   ck_assert(truncated);
+   const char *v = json_string(json_at(json_at(json_get(json_at(
+      json_get(sc, "signals"), 0), "changes"), 0), 1));
+   ck_assert_ptr_nonnull(v);
+   ck_assert_int_eq(v[0], '0');
+   ck_assert_int_eq(v[1], 'x');
+
+   // A file that is not a waveform is refused with advice
+   char *junk = xasprintf("%s/.nvc-mcp/%s/junk.fst", f.root, id);
+   FILE *jf = fopen(junk, "w");
+   ck_assert_ptr_nonnull(jf);
+   fputs("not a waveform", jf);
+   fclose(jf);
+   free(junk);
+   call_args = xasprintf("{\"file\":\".nvc-mcp/%s/junk.fst\"}", id);
+   err = tool_error(tool(f.mp, f.srv, &f.sink, "nvc_wave_summary", call_args));
+   ck_assert_ptr_nonnull(strstr(err, "nvc_wave_stop"));
+   free(call_args);
+
+   // Closing finishes a recording that is still active
+   sc = structured(sim_tool(&f, "nvc_wave_start", id, "\"name\":\"open\""));
+   char *open_file = xstrdup(str_field(sc, "file"));
+   sc = structured(sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"50 ns\","
+                            "\"pause_on\":\"never\""));
+   sc = structured(sim_tool(&f, "nvc_sim_close", id, ""));
+   call_args = xasprintf("{\"file\":\"%s\"}", open_file);
+   sc = structured(tool(f.mp, f.srv, &f.sink, "nvc_wave_summary", call_args));
+   ck_assert_int_gt(int_field(sc, "signals_total"), 0);
+   free(call_args);
+
+   free(open_file);
+   free(file);
+   fixture_close(&f);
+}
+END_TEST
+
+START_TEST(test_sim_log_limit)
+{
+   setenv("NVC_MCP_LOG_MAX", "200", 1);
+
+   fixture_t f;
+   const char *names[] = { "tb.vhd" }, *sources[] = { tb_src };
+   const char *tops[] = { "tb" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   char id[40];
+   open_sim(&f, "tb", id);
+
+   const json_t *sc = structured(sim_tool(&f, "nvc_sim_run", id,
+                                          "\"duration\":\"3 us\","
+                                          "\"pause_on\":\"never\""));
+   sc = structured(sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"3 us\","
+                            "\"pause_on\":\"never\""));
+   sc = structured(sim_tool(&f, "nvc_sim_status", id, ""));
+   const json_t *log = json_get(json_get(sc, "files"), "output_log");
+   bool full = false;
+   json_as_bool(json_get(log, "limit_reached"), &full);
+   ck_assert(full);
+
+   // The size stops growing once the limit is hit
+   const int64_t size = int_field(log, "bytes");
+   sc = structured(sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"3 us\","
+                            "\"pause_on\":\"never\""));
+   sc = structured(sim_tool(&f, "nvc_sim_status", id, ""));
+   ck_assert_int_eq(int_field(json_get(json_get(sc, "files"), "output_log"),
+                              "bytes"), size);
+
+   unsetenv("NVC_MCP_LOG_MAX");
+   fixture_close(&f);
+}
+END_TEST
+
 Suite *get_mcp_tests(void)
 {
    Suite *s = suite_create("mcp");
@@ -2372,6 +2580,9 @@ Suite *get_mcp_tests(void)
    tcase_add_test(tc, test_sim_progress);
    tcase_add_test(tc, test_sim_background);
    tcase_add_test(tc, test_sim_waves);
+   tcase_add_test(tc, test_sim_wait_cancel);
+   tcase_add_test(tc, test_sim_files_misc);
+   tcase_add_test(tc, test_sim_log_limit);
    tcase_set_timeout(tc, 60);
    suite_add_tcase(s, tc);
 

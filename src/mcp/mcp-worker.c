@@ -2201,6 +2201,11 @@ int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
       .printer     = printer_new(),
    };
 
+   // A smaller log limit makes the limit testable
+   const char *log_max = getenv("NVC_MCP_LOG_MAX");
+   if (log_max != NULL && atoll(log_max) > 0)
+      w.log_max = atoll(log_max);
+
    // Messages emitted while the design initialises are reported with the
    // ready event
    diag_set_consumer(worker_diag, &w);
@@ -2277,8 +2282,12 @@ int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
          pool_free(mp);
          break;
       }
-      else if (!strcmp(op, "cancel"))
-         op_stop(&w);   // Otherwise arrived after its run finished
+      else if (!strcmp(op, "cancel")) {
+         // Meant for a call that waits for a foreground run: a background
+         // run goes on, and the message may arrive after the run finished
+         if (!w.run.background)
+            op_stop(&w);
+      }
       else if (!strcmp(op, "stop")) {
          op_stop(&w);
          op_status(&w, req);
