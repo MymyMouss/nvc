@@ -1,7 +1,9 @@
 # Plan: donner à un agent les moyens de diagnostiquer par les ondes
 
-Statut: **proposé, rien n'est réalisé**. Ce document est soumis pour accord
-avant toute exécution. Il complète `MCP-ARCHITECTURE.md` (§8.5 décrit
+Statut: **phases 0 à 3, 5 (étape 1), 6 et 7 réalisées** (voir
+`MCP-ARCHITECTURE.md` §8.6 et §8.7). Non faites: phase 4 (`nvc_wave_diff`) et
+l'étape 2 de la phase 5 (cône d'influence), faute de besoin démontré par le
+banc; le banc actuel est trop facile pour trancher. Il complète `MCP-ARCHITECTURE.md` (§8.5 décrit
 l'existant).
 
 ## 1. Le problème

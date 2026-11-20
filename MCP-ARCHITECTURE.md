@@ -736,6 +736,27 @@ Banc (`test/mcp/bench`): 5 designs, 8 bugs, vérité terrain calculée par
 comparaison des ondes avec et sans le bug. Mesures avec le plus petit
 modèle (3 essais par bug): voir §8.7.
 
+### 8.7 Mesures du banc (modèle le plus petit, 3 essais par bug, 8 bugs)
+
+| Configuration | Réussites | Appels moyens | Coût |
+|---|---|---|---|
+| Avec lecture des sources, outils d'avant la phase 1 | 24/24 | 11,0 | 0,127 $ |
+| Sans sources, sans `find`/`measure`/`table` (ablation) | 23/24 | 12,2 | 0,166 $ |
+| Sans sources, tous les outils | 24/24 | 12,5 | 0,194 $ |
+| Sans sources, tous les outils et guidage | 21/24 | 12,1 | 0,167 $ |
+
+Lecture honnête: **le banc ne départage pas les configurations**. Les écarts
+(un à trois échecs sur 24) sont du bruit à cette taille d'échantillon, et le
+petit modèle réussit déjà presque tout, même sans voir le source. Les trois
+échecs de la dernière série sont des erreurs de définition de « première
+valeur fausse » (le signal en aval au lieu du signal en amont, ou l'instant où
+la sortie devient visiblement fausse au lieu de celui où le registre l'est),
+pas des erreurs de calcul de temps. Ce que ces outils apportent est vérifié
+par les tests unitaires (échantillonnage par front, délais en cycles,
+conditions, repliement des cycles), pas par ce banc. Pour mesurer un gain il
+faudrait des bugs plus durs (traces longues, nombreux signaux, causes à
+plusieurs étapes), un modèle moyen en plus du petit, et bien plus d'essais.
+
 ## Références
 
 - Spécification MCP 2026-07-28, changements:
