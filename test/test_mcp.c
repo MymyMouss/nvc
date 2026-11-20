@@ -25,6 +25,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -2774,6 +2775,661 @@ START_TEST(test_sim_queries)
 }
 END_TEST
 
+////////////////////////////////////////////////////////////////////////////////
+// Checkpoints
+
+// Reads one number from each line of stim.txt at every clock edge, so the
+// state of the design includes the position in an open file
+static const char reader_src[] =
+   "library std;\n"
+   "use std.textio.all;\n"
+   "entity reader is end entity;\n"
+   "architecture a of reader is\n"
+   "  signal clk : bit := '0';\n"
+   "  signal total : integer := 0;\n"
+   "  signal count : integer := 0;\n"
+   "begin\n"
+   "  clk <= not clk after 5 ns;\n"
+   "  process\n"
+   "    file f : text open read_mode is \"stim.txt\";\n"
+   "    variable l : line;\n"
+   "    variable v, s, c : integer := 0;\n"
+   "  begin\n"
+   "    while not endfile(f) loop\n"
+   "      wait until clk = '1';\n"
+   "      readline(f, l);\n"
+   "      read(l, v);\n"
+   "      s := s + v;\n"
+   "      c := c + 1;\n"
+   "      total <= s;\n"
+   "      count <= c;\n"
+   "    end loop;\n"
+   "    report \"stimulus read\" severity note;\n"
+   "    wait;\n"
+   "  end process;\n"
+   "end architecture;\n";
+
+#define STIM_LINES 5000
+
+static int64_t stim_value(int i)
+{
+   return (i * 37) % 1000 + 1;
+}
+
+static const char *signal_value(fixture_t *f, const char *id, const char *path)
+{
+   char *extra = xasprintf("\"paths\":[\"%s\"]", path);
+   const json_t *sc = structured(sim_tool(f, "nvc_signal_get", id, extra));
+   free(extra);
+   return str_field(json_at(json_get(sc, "values"), 0), "value");
+}
+
+static void expect_same_messages(const json_t *a, const json_t *b)
+{
+   ck_assert_int_eq(a->array.count, b->array.count);
+   for (size_t i = 0; i < a->array.count; i++) {
+      ck_assert_int_eq(int_field(json_at(a, i), "time_fs"),
+                       int_field(json_at(b, i), "time_fs"));
+      ck_assert_str_eq(str_field(json_at(a, i), "message"),
+                       str_field(json_at(b, i), "message"));
+      ck_assert_str_eq(str_field(json_at(a, i), "severity"),
+                       str_field(json_at(b, i), "severity"));
+   }
+}
+
+// A process that has gone is no longer there for kill.  When its parent
+// has gone too it stays a zombie until init collects it, which can take
+// a few seconds.
+static bool wait_gone(pid_t pid)
+{
+   for (int i = 0; i < 500; i++) {
+      if (kill(pid, 0) < 0)
+         return true;
+
+      usleep(20000);
+   }
+
+   return false;
+}
+
+static pid_t worker_pid(fixture_t *f, const char *id)
+{
+   const json_t *sc = structured(sim_tool(f, "nvc_sim_status", id, ""));
+   return int_field(json_get(sc, "worker"), "pid");
+}
+
+START_TEST(test_sim_checkpoint)
+{
+   fixture_t f;
+   const char *names[] = { "tb.vhd" }, *sources[] = { tb_src };
+   const char *tops[] = { "tb" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   char id[40];
+   open_sim(&f, "tb", id);
+
+   const json_t *sc = structured(sim_tool(&f, "nvc_sim_run", id,
+                                          "\"duration\":\"100 ns\","
+                                          "\"pause_on\":\"never\""));
+   ck_assert_int_eq(int_field(sc, "now_fs"), 100000000);
+
+   sc = structured(sim_tool(&f, "nvc_sim_checkpoint", id, ""));
+   ck_assert_int_eq(int_field(sc, "checkpoint_id"), 1);
+   ck_assert_int_eq(int_field(sc, "now_fs"), 100000000);
+   ck_assert_str_eq(str_field(sc, "now"), "100 ns");
+   const pid_t snap_pid = int_field(sc, "pid");
+
+   // The original goes on: note what it does
+   sc = structured(sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"200 ns\","
+                            "\"pause_on\":\"never\""));
+   ck_assert_int_eq(int_field(sc, "now_fs"), 300000000);
+   const json_t *orig_msgs = json_get(sc, "messages");
+   char *orig_out = xstrdup(str_field(sc, "sim_output"));
+   ck_assert_int_gt(orig_msgs->array.count, 0);
+   char *orig_q = xstrdup(signal_value(&f, id, "/q"));
+   char *orig_cnt = xstrdup(signal_value(&f, id, "/dut/cnt"));
+
+   // The status lists it
+   sc = structured(sim_tool(&f, "nvc_sim_status", id, ""));
+   const json_t *list = json_get(sc, "checkpoints");
+   ck_assert_int_eq(list->array.count, 1);
+   ck_assert_int_eq(int_field(json_at(list, 0), "id"), 1);
+   ck_assert_int_eq(int_field(json_at(list, 0), "time_fs"), 100000000);
+   ck_assert_str_eq(str_field(json_at(list, 0), "time"), "100 ns");
+   ck_assert(!bool_field(json_at(list, 0), "auto"));
+
+   // The restored simulation is a new one at the time of the checkpoint
+   sc = structured(sim_tool(&f, "nvc_sim_restore", id, "\"checkpoint_id\":1"));
+   char rid[40];
+   snprintf(rid, sizeof(rid), "%s", str_field(sc, "sim_id"));
+   ck_assert_str_ne(rid, id);
+   ck_assert_int_eq(int_field(sc, "now_fs"), 100000000);
+   ck_assert_int_eq(int_field(sc, "open_simulations"), 2);
+   const json_t *from = json_get(sc, "restored_from");
+   ck_assert_str_eq(str_field(from, "sim_id"), id);
+   ck_assert_int_eq(int_field(from, "checkpoint_id"), 1);
+   ck_assert_int_eq(json_get(sc, "messages")->array.count, 0);
+   char *rdir = xstrdup(str_field(sc, "files_directory"));
+
+   ck_assert_str_eq(signal_value(&f, rid, "/dut/cnt"), "1001");
+
+   sc = structured(sim_tool(&f, "nvc_sim_status", rid, ""));
+   ck_assert_str_eq(str_field(sc, "state"), "idle");
+
+   sc = structured(sim_tool(&f, "nvc_sim_run", rid, "\"duration\":\"200 ns\","
+                            "\"pause_on\":\"never\""));
+   ck_assert_int_eq(int_field(sc, "now_fs"), 300000000);
+   expect_same_messages(orig_msgs, json_get(sc, "messages"));
+   ck_assert_str_eq(str_field(sc, "sim_output"), orig_out);
+   ck_assert_str_eq(signal_value(&f, rid, "/q"), orig_q);
+   ck_assert_str_eq(signal_value(&f, rid, "/dut/cnt"), orig_cnt);
+
+   // The original was not touched by any of that
+   ck_assert_str_eq(signal_value(&f, id, "/q"), orig_q);
+   sc = structured(sim_tool(&f, "nvc_sim_status", id, ""));
+   ck_assert_int_eq(int_field(sc, "now_fs"), 300000000);
+
+   // The log of the new simulation is in its own directory and holds the
+   // same text
+   char *log = xasprintf("%s/%s/output.log", f.root, rdir);
+   char *olog = xasprintf("%s/.nvc-mcp/%s/output.log", f.root, id);
+   struct stat a, b;
+   ck_assert_int_eq(stat(log, &a), 0);
+   ck_assert_int_eq(stat(olog, &b), 0);
+   ck_assert_int_gt(a.st_size, 0);
+   ck_assert_int_eq(a.st_size, b.st_size);
+   free(log);
+   free(olog);
+
+   // Either can be closed without the other: the checkpoint belongs to the
+   // original and goes with it, the restored simulation does not
+   const pid_t rpid = worker_pid(&f, rid);
+   sc = structured(sim_tool(&f, "nvc_sim_close", id, ""));
+   ck_assert_int_eq(int_field(sc, "open_simulations"), 1);
+   ck_assert(wait_gone(snap_pid));
+   sc = structured(sim_tool(&f, "nvc_sim_run", rid, "\"duration\":\"10 ns\","
+                            "\"pause_on\":\"never\""));
+   ck_assert_int_eq(int_field(sc, "now_fs"), 310000000);
+   sim_tool(&f, "nvc_sim_close", rid, "");
+   ck_assert(wait_gone(rpid));
+
+   free(rdir);
+   free(orig_q);
+   free(orig_cnt);
+   free(orig_out);
+   fixture_close(&f);
+}
+END_TEST
+
+START_TEST(test_sim_restore_files)
+{
+   fixture_t f;
+   const char *names[] = { "reader.vhd" }, *sources[] = { reader_src };
+   const char *tops[] = { "reader" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   // More than a few buffers of input, so the position in the file matters
+   LOCAL_TEXT_BUF stim = tb_new();
+   int64_t expect = 0;
+   for (int i = 0; i < STIM_LINES; i++) {
+      tb_printf(stim, "%"PRIi64"\n", stim_value(i));
+      expect += stim_value(i);
+   }
+   ck_assert_int_gt(tb_len(stim), 4 * 4096);
+   write_file(f.root, "stim.txt", tb_get(stim), 0644);
+
+   char id[40];
+   open_sim(&f, "reader", id);
+
+   sim_tool(&f, "nvc_sim_run", id, "\"until\":\"1000 ns\","
+            "\"pause_on\":\"never\"");
+   ck_assert_str_eq(signal_value(&f, id, "/count"), "100");
+   structured(sim_tool(&f, "nvc_sim_checkpoint", id, ""));
+
+   // The original reads on past the end of the buffer the copy has, which
+   // moves the offset of the file they would share
+   sim_tool(&f, "nvc_sim_run", id, "\"until\":\"20 us\","
+            "\"pause_on\":\"never\"");
+   ck_assert_str_eq(signal_value(&f, id, "/count"), "2000");
+
+   char r1[40], r2[40];
+   const json_t *sc = structured(sim_tool(&f, "nvc_sim_restore", id,
+                                          "\"checkpoint_id\":1"));
+   snprintf(r1, sizeof(r1), "%s", str_field(sc, "sim_id"));
+   sc = structured(sim_tool(&f, "nvc_sim_restore", id, "\"checkpoint_id\":1"));
+   snprintf(r2, sizeof(r2), "%s", str_field(sc, "sim_id"));
+   ck_assert_str_eq(signal_value(&f, r1, "/count"), "100");
+   ck_assert_str_eq(signal_value(&f, r2, "/count"), "100");
+
+   // The original and both restored simulations read at the same time:
+   // each must see every line once, whatever the others do
+   const char *all[] = { id, r1, r2 };
+   for (int i = 1; i < 3; i++)
+      sim_tool(&f, "nvc_sim_run", all[i], "\"background\":true,"
+               "\"until\":\"60 us\",\"pause_on\":\"never\"");
+   sim_tool(&f, "nvc_sim_run", id, "\"until\":\"60 us\","
+            "\"pause_on\":\"never\"");
+
+   for (int i = 1; i < 3; i++) {
+      sc = structured(sim_tool(&f, "nvc_sim_wait", all[i],
+                               "\"timeout_ms\":20000"));
+      ck_assert_str_eq(str_field(sc, "state"), "idle");
+   }
+
+   char want[32];
+   snprintf(want, sizeof(want), "%"PRIi64, expect);
+   for (int i = 0; i < 3; i++) {
+      ck_assert_str_eq(signal_value(&f, all[i], "/total"), want);
+      ck_assert_str_eq(signal_value(&f, all[i], "/count"), "5000");
+   }
+
+   // Restoring once more after all that still starts from line 100
+   sim_tool(&f, "nvc_sim_close", r2, "");
+   sc = structured(sim_tool(&f, "nvc_sim_restore", id, "\"checkpoint_id\":1"));
+   snprintf(r2, sizeof(r2), "%s", str_field(sc, "sim_id"));
+   ck_assert_str_eq(signal_value(&f, r2, "/count"), "100");
+   sim_tool(&f, "nvc_sim_run", r2, "\"until\":\"60 us\","
+            "\"pause_on\":\"never\"");
+   ck_assert_str_eq(signal_value(&f, r2, "/total"), want);
+
+   // A file that has gone cannot be opened again: say so
+   char *path = xasprintf("%s/stim.txt", f.root);
+   ck_assert_int_eq(unlink(path), 0);
+   free(path);
+   const char *err = tool_error(sim_tool(&f, "nvc_sim_restore", id,
+                                         "\"checkpoint_id\":1"));
+   ck_assert_ptr_nonnull(strstr(err, "stim.txt"));
+   ck_assert_ptr_nonnull(strstr(err, "cannot open"));
+
+   // ... and the failed attempt used no slot
+   sc = structured(sim_tool(&f, "nvc_sim_status", id, ""));
+   ck_assert_int_eq(json_get(sc, "checkpoints")->array.count, 1);
+   sc = structured(sim_tool(&f, "nvc_sim_close", r2, ""));
+   ck_assert_int_eq(int_field(sc, "open_simulations"), 2);
+
+   fixture_close(&f);
+}
+END_TEST
+
+START_TEST(test_sim_restore_errors)
+{
+   fixture_t f;
+   const char *names[] = { "tb.vhd" }, *sources[] = { tb_src };
+   const char *tops[] = { "tb" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   char id[40];
+   open_sim(&f, "tb", id);
+
+   const char *err = tool_error(sim_tool(&f, "nvc_sim_restore", id,
+                                         "\"checkpoint_id\":1"));
+   ck_assert_ptr_nonnull(strstr(err, "does not exist"));
+   err = tool_error(sim_tool(&f, "nvc_sim_restore", id, ""));
+   ck_assert_ptr_nonnull(strstr(err, "checkpoint_id or at"));
+   err = tool_error(sim_tool(&f, "nvc_sim_restore", id,
+                             "\"checkpoint_id\":1,\"at\":\"1 ns\""));
+   ck_assert_ptr_nonnull(strstr(err, "checkpoint_id or at"));
+
+   // Checkpoints at 0 (before anything ran), 100 ns and 200 ns
+   structured(sim_tool(&f, "nvc_sim_checkpoint", id, ""));
+   sim_tool(&f, "nvc_sim_run", id, "\"until\":\"100 ns\","
+            "\"pause_on\":\"never\"");
+   structured(sim_tool(&f, "nvc_sim_checkpoint", id, ""));
+   sim_tool(&f, "nvc_sim_run", id, "\"until\":\"200 ns\","
+            "\"pause_on\":\"never\"");
+   structured(sim_tool(&f, "nvc_sim_checkpoint", id, ""));
+   sim_tool(&f, "nvc_sim_run", id, "\"until\":\"250 ns\","
+            "\"pause_on\":\"never\"");
+
+   // The latest checkpoint at or before the time
+   struct { const char *at; int64_t want_id; int64_t want_fs; } cases[] = {
+      { "150 ns", 2, 100000000 }, { "200 ns", 3, 200000000 },
+      { "99 ns", 1, 0 }, { "0.2 us", 3, 200000000 }, { "1 ms", 3, 200000000 },
+   };
+
+   for (size_t i = 0; i < ARRAY_LEN(cases); i++) {
+      char *extra = xasprintf("\"at\":\"%s\"", cases[i].at);
+      const json_t *sc = structured(sim_tool(&f, "nvc_sim_restore", id, extra));
+      free(extra);
+      ck_assert_int_eq(int_field(json_get(sc, "restored_from"),
+                                 "checkpoint_id"), cases[i].want_id);
+      ck_assert_int_eq(int_field(sc, "now_fs"), cases[i].want_fs);
+      sim_tool(&f, "nvc_sim_close", str_field(sc, "sim_id"), "");
+   }
+
+   err = tool_error(sim_tool(&f, "nvc_sim_restore", id, "\"checkpoint_id\":9"));
+   ck_assert_ptr_nonnull(strstr(err, "Checkpoints: 1 (0 fs), 2 (100 ns), "
+                                "3 (200 ns)"));
+   err = tool_error(sim_tool(&f, "nvc_sim_restore", id, "\"at\":\"soon\""));
+   ck_assert_ptr_nonnull(strstr(err, "Invalid at"));
+
+   // Nothing before the time asked for
+   sim_tool(&f, "nvc_sim_checkpoint_delete", id, "\"checkpoint_id\":1");
+   err = tool_error(sim_tool(&f, "nvc_sim_restore", id, "\"at\":\"50 ns\""));
+   ck_assert_ptr_nonnull(strstr(err, "No checkpoint at or before 50 ns"));
+
+   err = tool_error(sim_tool(&f, "nvc_sim_checkpoint_delete", id,
+                             "\"checkpoint_id\":1"));
+   ck_assert_ptr_nonnull(strstr(err, "does not exist"));
+
+   // At most 16 on request
+   for (int i = 0; i < 14; i++)
+      structured(sim_tool(&f, "nvc_sim_checkpoint", id, ""));
+
+   const json_t *sc = structured(sim_tool(&f, "nvc_sim_status", id, ""));
+   ck_assert_int_eq(json_get(sc, "checkpoints")->array.count, 16);
+
+   err = tool_error(sim_tool(&f, "nvc_sim_checkpoint", id, ""));
+   ck_assert_ptr_nonnull(strstr(err, "16 checkpoints"));
+   ck_assert_ptr_nonnull(strstr(err, "nvc_sim_checkpoint_delete"));
+
+   sc = structured(sim_tool(&f, "nvc_sim_checkpoint_delete", id,
+                            "\"checkpoint_id\":2"));
+   ck_assert_int_eq(int_field(sc, "checkpoints"), 15);
+   structured(sim_tool(&f, "nvc_sim_checkpoint", id, ""));
+
+   // A restore is a simulation like any other: four at most
+   char ids[4][40];
+   for (int i = 0; i < 3; i++) {
+      sc = structured(sim_tool(&f, "nvc_sim_restore", id,
+                               "\"checkpoint_id\":3"));
+      snprintf(ids[i], sizeof(ids[i]), "%s", str_field(sc, "sim_id"));
+   }
+
+   err = tool_error(sim_tool(&f, "nvc_sim_restore", id, "\"checkpoint_id\":3"));
+   ck_assert_ptr_nonnull(strstr(err, "4 simulations are already open"));
+   ck_assert_ptr_nonnull(strstr(err, "nvc_sim_close"));
+
+   // Closing one makes room
+   sim_tool(&f, "nvc_sim_close", ids[0], "");
+   structured(sim_tool(&f, "nvc_sim_restore", id, "\"checkpoint_id\":3"));
+
+   fixture_close(&f);
+}
+END_TEST
+
+START_TEST(test_sim_restore_failed)
+{
+   fixture_t f;
+   const char *names[] = { "fail.vhd" }, *sources[] = { fail_src };
+   const char *tops[] = { "failing" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   char id[40];
+   open_sim(&f, "failing", id);
+
+   sim_tool(&f, "nvc_sim_run", id, "\"until\":\"15 ns\"");
+   const json_t *sc = structured(sim_tool(&f, "nvc_sim_checkpoint", id, ""));
+   const int64_t ck_fs = int_field(sc, "now_fs");
+   ck_assert_int_gt(ck_fs, 0);
+   ck_assert_int_le(ck_fs, 15000000);
+
+   sc = structured(sim_tool(&f, "nvc_sim_run", id, ""));
+   ck_assert_str_eq(str_field(sc, "stopped_because"), "terminated");
+   ck_assert_int_eq(int_field(sc, "now_fs"), 30000000);
+
+   // A copy of the ended simulation could not run
+   const char *err = tool_error(sim_tool(&f, "nvc_sim_checkpoint", id, ""));
+   ck_assert_ptr_nonnull(strstr(err, "has ended"));
+   ck_assert_ptr_nonnull(strstr(err, "nvc_sim_restore"));
+
+   // The earlier one still works and fails in the same way
+   sc = structured(sim_tool(&f, "nvc_sim_restore", id, "\"at\":\"20 ns\""));
+   ck_assert_int_eq(int_field(sc, "now_fs"), ck_fs);
+   char rid[40];
+   snprintf(rid, sizeof(rid), "%s", str_field(sc, "sim_id"));
+
+   sc = structured(sim_tool(&f, "nvc_sim_status", rid, ""));
+   ck_assert_str_eq(str_field(sc, "state"), "idle");
+   ck_assert_str_eq(signal_value(&f, rid, "/x"), "7");
+
+   sc = structured(sim_tool(&f, "nvc_sim_run", rid, ""));
+   ck_assert_str_eq(str_field(sc, "stopped_because"), "terminated");
+   ck_assert_int_eq(int_field(sc, "now_fs"), 30000000);
+   const json_t *msgs = json_get(sc, "messages");
+   ck_assert_int_eq(msgs->array.count, 1);
+   ck_assert_ptr_nonnull(strstr(str_field(json_at(msgs, 0), "message"),
+                                "giving up"));
+
+   fixture_close(&f);
+}
+END_TEST
+
+START_TEST(test_sim_checkpoint_wave)
+{
+   fixture_t f;
+   const char *names[] = { "tb.vhd" }, *sources[] = { tb_src };
+   const char *tops[] = { "tb" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   char id[40];
+   open_sim(&f, "tb", id);
+
+   const json_t *sc = structured(sim_tool(&f, "nvc_wave_start", id,
+                                          "\"include\":[\"/dut/*\"],"
+                                          "\"name\":\"orig\""));
+   char *wave_file = xstrdup(str_field(sc, "file"));
+
+   sim_tool(&f, "nvc_sim_run", id, "\"until\":\"100 ns\","
+            "\"pause_on\":\"never\"");
+   structured(sim_tool(&f, "nvc_sim_checkpoint", id, ""));
+   sim_tool(&f, "nvc_sim_run", id, "\"until\":\"300 ns\","
+            "\"pause_on\":\"never\"");
+
+   // The restored simulation has no file recording of its own, and says so
+   sc = structured(sim_tool(&f, "nvc_sim_restore", id, "\"checkpoint_id\":1"));
+   ck_assert_ptr_nonnull(strstr(str_field(sc, "hint"), wave_file));
+   char rid[40];
+   snprintf(rid, sizeof(rid), "%s", str_field(sc, "sim_id"));
+
+   sc = structured(sim_tool(&f, "nvc_sim_status", rid, ""));
+   const json_t *files = json_get(sc, "files");
+   ck_assert(!bool_field(json_get(files, "wave"), "active"));
+   ck_assert(bool_field(json_get(files, "memory"), "active"));
+
+   // The in-memory recording carries on from the checkpoint
+   sim_tool(&f, "nvc_sim_run", rid, "\"until\":\"300 ns\","
+            "\"pause_on\":\"never\"");
+   sc = structured(sim_tool(&f, "nvc_wave_get", rid,
+                            "\"paths\":[\"/dut/cnt\"],\"radix\":\"decimal\","
+                            "\"from\":\"50 ns\",\"until\":\"300 ns\""));
+   const json_t *sig = json_at(json_get(sc, "signals"), 0);
+   ck_assert_int_gt(json_get(sig, "changes")->array.count, 10);
+
+   // A file recording can be started in the new simulation
+   sim_tool(&f, "nvc_wave_stop", rid, "");
+   sc = structured(sim_tool(&f, "nvc_wave_start", rid, "\"name\":\"again\""));
+   ck_assert_ptr_nonnull(strstr(str_field(sc, "file"), rid));
+   sim_tool(&f, "nvc_wave_stop", rid, "");
+
+   // The original recording is untouched, even by the end of the other
+   // simulation, and finishes into a readable file
+   sim_tool(&f, "nvc_sim_close", rid, "");
+   sc = structured(sim_tool(&f, "nvc_wave_stop", id, ""));
+   ck_assert_int_gt(int_field(sc, "bytes"), 0);
+
+   char *args = xasprintf("{\"file\":\"%s\"}", wave_file);
+   sc = structured(tool(f.mp, f.srv, &f.sink, "nvc_wave_summary", args));
+   ck_assert_int_eq(int_field(sc, "end_fs"), 300000000);
+   free(args);
+
+   free(wave_file);
+   fixture_close(&f);
+}
+END_TEST
+
+START_TEST(test_sim_checkpoint_auto)
+{
+   fixture_t f;
+   const char *names[] = { "tb.vhd" }, *sources[] = { tb_src };
+   const char *tops[] = { "tb" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   char id[40];
+   open_sim(&f, "tb", id);
+
+   // A foreground run takes none whatever the setting
+   sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"10 ns\","
+            "\"auto_checkpoint_s\":0.01,\"pause_on\":\"never\"");
+   const json_t *sc = structured(sim_tool(&f, "nvc_sim_status", id, ""));
+   ck_assert_ptr_null(json_get(sc, "checkpoints"));
+
+   // A checkpoint every 50 ms for two seconds is far more than the eight
+   // that are kept
+   sim_tool(&f, "nvc_sim_run", id, "\"background\":true,"
+            "\"auto_checkpoint_s\":0.05,\"pause_on\":\"never\"");
+
+   size_t most = 0;
+   for (int i = 0; i < 5; i++) {
+      sc = structured(sim_tool(&f, "nvc_sim_wait", id, "\"timeout_ms\":400"));
+      ck_assert_str_eq(str_field(sc, "state"), "running");
+      const json_t *list = json_get(sc, "checkpoints");
+      ck_assert_ptr_nonnull(list);
+      most = MAX(most, list->array.count);
+      ck_assert_int_le(list->array.count, 8);
+   }
+
+   sc = structured(sim_tool(&f, "nvc_sim_status", id, ""));
+   const json_t *list = json_get(sc, "checkpoints");
+   ck_assert_int_eq(list->array.count, 8);
+   ck_assert_int_eq(most, 8);
+
+   int64_t last = -1;
+   for (size_t i = 0; i < list->array.count; i++) {
+      ck_assert(bool_field(json_at(list, i), "auto"));
+      const int64_t t = int_field(json_at(list, i), "time_fs");
+      ck_assert_int_ge(t, last);
+      last = t;
+   }
+
+   // Thinning keeps the first one taken
+   ck_assert_int_eq(int_field(json_at(list, 0), "id"), 1);
+
+   // One of them can be restored while the original keeps running
+   const int64_t picked = int_field(json_at(list, 3), "id");
+   char *extra = xasprintf("\"checkpoint_id\":%"PRIi64, picked);
+   sc = structured(sim_tool(&f, "nvc_sim_restore", id, extra));
+   free(extra);
+   ck_assert_int_eq(int_field(sc, "now_fs"),
+                    int_field(json_at(list, 3), "time_fs"));
+
+   sc = structured(sim_tool(&f, "nvc_sim_status", id, ""));
+   ck_assert_str_eq(str_field(sc, "state"), "running");
+
+   // One taken by hand in the middle of the run is never thinned away
+   sc = structured(sim_tool(&f, "nvc_sim_checkpoint", id, ""));
+   const int64_t manual = int_field(sc, "checkpoint_id");
+   ck_assert_int_gt(manual, 8);
+   sleep(1);
+   sc = structured(sim_tool(&f, "nvc_sim_status", id, ""));
+   list = json_get(sc, "checkpoints");
+   bool found = false;
+   for (size_t i = 0; i < list->array.count; i++)
+      found |= int_field(json_at(list, i), "id") == manual;
+   ck_assert(found);
+   ck_assert_int_le(list->array.count, 9);
+
+   // With them switched off there are no more
+   sim_tool(&f, "nvc_sim_stop", id, "");
+   sc = structured(sim_tool(&f, "nvc_sim_status", id, ""));
+   const size_t before = json_get(sc, "checkpoints")->array.count;
+   sim_tool(&f, "nvc_sim_run", id, "\"background\":true,"
+            "\"auto_checkpoint_s\":0,\"pause_on\":\"never\"");
+   usleep(300000);
+   sim_tool(&f, "nvc_sim_stop", id, "");
+   sc = structured(sim_tool(&f, "nvc_sim_status", id, ""));
+   ck_assert_int_eq(json_get(sc, "checkpoints")->array.count, before);
+
+   fixture_close(&f);
+}
+END_TEST
+
+START_TEST(test_sim_checkpoint_cleanup)
+{
+   fixture_t f;
+   const char *names[] = { "tb.vhd" }, *sources[] = { tb_src };
+   const char *tops[] = { "tb" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   char id[40];
+   open_sim(&f, "tb", id);
+   const pid_t orig = worker_pid(&f, id);
+
+   const json_t *sc = structured(sim_tool(&f, "nvc_sim_checkpoint", id, ""));
+   const pid_t snap1 = int_field(sc, "pid");
+   sc = structured(sim_tool(&f, "nvc_sim_checkpoint", id, ""));
+   const pid_t snap2 = int_field(sc, "pid");
+   ck_assert_int_ne(snap1, snap2);
+   ck_assert_int_eq(kill(snap1, 0), 0);
+   ck_assert_int_eq(kill(snap2, 0), 0);
+
+   // Deleting one ends its process and no other
+   sim_tool(&f, "nvc_sim_checkpoint_delete", id, "\"checkpoint_id\":1");
+   ck_assert(wait_gone(snap1));
+   ck_assert_int_eq(kill(snap2, 0), 0);
+
+   sc = structured(sim_tool(&f, "nvc_sim_restore", id, "\"checkpoint_id\":2"));
+   char rid[40];
+   snprintf(rid, sizeof(rid), "%s", str_field(sc, "sim_id"));
+   const pid_t restored = worker_pid(&f, rid);
+   ck_assert_int_ne(restored, orig);
+
+   // The restored worker has a process group of its own, so stopping one
+   // never stops the other
+   ck_assert_int_eq(getpgid(restored), restored);
+   ck_assert_int_eq(getpgid(orig), orig);
+
+   // A checkpoint of the restored simulation is a copy of that worker
+   sc = structured(sim_tool(&f, "nvc_sim_checkpoint", rid, ""));
+   const pid_t snap3 = int_field(sc, "pid");
+   ck_assert_int_eq(getpgid(snap3), restored);
+
+   // ... which can be restored in turn, and runs
+   sc = structured(sim_tool(&f, "nvc_sim_restore", rid, "\"checkpoint_id\":1"));
+   char rid2[40];
+   snprintf(rid2, sizeof(rid2), "%s", str_field(sc, "sim_id"));
+   const pid_t restored2 = worker_pid(&f, rid2);
+   sc = structured(sim_tool(&f, "nvc_sim_run", rid2, "\"duration\":\"10 ns\","
+                            "\"pause_on\":\"never\""));
+   ck_assert_int_eq(int_field(sc, "now_fs"), 10000000);
+
+   // Closing the server leaves nothing behind
+   fixture_close(&f);
+
+   ck_assert(wait_gone(orig));
+   ck_assert(wait_gone(snap2));
+   ck_assert(wait_gone(restored));
+   ck_assert(wait_gone(snap3));
+   ck_assert(wait_gone(restored2));
+}
+END_TEST
+
+START_TEST(test_sim_checkpoint_worker_death)
+{
+   fixture_t f;
+   const char *names[] = { "tb.vhd" }, *sources[] = { tb_src };
+   const char *tops[] = { "tb" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   char id[40];
+   open_sim(&f, "tb", id);
+   const pid_t pid = worker_pid(&f, id);
+   structured(sim_tool(&f, "nvc_sim_checkpoint", id, ""));
+
+   // The copy must not keep the control socket open: the supervisor
+   // has to notice at once that the original has gone
+   ck_assert_int_eq(kill(pid, SIGKILL), 0);
+
+   const uint64_t start = get_timestamp_us();
+   const char *err = tool_error(sim_tool(&f, "nvc_signal_get", id,
+                                         "\"paths\":[\"/clk\"]"));
+   ck_assert_ptr_nonnull(strstr(err, "terminated by signal 9"));
+   ck_assert_int_lt(get_timestamp_us() - start, 2000000);
+
+   fixture_close(&f);
+}
+END_TEST
+
 Suite *get_mcp_tests(void)
 {
    Suite *s = suite_create("mcp");
@@ -2814,6 +3470,14 @@ Suite *get_mcp_tests(void)
    tcase_add_test(tc, test_sim_busy);
    tcase_add_test(tc, test_sim_live_trace);
    tcase_add_test(tc, test_sim_queries);
+   tcase_add_test(tc, test_sim_checkpoint);
+   tcase_add_test(tc, test_sim_restore_files);
+   tcase_add_test(tc, test_sim_restore_errors);
+   tcase_add_test(tc, test_sim_restore_failed);
+   tcase_add_test(tc, test_sim_checkpoint_wave);
+   tcase_add_test(tc, test_sim_checkpoint_auto);
+   tcase_add_test(tc, test_sim_checkpoint_cleanup);
+   tcase_add_test(tc, test_sim_checkpoint_worker_death);
    tcase_set_timeout(tc, 60);
    suite_add_tcase(s, tc);
 

@@ -34,6 +34,10 @@ void wave_dumper_restart(wave_dumper_t *wd, rt_model_t *m, jit_t *jit);
 // signals it watched are ignored afterwards.
 void wave_dumper_close(wave_dumper_t *wd);
 
+// Stop dumping without finishing the file.  For a forked copy of the
+// process: the file belongs to the original, which goes on writing it.
+void wave_dumper_abandon(wave_dumper_t *wd);
+
 // Forget all include and exclude patterns
 void wave_clear_globs(void);
 

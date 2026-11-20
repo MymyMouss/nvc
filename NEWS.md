@@ -19,7 +19,11 @@
   simulation runs.  Questions about time are answered by the tools rather
   than left to the caller: `nvc_wave_find` tests a VHDL-like condition per
   clock cycle and `nvc_wave_table` shows one row per clock edge with the
-  design messages on their cycle.  Each call that
+  design messages on their cycle.  A simulation can be saved at any
+  time as a frozen copy of its process (`nvc_sim_checkpoint`, also taken
+  automatically during background runs) and opened again from that point
+  as a new simulation (`nvc_sim_restore`), for example to record more
+  signals just before a failure.  Each call that
   loads a design runs in an isolated worker process.
 - Fixed a crash when attaching a waveform dumper to signals whose watch had
   been freed.

@@ -66,6 +66,7 @@ typedef struct _jit_dll {
 } jit_dll_t;
 
 static jit_dll_t *dlls;
+static unsigned   external_dlls;
 
 ffi_uarray_t ffi_wrap(void *ptr, int64_t left, int64_t right)
 {
@@ -240,10 +241,17 @@ jit_dll_t *ffi_load_dll(const char *path)
    dll->handle = handle;
    dll->path   = abs;
 
+   external_dlls++;
+
    jit_dll_t **where;
    for (where = &dlls; *where != NULL; where = &((*where)->next));
 
    return (*where = dll);
+}
+
+bool ffi_external_dll_loaded(void)
+{
+   return external_dlls > 0;
 }
 
 void ffi_unload_dll(jit_dll_t *dll)

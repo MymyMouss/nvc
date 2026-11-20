@@ -847,6 +847,131 @@ automatique à l'ouverture a été écarté: +3 à 6 % de temps sur un petit des
 actif, tampon limité aux derniers changements et à 512 signaux, donc sans
 intérêt pour une simulation longue.
 
+### 8.11 Checkpoints (phase 1)
+
+Réalisation de la phase 1 de `CHECKPOINT-PLAN.md`: retour en arrière par
+instantanés, même design, en mémoire, sans format de fichier.
+
+**Principe.** Un checkpoint est une copie gelée du worker, faite par `fork()`
+entre deux tranches de simulation (`take_checkpoint`, `mcp-worker.c`). La copie
+ne simule jamais: elle attend sur une socket privée dont l'autre bout est un
+descripteur détenu par le superviseur (transmis par `SCM_RIGHTS` avec la
+réponse). Fermer ce descripteur supprime le checkpoint; la mort du superviseur
+les ferme tous. Pour restaurer, le superviseur crée un répertoire et une
+socket de contrôle pour une nouvelle simulation et les envoie à la copie, qui
+fait un second `fork()`: le petit-fils devient le worker de la nouvelle
+simulation (nouveau groupe de processus, nouveau `output.log` copié jusqu'à
+l'offset du checkpoint, état au repos au temps du checkpoint, événement `ready`
+avec son pid). La copie reste gelée et peut être restaurée de nouveau.
+
+**Outils.** `nvc_sim_checkpoint` (16 à la demande par simulation),
+`nvc_sim_checkpoint_delete` (pas dans la liste du plan: sans lui l'erreur
+« trop de checkpoints » n'aurait aucun moyen de libérer une place),
+`nvc_sim_restore` (`checkpoint_id` ou `at`, donne une **nouvelle** simulation,
+compte dans les 4 maximum), `nvc_sim_status` liste les checkpoints,
+`nvc_sim_run` a `auto_checkpoint_s` (30 s par défaut pour un run de fond, 0 pour
+aucun, nombre fractionnaire accepté). Au plus 8 checkpoints automatiques: au
+neuvième on supprime celui dont les voisins sont les plus proches par rapport
+à son âge, en gardant le plus ancien et le plus récent (écarts croissants avec
+l'âge). Les checkpoints manuels ne sont jamais supprimés par ce tri.
+
+**Fichiers du design** (`fileio.c`). Le registre des fichiers ouverts existait
+déjà (table de poignées: `FILE *`, nom, mode). On y ajoute la position
+logique (`ftello`), relevée dans le worker juste avant le `fork()`. Après
+restauration, chaque fichier est rouvert par son chemin, sans création ni
+troncature, `dup2` sur l'ancien descripteur, puis `fseeko` à la position
+sauvée. Deux restaurations d'un même checkpoint lisent donc chacune leur
+fichier à leur propre position. Un fichier qui a disparu fait échouer la
+restauration avec son nom. **Fichiers en écriture:** la simulation restaurée
+réécrit à partir de la position du checkpoint sans tronquer, donc elle écrase
+ce que l'original a écrit après (et inversement si les deux tournent); en
+mode ajout, elle écrit à la fin du fichier, après ce que l'original a pu
+ajouter.
+
+**Ondes.** Un enregistrement FST en cours appartient à l'original: la copie
+l'abandonne sans l'écrire (`wave_dumper_abandon`, `wave.c`), la simulation
+restaurée n'a pas d'enregistrement fichier (le `hint` du résultat le dit) et
+l'enregistrement en mémoire continue.
+
+**Refus.** Pas de checkpoint d'une simulation terminée ou finie (on restaure
+un checkpoint antérieur, ce qui marche après une assertion fatale), ni
+lorsqu'une bibliothèque externe est chargée (plugin VHPI `--load`, ou
+bibliothèque d'un sous-programme `foreign` déjà appelé: `ffi_external_dll_loaded`).
+Un sous-programme `foreign` pas encore appelé n'est pas détecté.
+
+**Fin des processus.** Le worker d'origine meurt avec le superviseur
+(`PR_SET_PDEATHSIG`), mais ce réglage est effacé dans l'enfant d'un `fork()`:
+les copies ne l'ont pas. Elles meurent à la fin de fichier sur leur socket
+privée (les copies sont bloquées en lecture dessus). Un worker restauré a pour
+parent une copie qui peut disparaître avant lui (on ferme l'original, il reste
+utilisable), donc `PDEATHSIG` ne conviendrait pas non plus; un fil de garde
+surveille la fermeture de sa socket de contrôle, ce qui couvre un design qui
+boucle sans jamais attendre (sans cela, mesuré: processus orphelin à 100 % de
+CPU après un `kill -9` du serveur). `SIGCHLD` est ignoré dans le worker
+dès le premier checkpoint pour que les copies soient récoltées sans
+`waitpid`. Un worker restauré n'est pas un enfant du serveur: il est tué par
+son pid, sans `waitpid`. Les copies dont le parent est déjà mort restent
+zombies jusqu'à ce que `init` les récolte (quelques secondes dans le bac à
+sable de test, aucune ressource tenue).
+
+**Mesures de la phase 0** (build debug, interpréteur seul, 4 cœurs; avec
+l'implémentation elle-même plutôt qu'un code jetable).
+
+*Identité.* Pour chaque design: run d'un seul trait jusqu'à la fin contre run
+jusqu'à T, checkpoint, restauration, run jusqu'à la fin. Comparés: valeurs de
+tous les signaux lisibles, temps final, messages (sévérité, temps, delta,
+texte), sortie renvoyée et `output.log`.
+
+| Design | Signaux | Fin | T du checkpoint | Résultat |
+|---|---|---|---|---|
+| `counter` + `tb` (textio sur stdout, erreurs) | 7 | 1 us | 400 ns | identique |
+| SoC `tb_soc` (23 fichiers) | 1133 | 415,865 us | 200 us | identique |
+| `dma_tb` | 30 | 40 us | 17 us | identique |
+| `crc_tx_tb` | 18 | 100 us | 47 us | identique |
+| lecture de `stim.txt` et écriture de `result.txt` par textio | 3 | 3 us | 1 us | identique, fichier `result.txt` compris |
+
+*Coût* (durée de l'appel d'outil vu du client, avec les échanges):
+
+| Design | RSS du worker | Checkpoint | Restauration |
+|---|---|---|---|
+| SoC | 21 Mo | 0,4 à 0,8 ms | 0,7 à 0,9 ms |
+| tableau de 10 millions d'entiers | 51 Mo | 0,3 à 0,6 ms | 0,5 ms |
+| tableau de 100 millions d'entiers | 393 Mo | 0,6 à 0,8 ms (une fois 2,4) | 0,8 à 2,3 ms |
+
+*Mémoire* (`/proc/<pid>/smaps_rollup`, un seul checkpoint). Juste après le
+checkpoint, la copie a 0,1 Mo de mémoire privée sale et partage tout le reste
+(Pss: la copie, l'original et le restauré comptent chacun un tiers). Après avoir
+fait avancer l'original puis le restauré de 900 us sur le tableau de 10 millions
+(touché sur 34,5 Mo): original 34,5 Mo privés, restauré 34,5 Mo privés,
+**copie 34,5 Mo privés** (les anciennes versions des pages). Même chiffre pour
+le tableau de 100 millions (393 Mo de RSS, 34,5 Mo réellement modifiés). Sur le
+SoC: 0,4 Mo privés pour chacun des trois. Le coût d'un checkpoint est donc la
+mémoire modifiée depuis, pas la taille du worker.
+
+*Surcoût des checkpoints automatiques* (tableau de 100 millions, run de fond de
+7,4 s): sans, 7,40 et 7,39 s; un par seconde, 7,96 et 7,40 s; cinq par seconde
+(37 pris, 8 gardés), 7,68 et 7,68 s, soit environ +3,8 %. Au rythme par défaut
+(un toutes les 30 s) c'est négligeable.
+
+*Inventaire pour les phases suivantes* (`test/regress/testlist.txt`, 1519
+entrées dont 1473 avec un fichier source du même nom, 1230 en VHDL et 243 en
+Verilog; commentaires VHDL retirés, un seul fichier par test): déclaration
+`file x : t` 36 tests, appel `file_open` 31 (36 pour l'un ou l'autre),
+`use std.textio` ou `ieee.std_logic_textio` 49, types `access` 29, types
+`protected` 44 (70 pour l'un ou l'autre; 6 mêlent fichiers et access ou
+protégés). Options `vhpi` ou `vpi` dans la liste: 50 tests.
+
+**Limites.** Non testé: macOS, build LLVM (les threads de compilation
+asynchrone sont attendus avant le `fork()` avec `async_barrier()` et désactivés
+dans les copies, mais rien n'a été exécuté avec LLVM), plugins VHPI, Windows
+(le serveur MCP n'y existe pas). Fichiers en écriture: voir plus haut. Les
+checkpoints disparaissent avec la simulation qui les a pris (fermeture,
+expiration après 30 minutes sans appel) et avec le serveur. Au plus 8
+checkpoints automatiques en attente de lecture par le superviseur: le worker en
+cesse la prise si le superviseur n'a rien lu depuis huit (borne pour un run
+sans surveillance); le superviseur lit les événements à chaque appel d'outil
+et toutes les 30 s.
+
 ## Références
 
 - Spécification MCP 2026-07-28, changements:

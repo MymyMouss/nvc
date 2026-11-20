@@ -1352,6 +1352,27 @@ void wave_dumper_close(wave_dumper_t *wd)
    }
 }
 
+void wave_dumper_abandon(wave_dumper_t *wd)
+{
+   if (wd->fst_ctx == NULL)
+      return;
+
+   // Unlike wave_dumper_close this leaves the writer alone: it must not
+   // flush or close a file that another process is still writing.  Clearing
+   // the context makes the end of simulation callback do nothing.
+   rt_model_t *m = wd->model;
+   for (int i = 0; i < wd->dumped.count; i++) {
+      fst_data_t *data = wd->dumped.items[i];
+      if (data->watch != NULL) {
+         watch_free(m, data->watch);
+         data->watch = NULL;
+      }
+   }
+
+   wd->fst_ctx = NULL;
+   wd->model   = NULL;
+}
+
 void wave_clear_globs(void)
 {
    for (int i = 0; i < incl.count; i++)

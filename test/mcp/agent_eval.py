@@ -187,6 +187,15 @@ SCENARIOS = [
          "takes about half a minute of real time to finish. Run it to its "
          "end and tell me the message it prints when it completes. Finish "
          "with exactly one line in this form: RESULT: <message>"),
+    dict(name="rewind", files="longfail", tools=[],
+         check=r"RESULT:\s*15\s*$", must_call="nvc_sim_restore",
+         prompt="src/ holds a counter and a testbench called long_tb that "
+         "takes about half a minute of real time and then fails. Run it to "
+         "the failure. Then tell me the value, in decimal, of the register "
+         "cnt inside the counter instance 15 ns before the time of the "
+         "failure. Running again from the start costs another half minute: "
+         "avoid that if the tools allow. Finish with exactly one line in "
+         "this form: RESULT: <value>"),
     dict(name="wave-find", files="checked", tools=[],
          check=r"RESULT:\s*55\s*ns\s*$", must_call="nvc_wave_start",
          prompt="src/ holds a counter and a testbench called checked_tb. "
@@ -222,6 +231,10 @@ def make_workspace(kind):
         put("checked_tb.vhd", CHECKED_TESTBENCH)
     elif kind == "long":
         put("long_tb.vhd", LONG_TESTBENCH)
+    elif kind == "longfail":
+        put("long_tb.vhd", LONG_TESTBENCH.replace(
+            'report "long run complete" severity note;',
+            'assert false report "late failure" severity failure;'))
     else:
         put("counter_tb.vhd", TESTBENCH)
     return ws

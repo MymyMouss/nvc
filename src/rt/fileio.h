@@ -37,4 +37,10 @@ file_handle_t file_open(const char *name, file_mode_t mode);
 bool file_close(file_handle_t fh);
 FILE *file_stream(file_handle_t fh);
 
+// Support for forked copies of the simulation (see mcp-worker.c).  Save
+// the position of every open file before forking, and in the copy reopen
+// them all.  The latter returns NULL or a message for the caller to free.
+void file_save_positions(void);
+char *file_reopen_all(void);
+
 #endif  // _RT_FILEIO_H

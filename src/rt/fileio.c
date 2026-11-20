@@ -75,6 +75,7 @@ typedef struct {
    file_kind_t  kind;
    file_mode_t  mode;
    uint16_t     generation;
+   off_t        saved_pos;   // Logical position at the last checkpoint
 } file_slot_t;
 
 #define HANDLE_BITS      (sizeof(file_handle_t) * 8)
@@ -206,6 +207,57 @@ file_handle_t file_open(const char *name, file_mode_t mode)
 bool file_close(file_handle_t fh)
 {
    return drop_handle(fh);
+}
+
+void file_save_positions(void)
+{
+   for (unsigned i = 0; i < num_handles; i++) {
+      file_slot_t *slot = &(handles[i]);
+      if (slot->file != NULL && slot->kind == FILE_USER)
+         slot->saved_pos = ftello(slot->file);
+   }
+}
+
+char *file_reopen_all(void)
+{
+   // A forked copy shares the kernel file offset with the original, so
+   // each file is opened again to get a private one.  The same path is
+   // used without creating or truncating it: if it has gone the copy
+   // cannot be made to behave like the original.
+   for (unsigned i = 0; i < num_handles; i++) {
+      file_slot_t *slot = &(handles[i]);
+      if (slot->file == NULL || slot->kind != FILE_USER)
+         continue;
+
+      int flags = 0;
+      switch (slot->mode) {
+      case FILE_READ: flags = O_RDONLY; break;
+      case FILE_WRITE: flags = O_WRONLY; break;
+      case FILE_READ_WRITE: flags = O_RDWR; break;
+      case FILE_APPEND: flags = O_WRONLY | O_APPEND; break;
+      }
+
+      const int fd = open(slot->name, flags);
+      if (fd < 0)
+         return xasprintf("cannot open file %s again, which the design had "
+                          "open at the checkpoint: %s", slot->name,
+                          strerror(errno));
+
+      const int old = fileno(slot->file);
+      if (dup2(fd, old) < 0) {
+         close(fd);
+         return xasprintf("cannot reopen file %s: %s", slot->name,
+                          strerror(errno));
+      }
+      close(fd);
+
+      if (slot->mode != FILE_APPEND
+          && fseeko(slot->file, slot->saved_pos, SEEK_SET) != 0)
+         return xasprintf("cannot seek in file %s: %s", slot->name,
+                          strerror(errno));
+   }
+
+   return NULL;
 }
 
 FILE *file_stream(file_handle_t fh)

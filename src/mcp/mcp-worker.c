@@ -20,13 +20,17 @@
 #include "diag.h"
 #include "hash.h"
 #include "ident.h"
+#include "jit/jit-ffi.h"
 #include "jit/jit.h"
 #include "mcp/mcp.h"
 #include "mcp/mcp-json.h"
+#include "option.h"
+#include "rt/fileio.h"
 #include "rt/model.h"
 #include "rt/printer.h"
 #include "rt/structs.h"
 #include "rt/wave.h"
+#include "thread.h"
 #include "tree.h"
 #include "type.h"
 
@@ -38,13 +42,21 @@
 #include <fnmatch.h>
 #include <inttypes.h>
 #include <poll.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 
 //
 // Worker process for one live simulation
@@ -69,6 +81,7 @@
 #define MAX_WAVE_PATTERNS   64
 #define MAX_REQUEST_BYTES   (1024 * 1024)
 #define MAX_LIST_LIMIT      200
+#define MAX_AUTO_UNSEEN     8
 
 #define CLAMP_INT(v, lo, hi) ((v) < (lo) ? (lo) : (v) > (hi) ? (hi) : (v))
 
@@ -158,6 +171,16 @@ typedef struct {
 
    trace_t      *live;             // In-memory recording, if any
    unsigned      next_trace_id;
+
+   size_t        nsignals;
+   size_t        nregions;
+
+   // Checkpoints: frozen copies of this process, see take_checkpoint
+   uint64_t      auto_us;          // Real time between automatic ones, or 0
+   uint64_t      last_ckpt_us;
+   unsigned      auto_unseen;      // Taken since the supervisor last wrote
+   off_t         ckpt_log_size;    // Size of the output log at the checkpoint
+   char         *dropped_wave;     // File recording not carried into a copy
 } worker_t;
 
 static void files_check(worker_t *w, bool force);
@@ -172,6 +195,7 @@ static void live_stop(worker_t *w);
 static bool live_active(const worker_t *w);
 static void live_free(worker_t *w);
 static void write_live(worker_t *w, json_writer_t *jw);
+static bool take_checkpoint(worker_t *w, bool automatic, text_buf_t *err);
 
 ////////////////////////////////////////////////////////////////////////////////
 // Helpers
@@ -197,13 +221,8 @@ void mcp_format_time(int64_t fs, char *buf, size_t len)
    }
 }
 
-static void ctl_send(worker_t *w, text_buf_t *tb)
+static void ctl_write_all(worker_t *w, const char *data, size_t left)
 {
-   tb_append(tb, '\n');
-
-   const char *data = tb_get(tb);
-   size_t left = tb_len(tb);
-
    while (left > 0) {
       const ssize_t n = write(w->ctl_fd, data, left);
       if (n < 0 && errno == EINTR)
@@ -214,6 +233,47 @@ static void ctl_send(worker_t *w, text_buf_t *tb)
       data += n;
       left -= n;
    }
+}
+
+static void ctl_send(worker_t *w, text_buf_t *tb)
+{
+   tb_append(tb, '\n');
+   ctl_write_all(w, tb_get(tb), tb_len(tb));
+}
+
+// Send a line together with an open descriptor for the supervisor to keep
+static void ctl_send_fd(worker_t *w, text_buf_t *tb, int fd)
+{
+   tb_append(tb, '\n');
+
+   const char *data = tb_get(tb);
+   size_t left = tb_len(tb);
+
+   char cbuf[CMSG_SPACE(sizeof(int))];
+   memset(cbuf, 0, sizeof(cbuf));
+
+   struct iovec iov = { .iov_base = (void *)data, .iov_len = left };
+   struct msghdr msg = {
+      .msg_iov        = &iov,
+      .msg_iovlen     = 1,
+      .msg_control    = cbuf,
+      .msg_controllen = sizeof(cbuf),
+   };
+
+   struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+   cm->cmsg_level = SOL_SOCKET;
+   cm->cmsg_type  = SCM_RIGHTS;
+   cm->cmsg_len   = CMSG_LEN(sizeof(int));
+   memcpy(CMSG_DATA(cm), &fd, sizeof(int));
+
+   ssize_t n;
+   while ((n = sendmsg(w->ctl_fd, &msg, MSG_NOSIGNAL)) < 0 && errno == EINTR)
+      ;
+
+   if (n <= 0)
+      _exit(0);   // The supervisor has gone away
+
+   ctl_write_all(w, data + n, left - n);
 }
 
 // Returns a newline terminated request without the newline, or NULL if
@@ -780,6 +840,26 @@ static void run_step(worker_t *w)
    files_check(w, false);
 
    const uint64_t now_us = get_timestamp_us();
+
+   if (w->auto_us > 0 && now_us - w->last_ckpt_us >= w->auto_us) {
+      // Stop when the supervisor has not collected the earlier ones, so
+      // an unattended run cannot pile up copies of the process
+      if (w->auto_unseen < MAX_AUTO_UNSEEN) {
+         LOCAL_TEXT_BUF err = tb_new();
+         if (take_checkpoint(w, true, err)) {
+            w->auto_unseen++;
+            if (!w->run.active)
+               return;   // This is the restored copy, which starts idle
+         }
+         else {
+            w->auto_us = 0;
+            notef("automatic checkpoints are off: %s", tb_get(err));
+         }
+      }
+
+      w->last_ckpt_us = now_us;
+   }
+
    if (w->run.max_wall_ms > 0
        && (int64_t)((now_us - w->run.start_us) / 1000) >= w->run.max_wall_ms)
       return run_finish(w, "wall_budget");
@@ -836,6 +916,9 @@ static void op_run(worker_t *w, const json_t *req)
    json_as_bool(json_get(req, "progress"), &progress);
    json_as_bool(json_get(req, "background"), &background);
 
+   int64_t auto_ms = 0;
+   json_as_int(json_get(req, "auto_checkpoint_ms"), &auto_ms);
+
    const char *pause = json_string(json_get(req, "pause_on"));
    w->pause_level = DIAG_FATAL + 1;
    if (pause != NULL) {
@@ -861,6 +944,8 @@ static void op_run(worker_t *w, const json_t *req)
    w->run.start_fs = model_now(w->model, NULL);
    w->run.slice = 16;
    w->last_reason = NULL;
+   w->auto_us = background && auto_ms > 0 ? (uint64_t)auto_ms * 1000 : 0;
+   w->last_ckpt_us = w->run.start_us;
 
    if (background) {
       LOCAL_TEXT_BUF tb = tb_new();
@@ -2270,6 +2355,381 @@ static void op_wave_read(worker_t *w, const json_t *req)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// Checkpoints
+//
+// A checkpoint is a frozen copy of this process made with fork().  The
+// copy never runs the simulation: it waits on a private socket whose other
+// end the supervisor holds, and exits when that end is closed, which is
+// how a checkpoint is deleted and how every checkpoint dies with the
+// supervisor.  To restore, the supervisor sends the copy the control
+// socket of a new simulation and the name of its files directory.  The
+// copy forks again and the child carries on as the worker of that new
+// simulation, so the checkpoint itself stays frozen and can be restored
+// any number of times.  Memory is shared copy on write: a checkpoint costs
+// only what the original or a restored simulation changes after it.
+
+static void send_ready(worker_t *w, bool restored)
+{
+   LOCAL_TEXT_BUF tb = tb_new();
+   json_writer_t jw;
+   jw_init(&jw, tb);
+
+   jw_begin_object(&jw);
+   jw_key(&jw, "event");
+   jw_string(&jw, "ready");
+   jw_key(&jw, "signals");
+   jw_int(&jw, w->nsignals);
+   jw_key(&jw, "regions");
+   jw_int(&jw, w->nregions);
+   jw_key(&jw, "root");
+   jw_string(&jw, "/");
+   write_state(w, &jw);
+   write_messages(w, &jw);
+   write_output(w, &jw);
+
+   if (restored) {
+      // The supervisor did not start this process, so it needs the pid
+      jw_key(&jw, "pid");
+      jw_int(&jw, getpid());
+
+      if (w->dropped_wave != NULL) {
+         LOCAL_TEXT_BUF hint = tb_new();
+         tb_printf(hint, "The waveform file %s was being written at the "
+                   "checkpoint and is not continued here: it belongs to the "
+                   "original simulation.  The in-memory recording carries "
+                   "on.  To record to a file here, call nvc_wave_stop and "
+                   "then nvc_wave_start.",
+                   w->dropped_wave);
+         jw_key(&jw, "hint");
+         jw_string(&jw, tb_get(hint));
+      }
+   }
+
+   jw_end_object(&jw);
+   ctl_send(w, tb);
+}
+
+static int64_t resident_mb(void)
+{
+#ifdef __linux__
+   FILE *f = fopen("/proc/self/statm", "r");
+   if (f != NULL) {
+      long pages = 0, resident = 0;
+      const int n = fscanf(f, "%ld %ld", &pages, &resident);
+      fclose(f);
+      if (n == 2)
+         return resident * sysconf(_SC_PAGESIZE) / (1 << 20);
+   }
+#endif
+
+   return 0;
+}
+
+static bool write_all(int fd, const char *data, size_t len)
+{
+   while (len > 0) {
+      const ssize_t n = write(fd, data, len);
+      if (n < 0 && errno == EINTR)
+         continue;
+      else if (n <= 0)
+         return false;
+
+      data += n;
+      len -= n;
+   }
+
+   return true;
+}
+
+// A worker started by the supervisor is killed by the kernel when the
+// supervisor dies (PR_SET_PDEATHSIG).  A restored worker is a child of a
+// checkpoint instead, which must be able to outlive the simulation it was
+// taken in, so that does not apply.  Without help a design that loops
+// without ever waiting would never see the supervisor close the control
+// socket, so this thread watches for that.
+static void *ctl_watchdog(void *arg)
+{
+   struct pollfd pfd = { .fd = (int)(intptr_t)arg };   // Reports hang up only
+
+   for (;;) {
+      if (poll(&pfd, 1, -1) > 0 && (pfd.revents & (POLLHUP | POLLERR)))
+         _exit(0);
+   }
+
+   return NULL;
+}
+
+// Runs in the child of a restore: turn this copy into the worker of a
+// new simulation.  Does not return if that is not possible.
+static void become_restored(worker_t *w, int ctl, char *files_dir)
+{
+   // Its own process group, as for a worker started by the supervisor, so
+   // that stopping it also stops anything it forks
+   setpgid(0, 0);
+
+   w->ctl_fd = ctl;
+   w->inlen  = 0;   // Whatever the old supervisor had written is not ours
+   w->eof    = false;
+
+   pthread_t watchdog;
+   if (pthread_create(&watchdog, NULL, ctl_watchdog,
+                      (void *)(intptr_t)ctl) == 0)
+      pthread_detach(watchdog);
+
+   // The new log starts with the old one as it was at the checkpoint
+   char *log = xasprintf("%s/output.log", files_dir);
+   const int fd = open(log, O_RDWR | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC,
+                       0644);
+   if (fd < 0) {
+      reply_error(w, "Cannot create %s: %s", log, strerror(errno));
+      _exit(1);
+   }
+
+   off_t off = 0;
+   char *buf = xmalloc(65536);
+   while (off < w->ckpt_log_size && w->out_fd >= 0) {
+      const ssize_t n = pread(w->out_fd, buf, MIN(65536, w->ckpt_log_size - off),
+                              off);
+      if (n <= 0 || !write_all(fd, buf, n)) {
+         reply_error(w, "Cannot copy the output log to %s", log);
+         _exit(1);
+      }
+      off += n;
+   }
+   free(buf);
+   free(log);
+
+   fflush(stdout);
+   fflush(stderr);
+   dup2(fd, STDOUT_FILENO);
+   dup2(fd, STDERR_FILENO);
+
+   if (w->out_fd >= 0)
+      close(w->out_fd);
+
+   w->out_fd    = fd;
+   w->out_off   = off;
+   w->log_full  = false;
+   w->files_dir = files_dir;
+
+   char *err = file_reopen_all();
+   if (err != NULL) {
+      reply_error(w, "%s", err);
+      _exit(1);
+   }
+
+   // Idle at the time of the checkpoint, whatever was going on then
+   memset(&w->run, 0, sizeof(w->run));
+   w->last_reason   = NULL;
+   w->last_wall_ms  = 0;
+   w->auto_us       = 0;
+   w->auto_unseen   = 0;
+   w->files_check_us = 0;
+   reset_messages(w);
+   w->msg_base = 0;
+
+   send_ready(w, true);
+   w->dropped_wave = NULL;   // Said once: not for copies of this worker
+}
+
+// Runs in the frozen copy.  Returns true in the child of a restore, which
+// goes on as a worker, and never returns in the copy itself.
+static bool snapshot_serve(worker_t *w, int fd)
+{
+   // The file recording belongs to the original, which goes on writing it
+   if (w->wave != NULL) {
+      wave_dumper_abandon(w->wave);
+      w->dropped_wave = w->wave_file;
+      w->wave = NULL;
+      w->wave_file = NULL;
+   }
+
+   // The compilation threads of the original are not in this copy
+   opt_set_int(OPT_JIT_ASYNC, 0);
+
+   char buf[4096];
+   size_t len = 0;
+   int newfd = -1;
+
+   for (;;) {
+      char cbuf[CMSG_SPACE(sizeof(int))];
+      struct iovec iov = { .iov_base = buf + len,
+                           .iov_len  = sizeof(buf) - len - 1 };
+      struct msghdr msg = {
+         .msg_iov        = &iov,
+         .msg_iovlen     = 1,
+         .msg_control    = cbuf,
+         .msg_controllen = sizeof(cbuf),
+      };
+
+      const ssize_t n = recvmsg(fd, &msg, 0);
+      if (n < 0 && errno == EINTR)
+         continue;
+      else if (n <= 0)
+         _exit(0);   // The supervisor dropped this checkpoint or has gone
+
+      for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg); cm != NULL;
+           cm = CMSG_NXTHDR(&msg, cm)) {
+         if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS) {
+            if (newfd >= 0)
+               close(newfd);
+            memcpy(&newfd, CMSG_DATA(cm), sizeof(int));
+         }
+      }
+
+      len += n;
+
+      char *nl = memchr(buf, '\n', len);
+      if (nl == NULL) {
+         if (len >= sizeof(buf) - 1)
+            _exit(1);
+         continue;
+      }
+
+      *nl = '\0';
+
+      mem_pool_t *mp = pool_new();
+      const char *perr;
+      json_t *req = json_parse(mp, buf, nl - buf, NULL, &perr);
+      const char *op = json_string(json_get(req, "op"));
+      const char *dir = json_string(json_get(req, "files_dir"));
+
+      if (op != NULL && !strcmp(op, "restore") && dir != NULL && newfd >= 0) {
+         char *files_dir = xstrdup(dir);
+         const pid_t pid = fork();
+         if (pid == 0) {
+            close(fd);
+            pool_free(mp);
+            become_restored(w, newfd, files_dir);
+            return true;
+         }
+
+         // On failure the new socket closes and the supervisor finds out
+         free(files_dir);
+         close(newfd);
+         newfd = -1;
+      }
+
+      pool_free(mp);
+
+      memmove(buf, nl + 1, len - (nl + 1 - buf));
+      len -= nl + 1 - buf;
+   }
+}
+
+// Make a checkpoint and hand the supervisor the descriptor that keeps it
+// alive.  Returns false with a reason in err if one cannot be made.  In
+// the restored copy it returns true with the simulation idle.
+static bool take_checkpoint(worker_t *w, bool automatic, text_buf_t *err)
+{
+   if (ffi_external_dll_loaded()) {
+      tb_cat(err, "a VHPI plugin or foreign library is loaded: it may hold "
+             "files, sockets or state outside the simulation that a copy of "
+             "the process would share with the original");
+      return false;
+   }
+   else if (w->ended || model_is_terminated(w->model)) {
+      tb_cat(err, "the simulation has ended, so a copy of it could not run. "
+             "Restore an earlier checkpoint with nvc_sim_restore");
+      return false;
+   }
+
+   const uint64_t start_us = get_timestamp_us();
+
+   int sp[2];
+   if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) < 0) {
+      tb_printf(err, "cannot create a socket: %s", strerror(errno));
+      return false;
+   }
+
+   fcntl(sp[0], F_SETFD, FD_CLOEXEC);
+   fcntl(sp[1], F_SETFD, FD_CLOEXEC);
+
+   // Nothing may wait in a stdio buffer when the copy is made, or it
+   // would be written twice.  The position of every open file is noted
+   // now because the copy shares the file offset with this process, which
+   // goes on reading and writing.  No compilation may be under way.
+   fflush(NULL);
+   file_save_positions();
+   async_barrier();
+
+   struct stat st;
+   w->ckpt_log_size = w->out_fd >= 0 && fstat(w->out_fd, &st) == 0
+      ? st.st_size : 0;
+
+   // Nobody waits for the copies, so have them reaped when they exit
+   signal(SIGCHLD, SIG_IGN);
+
+   const pid_t pid = fork();
+   if (pid < 0) {
+      tb_printf(err, "cannot fork the simulation process: %s", strerror(errno));
+      close(sp[0]);
+      close(sp[1]);
+      return false;
+   }
+   else if (pid == 0) {
+      // The copy must not hold the control socket: the supervisor has to
+      // see the original go away.  Nor may it hold the far end of its own
+      // socket, or it would never see that closed.
+      close(w->ctl_fd);
+      close(sp[1]);
+      if (snapshot_serve(w, sp[0]))
+         return true;
+
+      _exit(0);
+   }
+
+   close(sp[0]);
+
+   LOCAL_TEXT_BUF tb = tb_new();
+   json_writer_t jw;
+   jw_init(&jw, tb);
+
+   const int64_t wall_ms = (get_timestamp_us() - start_us) / 1000;
+
+   if (automatic) {
+      jw_begin_object(&jw);
+      jw_key(&jw, "event");
+      jw_string(&jw, "checkpoint");
+   }
+   else
+      begin_reply(&jw, true);
+
+   jw_key(&jw, "has_fd");
+   jw_bool(&jw, true);
+
+   if (!automatic) {
+      jw_key(&jw, "result");
+      jw_begin_object(&jw);
+   }
+
+   jw_key(&jw, "pid");
+   jw_int(&jw, pid);
+   jw_key(&jw, "wall_ms");
+   jw_int(&jw, wall_ms);
+   jw_key(&jw, "memory_mb");
+   jw_int(&jw, resident_mb());
+   write_state(w, &jw);
+
+   if (!automatic)
+      jw_end_object(&jw);
+   jw_end_object(&jw);
+
+   ctl_send_fd(w, tb, sp[1]);
+   close(sp[1]);
+
+   w->last_ckpt_us = get_timestamp_us();
+   return true;
+}
+
+static void op_checkpoint(worker_t *w)
+{
+   LOCAL_TEXT_BUF err = tb_new();
+   if (!take_checkpoint(w, false, err))
+      reply_error(w, "A checkpoint cannot be taken: %s", tb_get(err));
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // Entry point
 
 int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
@@ -2316,30 +2776,11 @@ int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
          nregions++;
    }
 
+   w.nsignals = nsignals;
+   w.nregions = nregions;
+
    capture_output(&w);
-
-   {
-      LOCAL_TEXT_BUF tb = tb_new();
-      json_writer_t jw;
-      jw_init(&jw, tb);
-
-      jw_begin_object(&jw);
-      jw_key(&jw, "event");
-      jw_string(&jw, "ready");
-      jw_key(&jw, "signals");
-      jw_int(&jw, nsignals);
-      jw_key(&jw, "regions");
-      jw_int(&jw, nregions);
-      jw_key(&jw, "root");
-      jw_string(&jw, "/");
-      write_state(&w, &jw);
-      write_messages(&w, &jw);
-      write_output(&w, &jw);
-      jw_end_object(&jw);
-
-      ctl_send(&w, tb);
-   }
-
+   send_ready(&w, false);
    reset_messages(&w);
 
    for (;;) {
@@ -2352,6 +2793,8 @@ int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
             run_step(&w);
          continue;
       }
+
+      w.auto_unseen = 0;   // Everything sent so far has been read
 
       mem_pool_t *mp = pool_new();
       const char *perr;
@@ -2394,6 +2837,8 @@ int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
          op_wave_start(&w, req);
       else if (!strcmp(op, "wave_stop"))
          op_wave_stop(&w);
+      else if (!strcmp(op, "checkpoint"))
+         op_checkpoint(&w);
       else if (busy)
          reply_error(&w, "The simulation is running a background run, which "
                      "only allows reading: wait for it with nvc_sim_wait or "
