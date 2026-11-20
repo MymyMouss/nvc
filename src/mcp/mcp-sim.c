@@ -1978,59 +1978,6 @@ bool mcp_sim_wave_read(mcp_call_t *call, const json_t *args,
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// nvc_signal_drivers
-
-static const char drivers_input[] = MCP_JSON({
-   "type": "object",
-   "properties": {
-      "sim_id": { "type": "string", "minLength": 32, "maxLength": 32 },
-      "path": {
-         "type": "string",
-         "minLength": 1,
-         "maxLength": 1024,
-         "description": "Full path of the signal, for example /dut/ready_out."
-      }
-   },
-   "required": ["sim_id", "path"],
-   "additionalProperties": false
-});
-
-static const char drivers_output[] = MCP_JSON({
-   "type": "object",
-   "properties": {
-      "path": { "type": "string" },
-      "drivers": { "type": "array", "items": { "type": "object" } },
-      "waiting_processes": { "type": "array", "items": { "type": "object" } },
-      "connected_to": { "type": "array", "items": { "type": "string" } },
-      "hint": { "type": "string" }
-   },
-   "required": ["path", "drivers", "waiting_processes", "connected_to"]
-});
-
-static const char drivers_example[] = MCP_JSON({
-   "sim_id": "0123456789abcdef0123456789abcdef", "path": "/dut/ready_out"
-});
-
-static bool tool_signal_drivers(mcp_call_t *call, const json_t *args,
-                                json_writer_t *out)
-{
-   const char *sim_id = json_string(json_get(args, "sim_id"));
-   const char *path = json_string(json_get(args, "path"));
-
-   LOCAL_TEXT_BUF req = tb_new();
-   json_writer_t w;
-   jw_init(&w, req);
-   jw_begin_object(&w);
-   jw_key(&w, "op");
-   jw_string(&w, "drivers");
-   jw_key(&w, "path");
-   jw_string(&w, path);
-   jw_end_object(&w);
-
-   return sim_op(call, sim_id, req, 10000, out);
-}
-
-////////////////////////////////////////////////////////////////////////////////
 // Tool table
 
 static const mcp_tool_t sim_tools[] = {
@@ -2256,28 +2203,6 @@ static const mcp_tool_t sim_tools[] = {
       .destructive   = false,
       .idempotent    = true,
       .fn            = tool_signal_get,
-   },
-   {
-      .name          = "nvc_signal_drivers",
-      .title         = "Find what drives a signal",
-      .description   =
-         "Say what writes a signal, to follow a wrong value back to its "
-         "cause: drivers lists the processes that assign it, each with its "
-         "name and the file and line of the process in the source (read "
-         "that code to see what it computes), and the signal a port "
-         "connection takes it from.  waiting_processes are the processes "
-         "currently waiting for the signal to change (a process also reads "
-         "signals outside its sensitivity list, so read its code too) and "
-         "connected_to the signals it feeds through ports.  Start from the "
-         "signal that is wrong, then repeat on the signals its driver "
-         "reads.",
-      .input_schema  = drivers_input,
-      .output_schema = drivers_output,
-      .example       = drivers_example,
-      .read_only     = true,
-      .destructive   = false,
-      .idempotent    = true,
-      .fn            = tool_signal_drivers,
    },
    {
       .name          = "nvc_signal_set",

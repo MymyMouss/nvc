@@ -691,7 +691,7 @@ static bool tool_wave_get(mcp_call_t *call, const json_t *args,
 // Series of changes, from a file or from a live simulation
 //
 // The tools below answer questions about time (when is a condition true,
-// how long between two events, what does each clock cycle look like).  The
+// what does each clock cycle look like).  The
 // work is done here rather than left to the caller, who would have to
 // read an ordered list of changes and get the order and the delays right.
 // A series is the value of one signal at the start of a window and every
@@ -1416,213 +1416,6 @@ static bool tool_wave_find(mcp_call_t *call, const json_t *args,
    return true;
 }
 
-static const char measure_input[] = MCP_JSON({
-   "type": "object",
-   "properties": {
-      "sim_id": { "type": "string", "minLength": 32, "maxLength": 32, "description": "Use the in-memory recording of this live simulation. Give sim_id or file." },
-      "file": { "type": "string", "minLength": 1, "maxLength": 1024, "description": "Use a finished waveform file. Give sim_id or file." },
-      "event_a": {
-         "type": "string",
-         "minLength": 1,
-         "maxLength": 512,
-         "description": "The first event: a condition as in nvc_wave_find, for example rose(/dut/start). An event happens each time the condition becomes true."
-      },
-      "event_b": {
-         "type": "string",
-         "minLength": 1,
-         "maxLength": 512,
-         "description": "The second event, for example /dut/done = '1'."
-      },
-      "clock": { "type": "string", "maxLength": 512, "description": "Count delays in cycles of this clock and test the conditions as nvc_wave_find does." },
-      "edge": { "type": "string", "enum": ["rising", "falling"] },
-      "from": { "type": "string", "maxLength": 32 },
-      "until": { "type": "string", "maxLength": 32 },
-      "max_pairs": { "type": "integer", "minimum": 1, "maximum": 100 }
-   },
-   "required": ["event_a", "event_b"],
-   "additionalProperties": false
-});
-
-static const char measure_output[] = MCP_JSON({
-   "type": "object",
-   "properties": {
-      "summary": { "type": "string" },
-      "first_event": { "type": "string", "enum": ["a", "b", "none"] },
-      "a_events": { "type": "integer" },
-      "b_events": { "type": "integer" },
-      "pairs_total": { "type": "integer" },
-      "unmatched_a": { "type": "integer" },
-      "delay_fs": { "type": "object" },
-      "delay_cycles": { "type": "object" },
-      "pairs": { "type": "array", "items": { "type": "object" } },
-      "truncated": { "type": "boolean" }
-   },
-   "required": ["summary", "first_event", "a_events", "b_events",
-                "pairs_total", "unmatched_a", "pairs", "truncated"]
-});
-
-static const char measure_example[] = MCP_JSON({
-   "file": ".nvc-mcp/0123456789abcdef0123456789abcdef/wave-1.fst",
-   "event_a": "rose(/dut/start)", "event_b": "/dut/done = '1'",
-   "clock": "/clk"
-});
-
-static bool tool_wave_measure(mcp_call_t *call, const json_t *args,
-                              json_writer_t *out)
-{
-   const char *texts[2] = { json_string(json_get(args, "event_a")),
-                            json_string(json_get(args, "event_b")) };
-   int64_t max_pairs = 20;
-   json_as_int(json_get(args, "max_pairs"), &max_pairs);
-
-   query_t q;
-   if (!query_open(call, args, texts, 2, &q))
-      return false;
-
-   runs_t a = {}, b = {};
-   eval_runs(&q.set, q.cond[0], q.refmap[0], q.clk, q.falling, &a);
-   eval_runs(&q.set, q.cond[1], q.refmap[1], q.clk, q.falling, &b);
-
-   const bool clocked = q.clk >= 0;
-
-   // Each event of A with the first event of B at or after it
-   size_t pairs = 0, unmatched = 0, shown = 0, j = 0;
-   uint64_t min_fs = UINT64_MAX, max_fs = 0, sum_fs = 0;
-   int64_t min_cy = INT64_MAX, max_cy = 0, sum_cy = 0;
-
-   LOCAL_TEXT_BUF pairs_json = tb_new();
-   json_writer_t pj;
-   jw_init(&pj, pairs_json);
-   jw_begin_array(&pj);
-
-   char first_pair[200] = "";
-
-   for (size_t i = 0; i < a.n; i++) {
-      while (j < b.n && b.r[j].start < a.r[i].start)
-         j++;
-
-      if (j == b.n) {
-         unmatched++;
-         continue;
-      }
-
-      const uint64_t dfs = b.r[j].start - a.r[i].start;
-      const int64_t dcy = (int64_t)b.r[j].first_index
-         - (int64_t)a.r[i].first_index;
-
-      pairs++;
-      min_fs = MIN(min_fs, dfs);
-      max_fs = MAX(max_fs, dfs);
-      sum_fs += dfs;
-      min_cy = MIN(min_cy, dcy);
-      max_cy = MAX(max_cy, dcy);
-      sum_cy += dcy;
-
-      if (shown < (size_t)max_pairs) {
-         jw_begin_object(&pj);
-         jw_key(&pj, "a_fs");
-         jw_int(&pj, a.r[i].start);
-         jw_key(&pj, "b_fs");
-         jw_int(&pj, b.r[j].start);
-         jw_key(&pj, "delay_fs");
-         jw_int(&pj, dfs);
-         if (clocked) {
-            jw_key(&pj, "delay_cycles");
-            jw_int(&pj, dcy);
-         }
-         jw_end_object(&pj);
-         shown++;
-      }
-
-      if (pairs == 1) {
-         char ta[48], tb2[48], td[48];
-         mcp_format_time(a.r[i].start, ta, sizeof(ta));
-         mcp_format_time(b.r[j].start, tb2, sizeof(tb2));
-         mcp_format_time(dfs, td, sizeof(td));
-         if (clocked)
-            snprintf(first_pair, sizeof(first_pair),
-                     "the first B comes %"PRIi64" cycles (%s) after the "
-                     "first A at %s, at %s", dcy, td, ta, tb2);
-         else
-            snprintf(first_pair, sizeof(first_pair),
-                     "the first B comes %s after the first A at %s, at %s",
-                     td, ta, tb2);
-      }
-   }
-
-   jw_end_array(&pj);
-
-   const char *first = a.n == 0 && b.n == 0 ? "none"
-      : b.n == 0 || (a.n > 0 && a.r[0].start <= b.r[0].start) ? "a" : "b";
-
-   LOCAL_TEXT_BUF summary = tb_new();
-   if (a.n == 0 && b.n == 0)
-      tb_cat(summary, "Neither event happened in the window");
-   else if (a.n == 0)
-      tb_printf(summary, "A never happened; B happened %zu times", b.n);
-   else if (b.n == 0)
-      tb_printf(summary, "A happened %zu times and B never did", a.n);
-   else {
-      tb_printf(summary, "A happened %zu times and B %zu times", a.n, b.n);
-      if (pairs > 0)
-         tb_printf(summary, "; %s", first_pair);
-      if (unmatched > 0)
-         tb_printf(summary, "; %zu A events had no B after them", unmatched);
-      if (!strcmp(first, "b"))
-         tb_cat(summary, "; B happened before the first A");
-   }
-
-   jw_begin_object(out);
-   jw_key(out, "summary");
-   jw_string(out, tb_get(summary));
-   jw_key(out, "first_event");
-   jw_string(out, first);
-   jw_key(out, "a_events");
-   jw_int(out, a.n);
-   jw_key(out, "b_events");
-   jw_int(out, b.n);
-   jw_key(out, "pairs_total");
-   jw_int(out, pairs);
-   jw_key(out, "unmatched_a");
-   jw_int(out, unmatched);
-
-   if (pairs > 0) {
-      jw_key(out, "delay_fs");
-      jw_begin_object(out);
-      jw_key(out, "min");
-      jw_int(out, min_fs);
-      jw_key(out, "max");
-      jw_int(out, max_fs);
-      jw_key(out, "mean");
-      jw_int(out, sum_fs / pairs);
-      jw_end_object(out);
-
-      if (clocked) {
-         jw_key(out, "delay_cycles");
-         jw_begin_object(out);
-         jw_key(out, "min");
-         jw_int(out, min_cy);
-         jw_key(out, "max");
-         jw_int(out, max_cy);
-         jw_key(out, "mean");
-         jw_int(out, sum_cy / (int64_t)pairs);
-         jw_end_object(out);
-      }
-   }
-
-   jw_key(out, "pairs");
-   jw_raw(out, tb_get(pairs_json));
-   jw_key(out, "truncated");
-   jw_bool(out, pairs > shown);
-   jw_end_object(out);
-
-   free(a.r);
-   free(b.r);
-   query_free(&q);
-   return true;
-}
-
-
 ////////////////////////////////////////////////////////////////////////////////
 // nvc_wave_table: one row per clock cycle
 
@@ -2219,27 +2012,6 @@ static const mcp_tool_t file_tools[] = {
       .fn            = tool_wave_find,
    },
    {
-      .name          = "nvc_wave_measure",
-      .title         = "Measure the time between two events",
-      .description   =
-         "Say how events relate in time, which is easy to get wrong when "
-         "reading changes by hand: which of two events comes first, the "
-         "delay from each A to the next B in time and in clock cycles "
-         "(minimum, maximum, mean), and A events that no B follows.  An "
-         "event is each time a condition becomes true (conditions are "
-         "written as for nvc_wave_find).  Use it for latency, handshakes "
-         "and cause-and-effect questions.  summary states the result in "
-         "words.  Give sim_id for a live recording or file for a finished "
-         "waveform file.",
-      .input_schema  = measure_input,
-      .output_schema = measure_output,
-      .example       = measure_example,
-      .read_only     = true,
-      .destructive   = false,
-      .idempotent    = true,
-      .fn            = tool_wave_measure,
-   },
-   {
       .name          = "nvc_wave_table",
       .title         = "Show signals cycle by cycle",
       .description   =
@@ -2250,8 +2022,8 @@ static const mcp_tool_t file_tools[] = {
          "reports) placed on the cycle where they happened for a live "
          "simulation.  Use around with the time of a failure to see the "
          "cycles before and after it.  This is the easiest way to read "
-         "what the design was doing; use nvc_wave_find or nvc_wave_measure "
-         "when you need a time or a delay rather than a picture.  Give "
+         "what the design was doing; use nvc_wave_find when you need a "
+         "time rather than a picture.  Give "
          "sim_id for a live recording or file for a finished waveform "
          "file.",
       .input_schema  = table_input,

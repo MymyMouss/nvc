@@ -838,6 +838,15 @@ Constats:
   lui fallait. Un enregistrement en mémoire de tous les signaux, démarré
   d'office à l'ouverture, éviterait ces relances.
 
+### 8.10 Tri après mesure
+
+`nvc_wave_measure` et `nvc_signal_drivers` ont été retirés: aucun appel en 30
+essais sur le banc SoC et aucun gain mesuré (le code reste dans l'historique
+git). `nvc_wave_find` et `nvc_wave_table` sont conservés. L'enregistrement
+automatique à l'ouverture a été écarté: +3 à 6 % de temps sur un petit design
+actif, tampon limité aux derniers changements et à 512 signaux, donc sans
+intérêt pour une simulation longue.
+
 ## Références
 
 - Spécification MCP 2026-07-28, changements:

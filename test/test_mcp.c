@@ -2735,22 +2735,6 @@ START_TEST(test_sim_queries)
                            "\"when\":\"/dut/cnt = 5\",\"at_least_cycles\":2"));
    ck_assert_ptr_nonnull(strstr(e, "clock"));
 
-   // From cnt = 3 to cnt = 5 is two cycles
-   sc = structured(sim_tool(&f, "nvc_wave_measure", id,
-                            "\"event_a\":\"/dut/cnt = 3\","
-                            "\"event_b\":\"/dut/cnt = 5\",\"clock\":\"/clk\""));
-   ck_assert_str_eq(str_field(sc, "first_event"), "a");
-   ck_assert_int_ge(int_field(sc, "pairs_total"), 1);
-   ck_assert_int_eq(int_field(json_get(sc, "delay_cycles"), "min"), 2);
-   ck_assert_int_eq(int_field(json_get(sc, "delay_fs"), "min"), 20000000);
-   ck_assert_ptr_nonnull(strstr(str_field(sc, "summary"), "2 cycles"));
-
-   // The other way round: five comes before 3 only after the wrap
-   sc = structured(sim_tool(&f, "nvc_wave_measure", id,
-                            "\"event_a\":\"/dut/cnt = 5\","
-                            "\"event_b\":\"/dut/cnt = 3\",\"clock\":\"/clk\""));
-   ck_assert_int_eq(int_field(json_get(sc, "delay_cycles"), "min"), 14);
-
    // One row per clock edge, around a time, with the assertion on its cycle
    sc = structured(sim_tool(&f, "nvc_wave_table", id,
                             "\"clock\":\"/clk\",\"signals\":[\"/dut/cnt\"],"
@@ -2764,20 +2748,6 @@ START_TEST(test_sim_queries)
    ck_assert_str_eq(json_string(json_at(json_at(rows, 2), 2)), "0x5");
    ck_assert_ptr_nonnull(strstr(json_string(json_at(json_at(rows, 2), 3)),
                                 "q reached five"));
-
-   // What drives a signal, and what waits for it
-   sc = structured(sim_tool(&f, "nvc_signal_drivers", id,
-                            "\"path\":\"/dut/cnt\""));
-   ck_assert_int_eq(json_get(sc, "drivers")->array.count, 1);
-   const json_t *drv = json_at(json_get(sc, "drivers"), 0);
-   ck_assert_str_eq(str_field(drv, "kind"), "process");
-   ck_assert_int_gt(int_field(drv, "line"), 0);
-   ck_assert_ptr_nonnull(strstr(str_field(drv, "file"), "counter.vhd"));
-   sc = structured(sim_tool(&f, "nvc_signal_drivers", id, "\"path\":\"/clk\""));
-   ck_assert_int_ge(json_get(sc, "waiting_processes")->array.count, 1);
-   e = tool_error(sim_tool(&f, "nvc_signal_drivers", id,
-                           "\"path\":\"/dut/nope\""));
-   ck_assert_ptr_nonnull(strstr(e, "was not found"));
 
    // A finished file answers the same questions
    sc = structured(sim_tool(&f, "nvc_wave_stop", id, ""));

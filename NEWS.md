@@ -18,10 +18,8 @@
   also keeps the latest changes in memory so they can be read while a
   simulation runs.  Questions about time are answered by the tools rather
   than left to the caller: `nvc_wave_find` tests a VHDL-like condition per
-  clock cycle, `nvc_wave_measure` gives delays between two events,
-  `nvc_wave_table` shows one row per clock edge with the design messages
-  on their cycle, and `nvc_signal_drivers` names the processes that
-  write a signal.  Each call that
+  clock cycle and `nvc_wave_table` shows one row per clock edge with the
+  design messages on their cycle.  Each call that
   loads a design runs in an isolated worker process.
 - Fixed a crash when attaching a waveform dumper to signals whose watch had
   been freed.
