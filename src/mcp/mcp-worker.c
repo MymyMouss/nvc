@@ -81,7 +81,7 @@
 #define MAX_WAVE_PATTERNS   64
 #define MAX_REQUEST_BYTES   (1024 * 1024)
 #define MAX_LIST_LIMIT      200
-#define MAX_AUTO_UNSEEN     8
+#define MAX_AUTO_UNSEEN     16
 
 #define CLAMP_INT(v, lo, hi) ((v) < (lo) ? (lo) : (v) > (hi) ? (hi) : (v))
 
@@ -177,6 +177,7 @@ typedef struct {
 
    // Checkpoints: frozen copies of this process, see take_checkpoint
    uint64_t      auto_us;          // Real time between automatic ones, or 0
+   uint64_t      auto_next_us;     // Current interval, which grows to auto_us
    uint64_t      last_ckpt_us;
    unsigned      auto_unseen;      // Taken since the supervisor last wrote
    off_t         ckpt_log_size;    // Size of the output log at the checkpoint
@@ -841,7 +842,7 @@ static void run_step(worker_t *w)
 
    const uint64_t now_us = get_timestamp_us();
 
-   if (w->auto_us > 0 && now_us - w->last_ckpt_us >= w->auto_us) {
+   if (w->auto_us > 0 && now_us - w->last_ckpt_us >= w->auto_next_us) {
       // Stop when the supervisor has not collected the earlier ones, so
       // an unattended run cannot pile up copies of the process
       if (w->auto_unseen < MAX_AUTO_UNSEEN) {
@@ -857,7 +858,10 @@ static void run_step(worker_t *w)
          }
       }
 
+      // The first comes after a second and the interval doubles up to the
+      // one asked for, so that a run shorter than it still has some
       w->last_ckpt_us = now_us;
+      w->auto_next_us = MIN(w->auto_next_us * 2, w->auto_us);
    }
 
    if (w->run.max_wall_ms > 0
@@ -946,6 +950,7 @@ static void op_run(worker_t *w, const json_t *req)
    w->last_reason = NULL;
    w->auto_us = background && auto_ms > 0 ? (uint64_t)auto_ms * 1000 : 0;
    w->last_ckpt_us = w->run.start_us;
+   w->auto_next_us = MIN(w->auto_us, 1000000);
 
    if (background) {
       LOCAL_TEXT_BUF tb = tb_new();
@@ -2806,6 +2811,8 @@ int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
 
       if (op == NULL)
          reply_error(&w, "malformed request");
+      else if (!strcmp(op, "seen"))
+         ;   // Only says that the checkpoints sent were collected
       else if (!strcmp(op, "close")) {
          op_close(&w);
          pool_free(mp);

@@ -972,6 +972,15 @@ cesse la prise si le superviseur n'a rien lu depuis huit (borne pour un run
 sans surveillance); le superviseur lit les événements à chaque appel d'outil
 et toutes les 30 s.
 
+Contrôle après livraison (test avec un vrai agent, scénario `rewind` de
+`test/mcp/agent_eval.py`): un run de 23 s n'avait aucun checkpoint avec un
+intervalle fixe de 30 s, et un run laissé sans surveillance cessait d'en
+prendre après 8. Corrigé: le premier checkpoint arrive après 1 s et
+l'intervalle double jusqu'à `auto_checkpoint_s`; le superviseur accuse
+réception des checkpoints à chaque réveil (toutes les 30 s), ce qui relance
+le compteur du worker. Après correction l'agent restaure à 128 ms et lit la
+valeur demandée sans repartir de zéro.
+
 ## Références
 
 - Spécification MCP 2026-07-28, changements:

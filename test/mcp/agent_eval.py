@@ -190,8 +190,10 @@ SCENARIOS = [
     dict(name="rewind", files="longfail", tools=[],
          check=r"RESULT:\s*15\s*$", must_call="nvc_sim_restore",
          prompt="src/ holds a counter and a testbench called long_tb that "
-         "takes about half a minute of real time and then fails. Run it to "
-         "the failure. Then tell me the value, in decimal, of the register "
+         "takes about half a minute of real time and then fails. First run "
+         "it to the failure just as it is, with default settings and "
+         "without recording any signal: I only know afterwards what I want "
+         "to look at. Then tell me the value, in decimal, of the register "
          "cnt inside the counter instance 15 ns before the time of the "
          "failure. Running again from the start costs another half minute: "
          "avoid that if the tools allow. Finish with exactly one line in "

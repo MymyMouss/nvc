@@ -537,6 +537,8 @@ static void sim_drain_events(sim_t *s)
    if (s->fd < 0)
       return;
 
+   bool taken = false;
+
    while (s->len < MAX_STARTUP_TEXT) {
       struct pollfd pfd = { .fd = s->fd, .events = POLLIN };
       if (poll(&pfd, 1, 0) <= 0 || !fill_buffer(s))
@@ -552,6 +554,15 @@ static void sim_drain_events(sim_t *s)
       sim_take_event(s, msg);
       pool_free(mp);
       free(line);
+      taken = true;
+   }
+
+   // Tell the worker its checkpoints were collected: it stops taking
+   // automatic ones when too many are waiting, and a long unattended run
+   // must keep getting them
+   if (taken) {
+      static const char seen[] = "{\"op\":\"seen\"}\n";
+      send_all(s->fd, seen, strlen(seen));
    }
 }
 
@@ -1149,7 +1160,7 @@ static const char run_input[] = MCP_JSON({
       },
       "background": {
          "type": "boolean",
-         "description": "Start the run and return at once instead of waiting for it. The simulation keeps running while you do other things; follow it with nvc_sim_wait or nvc_sim_status and end it with nvc_sim_stop. Use it for anything that may take more than a few seconds. While it runs only reading tools work (nvc_signal_get, nvc_design_*, nvc_wave_get). Without max_wall_ms a background run has no real time limit and is never expired, even when it takes days. nvc_sim_status shows whether it is still alive (see responsive and worker.cpu_seconds). A background run saves a checkpoint every 30 seconds unless auto_checkpoint_s says otherwise."
+         "description": "Start the run and return at once instead of waiting for it. The simulation keeps running while you do other things; follow it with nvc_sim_wait or nvc_sim_status and end it with nvc_sim_stop. Use it for anything that may take more than a few seconds. While it runs only reading tools work (nvc_signal_get, nvc_design_*, nvc_wave_get). Without max_wall_ms a background run has no real time limit and is never expired, even when it takes days. nvc_sim_status shows whether it is still alive (see responsive and worker.cpu_seconds). A background run saves checkpoints by itself (after 1 second, then at growing intervals up to auto_checkpoint_s), so nvc_sim_restore can go back without running again."
       },
       "pause_on": {
          "type": "string",
