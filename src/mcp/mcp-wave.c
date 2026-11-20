@@ -1907,7 +1907,9 @@ static bool tool_wave_table(mcp_call_t *call, const json_t *args,
              "first, counted from the start of the window; repeat is how "
              "many consecutive edges had these same values). Values are "
              "those just before the edge, which is what the design "
-             "registers see.");
+             "registers see: a register written at an edge shows its new "
+             "value in the row of the next edge, so the time it changed is "
+             "one clock period before that row.");
 
    jw_key(out, "rows");
    jw_begin_array(out);

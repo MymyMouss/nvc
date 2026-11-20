@@ -757,6 +757,42 @@ conditions, repliement des cycles), pas par ce banc. Pour mesurer un gain il
 faudrait des bugs plus durs (traces longues, nombreux signaux, causes à
 plusieurs étapes), un modèle moyen en plus du petit, et bien plus d'essais.
 
+### 8.8 Grand banc (19 bugs, 5 designs de plus, avec et sans sources)
+
+Ajouts: un moteur DMA (le bug n'apparaît que quand la fin du transfert tombe
+sur une fin de rafale), un arbitre à tourniquet (famine après quelques
+dizaines de cycles), un récepteur UART (drapeau d'erreur jamais effacé, ou
+parité sur 7 bits), un émetteur série lent avec CRC (CRC non remis à zéro,
+ou mauvais polynôme, 100 horloges par bit), un compteur de ticks (retenue
+perdue après 164 µs). Trois variantes silencieuses (le testbench ne vérifie
+rien).
+
+| Série | Réussites | Coût |
+|---|---|---|
+| petit modèle, sans sources, sans les outils temporels | 35/36 | 0,30 $ |
+| petit modèle, sans sources, tous les outils | 34/36 | 0,29 $ |
+| petit modèle, avec sources, tous les outils | 34/36 | 0,21 $ |
+| modèle moyen, sans sources, sans les outils temporels | 18/18 | 1,03 $ |
+| modèle moyen, sans sources, tous les outils | 18/18 | 1,10 $ |
+| modèle moyen, avec sources, tous les outils | 14/18 | 0,94 $ |
+
+Lecture: **pas de gain mesurable des outils temporels**; les deux modèles
+réussissent presque tout sans eux. Les échecs se classent en trois familles:
+(1) un écart d'une période d'horloge (163 825 ns au lieu de 163 815 ns): la
+table montre la valeur avant le front, donc un registre écrit à un front
+apparaît sur la ligne du front suivant; la description de l'outil le dit
+désormais; (2) la confusion entre une erreur légitime et l'erreur
+« jamais effacée » (`rx_noclear`: le petit modèle répond l'instant de la
+première erreur de parité, qui est correcte); (3) un symptôme tardif donné
+pour la cause (`dma_burst_end` avec sources: le petit modèle répond
+l'instant où l'indice dépasse la fin, 2795 ns, au lieu de l'instant où la fin
+de rafale est mal traitée, 875 ns). Avec les sources, le modèle moyen
+répond plus vite (3 appels) mais se trompe plus (4 échecs sur 18, tous d'une
+période d'horloge): il raisonne sur le code au lieu de mesurer. Ce banc ne
+mesure donc que ce que les modèles font déjà bien; il reste à lui donner des
+causes plus difficiles (plusieurs étapes, nombreux signaux, simulations
+longues) ou des bugs réels.
+
 ## Références
 
 - Spécification MCP 2026-07-28, changements:
