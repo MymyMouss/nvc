@@ -45,110 +45,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct _rt_callback rt_callback_t;
-typedef struct _memblock memblock_t;
-
-typedef struct _rt_callback {
-   rt_event_fn_t  fn;
-   void          *user;
-   rt_callback_t *next;
-} rt_callback_t;
-
-typedef enum {
-   EVENT_TIMEOUT,
-   EVENT_DRIVER,
-   EVENT_PROCESS,
-   EVENT_PSEUDO,
-} event_kind_t;
-
-#define MEMBLOCK_ALIGN   64
-#define MEMBLOCK_PAGE_SZ 0x800000
-#define TRIGGER_TAB_SIZE 64
-
-#if ASAN_ENABLED
-#define MEMBLOCK_REDZONE 16
-#else
-#define MEMBLOCK_REDZONE 0
-#endif
-
-typedef struct _memblock {
-   memblock_t *chain;
-   size_t      alloc;
-   size_t      limit;
-   uint8_t     data[];
-} memblock_t;
-
-STATIC_ASSERT(sizeof(memblock_t) <= MEMBLOCK_ALIGN);
-
-typedef struct {
-   waveform_t    *free_waveforms;
-   tlab_t        *tlab;
-   rt_wakeable_t *active_obj;
-   rt_scope_t    *active_scope;
-} __attribute__((aligned(64))) model_thread_t;
-
-typedef void (*defer_fn_t)(rt_model_t *, void *);
-
-typedef struct {
-   defer_fn_t  fn;
-   void       *arg;
-} defer_task_t;
-
-typedef struct {
-   defer_task_t *tasks;
-   unsigned      count;
-   unsigned      max;
-} deferq_t;
-
-typedef struct _rt_model {
-   tree_t             top;
-   hash_t            *scopes;
-   rt_scope_t        *root;
-   mspace_t          *mspace;
-   jit_t             *jit;
-   rt_nexus_t        *nexuses;
-   rt_nexus_t       **nexus_tail;
-   delta_cycle_t      stop_delta;
-   int                iteration;
-   uint64_t           now;
-   uint64_t           trigger_epoch;
-   bool               can_create_delta;
-   bool               next_is_delta;
-   bool               force_stop;
-   bool               blocking_update;
-   unsigned           n_signals;
-   heap_t            *eventq_heap;
-   ihash_t           *res_memo;
-   rt_watch_t        *watches;
-   deferq_t           procq;
-   deferq_t           next_procq;
-   deferq_t           driverq;
-   deferq_t           next_driverq;
-   deferq_t           postponedq;
-   deferq_t           triggerq;
-   deferq_t           inactiveq;
-   deferq_t           next_inactiveq;
-   deferq_t           nonblockq;
-   deferq_t           reschedq;
-   heap_t            *driving_heap;
-   heap_t            *effective_heap;
-   rt_callback_t     *phase_cbs[END_OF_SIMULATION + 1];
-   cover_data_t      *cover;
-   nvc_rusage_t       ready_rusage;
-   nvc_lock_t         memlock;
-   memblock_t        *memblocks;
-   model_thread_t    *threads[MAX_THREADS];
-   signal_list_t      eventsigs;
-   bool               shuffle;
-   bool               liveness;
-   rt_trigger_t      *triggertab[TRIGGER_TAB_SIZE];
-} rt_model_t;
+#include "rt/model-priv.h"
 
 #define FMT_VALUES_SZ   128
 #define NEXUS_INDEX_MIN 8
 #define TRACE_SIGNALS   1
 #define WAVEFORM_CHUNK  256
-#define PENDING_MIN     4
 #define MAX_RANK        UINT8_MAX
 
 #define TRACE(...) do {                                 \
@@ -168,6 +70,7 @@ static void *source_value(rt_nexus_t *nexus, rt_source_t *src);
 static void free_value(rt_nexus_t *n, rt_value_t v);
 static rt_nexus_t *clone_nexus(rt_model_t *m, rt_nexus_t *old, int offset);
 static void put_driving(rt_model_t *m, rt_nexus_t *n, const void *value);
+static void sched_event(rt_model_t *m, void **pending, rt_wakeable_t *obj);
 static void put_effective(rt_model_t *m, rt_nexus_t *n, const void *value);
 static bool run_trigger(rt_model_t *m, rt_trigger_t *t);
 static void wakeup_all(rt_model_t *m, void **pending);
@@ -1690,6 +1593,37 @@ static inline rt_nexus_t *split_nexus(rt_model_t *m, rt_signal_t *s,
       return n0;
 
    return split_nexus_slow(m, s, offset, count);
+}
+
+rt_nexus_t *model_split_nexus(rt_model_t *m, rt_signal_t *s, int offset,
+                              int count)
+{
+   return split_nexus(m, s, offset, count);
+}
+
+rt_source_t *model_add_source(rt_model_t *m, rt_nexus_t *n, source_kind_t kind)
+{
+   return add_source(m, n, kind);
+}
+
+rt_value_t model_alloc_value(rt_model_t *m, rt_nexus_t *n)
+{
+   return alloc_value(m, n);
+}
+
+waveform_t *model_alloc_waveform(rt_model_t *m)
+{
+   return alloc_waveform(m);
+}
+
+uint8_t *model_value_ptr(rt_nexus_t *n, rt_value_t *v)
+{
+   return value_ptr(n, v);
+}
+
+void model_sched_event(rt_model_t *m, void **pending, rt_wakeable_t *obj)
+{
+   sched_event(m, pending, obj);
 }
 
 static void setup_signal(rt_model_t *m, rt_signal_t *s, tree_t where,
@@ -3484,6 +3418,13 @@ bool model_is_terminated(rt_model_t *m)
    return relaxed_load(&m->force_stop);
 }
 
+bool model_at_step_end(rt_model_t *m)
+{
+   // After a cycle that did not leave a delta cycle pending the end of
+   // time step phase has run and nothing is queued
+   return m->iteration >= 0 && !m->next_is_delta;
+}
+
 bool model_is_finished(rt_model_t *m)
 {
    return !m->next_is_delta && heap_size(m->eventq_heap) == 0;
@@ -4015,7 +3956,14 @@ static rt_trigger_t *new_trigger(rt_model_t *m, trigger_kind_t kind,
    t->epoch  = UINT64_MAX;
    t->kind   = kind;
    t->chain  = *bucket;
+   t->id     = m->ntriggers++;
    memcpy(t->args, args, argsz);
+
+   model_thread_t *thread = model_thread(m);
+   if (thread->active_obj != NULL && thread->active_obj->kind == W_PROC)
+      t->owner = container_of(thread->active_obj, rt_proc_t, wakeable)->name;
+   else if (thread->active_scope != NULL)
+      t->owner = thread->active_scope->name;
 
    arm_trigger(m, t, &(t->wakeable));
 

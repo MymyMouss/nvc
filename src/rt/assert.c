@@ -524,6 +524,18 @@ bool get_vhdl_assert_enable(vhdl_severity_t severity)
    return !!(enable_mask & (1 << severity));
 }
 
+void get_vhdl_assert_state(unsigned *out, unsigned *mask)
+{
+   memcpy(out, counts, sizeof(counts));
+   *mask = enable_mask;
+}
+
+void set_vhdl_assert_state(const unsigned *in, unsigned mask)
+{
+   memcpy(counts, in, sizeof(counts));
+   enable_mask = mask;
+}
+
 int get_vhdl_assert_exit_status(void)
 {
    for (int s = status_severity; s <= SEVERITY_FAILURE; s++) {

@@ -326,10 +326,7 @@ typedef enum {
    JIT_FUNC_ERROR,
 } func_state_t;
 
-typedef struct {
-   ident_t   name;
-   ptrdiff_t offset;
-} link_tab_t;
+typedef jit_var_t link_tab_t;
 
 typedef struct _jit_func {
    jit_entry_fn_t  entry;    // Must be first
@@ -344,6 +341,8 @@ typedef struct _jit_func {
    unsigned        nirs;
    unsigned        nregs;
    unsigned        nvars;
+   unsigned        ukind;    // mir_unit_kind_t
+   unsigned        hdrsz;    // Frame header size
    unsigned        cpoolsz;
    jit_handle_t    handle;
    unsigned        hotness;

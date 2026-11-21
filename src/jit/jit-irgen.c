@@ -5316,6 +5316,79 @@ static void irgen_stack_vars(jit_irgen_t *g)
    }
 }
 
+static const jit_vtype_t *irgen_vtype(jit_irgen_t *g, mir_type_t type)
+{
+   jit_vtype_t *vt = xcalloc(sizeof(jit_vtype_t));
+   vt->size  = irgen_size_bytes(g, type);
+   vt->align = irgen_align_of(g, type);
+
+   switch (mir_get_class(g->mu, type)) {
+   case MIR_TYPE_INT:      vt->kind = VT_INT; break;
+   case MIR_TYPE_OFFSET:   vt->kind = VT_OFFSET; break;
+   case MIR_TYPE_REAL:     vt->kind = VT_REAL; break;
+   case MIR_TYPE_VEC2:     vt->kind = VT_VEC2; break;
+   case MIR_TYPE_VEC4:     vt->kind = VT_VEC4; break;
+   case MIR_TYPE_SIGNAL:   vt->kind = VT_SIGNAL; break;
+   case MIR_TYPE_CONTEXT:  vt->kind = VT_CONTEXT; break;
+   case MIR_TYPE_TRIGGER:  vt->kind = VT_TRIGGER; break;
+   case MIR_TYPE_RESOLUTION: vt->kind = VT_RESOLUTION; break;
+
+   case MIR_TYPE_FILE:
+      vt->kind = VT_FILE;
+      break;
+
+   case MIR_TYPE_POINTER:
+   case MIR_TYPE_ACCESS:
+      vt->kind = mir_get_class(g->mu, type) == MIR_TYPE_ACCESS
+         ? VT_ACCESS : VT_POINTER;
+      {
+         // Opaque pointees (e.g. protected types) have no size or layout
+         mir_type_t pointed = mir_get_pointer(g->mu, type);
+         const mir_class_t pc = mir_get_class(g->mu, pointed);
+         if (pc != MIR_TYPE_OPAQUE && pc != MIR_TYPE_CLOSURE
+             && pc != MIR_TYPE_LOCUS)
+            vt->elem = irgen_vtype(g, pointed);
+      }
+      break;
+
+   case MIR_TYPE_CARRAY:
+      vt->kind  = VT_CARRAY;
+      vt->count = mir_get_size(g->mu, type);
+      vt->elem  = irgen_vtype(g, mir_get_elem(g->mu, type));
+      break;
+
+   case MIR_TYPE_UARRAY:
+      vt->kind  = VT_UARRAY;
+      vt->count = mir_get_dims(g->mu, type);
+      vt->elem  = irgen_vtype(g, mir_get_elem(g->mu, type));
+      break;
+
+   case MIR_TYPE_RECORD:
+      {
+         size_t nfields, bytes = 0;
+         const mir_type_t *fields = mir_get_fields(g->mu, type, &nfields);
+
+         vt->kind   = VT_RECORD;
+         vt->count  = nfields;
+         vt->fields = xmalloc_array(nfields, sizeof(jit_vfield_t));
+
+         for (int i = 0; i < nfields; i++) {
+            const int align = irgen_align_of(g, fields[i]);
+            bytes = ALIGN_UP(bytes, align);
+            vt->fields[i].offset = bytes;
+            vt->fields[i].type = irgen_vtype(g, fields[i]);
+            bytes += irgen_size_bytes(g, fields[i]);
+         }
+      }
+      break;
+
+   default:
+      should_not_reach_here();
+   }
+
+   return vt;
+}
+
 static void irgen_context_struct(jit_irgen_t *g)
 {
    const mir_unit_kind_t kind = mir_get_kind(g->mu);
@@ -5326,8 +5399,18 @@ static void irgen_context_struct(jit_irgen_t *g)
       sz += sizeof(int32_t);  // State number
    }
 
+   if (kind == MIR_UNIT_PROCEDURE) {
+      // The frame of a suspended procedure is found only through the
+      // pointer in its caller so record which unit it belongs to: this
+      // lets a checkpoint describe it
+      sz += sizeof(int32_t);
+   }
+
+   g->func->ukind = kind;
+   g->func->hdrsz = sz;
+
    const int nvars = mir_count_vars(g->mu);
-   link_tab_t *linktab = xmalloc_array(nvars, sizeof(link_tab_t));
+   link_tab_t *linktab = xcalloc_array(nvars, sizeof(link_tab_t));
 
    if (g->statereg.kind == JIT_VALUE_INVALID)
       g->statereg = irgen_alloc_reg(g, 1);
@@ -5344,6 +5427,7 @@ static void irgen_context_struct(jit_irgen_t *g)
          sz = ALIGN_UP(sz, align);
          linktab[i].name = mir_get_name(g->mu, var);
          linktab[i].offset = sz;
+         linktab[i].type = irgen_vtype(g, type);
          g->vars[i] = jit_addr_from_value(g->statereg, sz);
          sz += irgen_size_bytes(g, type);
       }
@@ -5357,6 +5441,17 @@ static void irgen_context_struct(jit_irgen_t *g)
    else {
       macro_lalloc(g, g->statereg, jit_value_from_int64(sz));
       g->used_tlab = true;
+   }
+
+   if (kind == MIR_UNIT_PROCEDURE) {
+      jit_value_t stamp =
+         jit_addr_from_value(g->statereg, 2 * sizeof(void *) + sizeof(int32_t));
+      j_store(g, JIT_SZ_32, jit_value_from_int64(g->func->handle), stamp);
+
+      // The pointer to a nested suspended procedure is only written when
+      // one suspends: clear it so it can be told apart from garbage
+      j_store(g, JIT_SZ_PTR, jit_value_from_int64(0),
+              jit_addr_from_value(g->statereg, sizeof(void *)));
    }
 
    // Publish the variable offset table early to handle circular references

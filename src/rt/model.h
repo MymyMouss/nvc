@@ -53,6 +53,7 @@ bool model_run_cycles(rt_model_t *m, uint64_t stop_time, unsigned max_cycles,
 void model_end(rt_model_t *m);
 bool model_is_terminated(rt_model_t *m);   // Stopped by an error or abort
 bool model_is_finished(rt_model_t *m);     // No events remain
+bool model_at_step_end(rt_model_t *m);     // Between time steps: can be saved
 bool model_can_create_delta(rt_model_t *m);
 int64_t model_now(rt_model_t *m, unsigned *deltas);
 int64_t model_next_time(rt_model_t *m);

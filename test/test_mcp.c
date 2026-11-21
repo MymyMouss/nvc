@@ -3051,6 +3051,100 @@ START_TEST(test_sim_restore_files)
 }
 END_TEST
 
+START_TEST(test_sim_checkpoint_file)
+{
+   fixture_t f;
+   const char *names[] = { "tb.vhd" }, *sources[] = { tb_src };
+   const char *tops[] = { "tb" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   char id[40];
+   open_sim(&f, "tb", id);
+
+   const json_t *sc = structured(sim_tool(&f, "nvc_sim_run", id,
+                                          "\"duration\":\"100 ns\","
+                                          "\"pause_on\":\"never\""));
+   ck_assert_int_eq(int_field(sc, "now_fs"), 100000000);
+
+   // The state goes to a file instead of a frozen process
+   sc = structured(sim_tool(&f, "nvc_sim_checkpoint", id,
+                            "\"to_file\":\"state.ckpt\""));
+   ck_assert_str_eq(str_field(sc, "file"), ".nvc-mcp/state.ckpt");
+   ck_assert_int_eq(int_field(sc, "now_fs"), 100000000);
+   ck_assert_int_gt(int_field(sc, "bytes"), 0);
+
+   char *path = xasprintf("%s/.nvc-mcp/state.ckpt", f.root);
+   struct stat st;
+   ck_assert_int_eq(stat(path, &st), 0);
+   free(path);
+
+   // No process copy was made
+   sc = structured(sim_tool(&f, "nvc_sim_status", id, ""));
+   ck_assert(json_get(sc, "checkpoints") == NULL
+             || json_get(sc, "checkpoints")->array.count == 0);
+
+   sc = structured(sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"200 ns\","
+                            "\"pause_on\":\"never\""));
+   ck_assert_int_eq(int_field(sc, "now_fs"), 300000000);
+   const json_t *orig_msgs = json_get(sc, "messages");
+   char *orig_out = xstrdup(str_field(sc, "sim_output"));
+   char *orig_q = xstrdup(signal_value(&f, id, "/q"));
+   char *orig_cnt = xstrdup(signal_value(&f, id, "/dut/cnt"));
+   ck_assert_int_gt(orig_msgs->array.count, 0);
+
+   // The file does not depend on the simulation that wrote it
+   sim_tool(&f, "nvc_sim_close", id, "");
+
+   char rid[40];
+   char *args = xstrdup("{\"top\":\"tb\",\"std\":\"2008\","
+                        "\"restore_from\":\".nvc-mcp/state.ckpt\"}");
+   sc = structured(tool(f.mp, f.srv, &f.sink, "nvc_sim_open", args));
+   free(args);
+   snprintf(rid, sizeof(rid), "%s", str_field(sc, "sim_id"));
+   ck_assert_int_eq(int_field(sc, "now_fs"), 100000000);
+   ck_assert_str_eq(signal_value(&f, rid, "/dut/cnt"), "1001");
+
+   sc = structured(sim_tool(&f, "nvc_sim_run", rid, "\"duration\":\"200 ns\","
+                            "\"pause_on\":\"never\""));
+   ck_assert_int_eq(int_field(sc, "now_fs"), 300000000);
+   expect_same_messages(orig_msgs, json_get(sc, "messages"));
+   ck_assert_str_eq(str_field(sc, "sim_output"), orig_out);
+   ck_assert_str_eq(signal_value(&f, rid, "/q"), orig_q);
+   ck_assert_str_eq(signal_value(&f, rid, "/dut/cnt"), orig_cnt);
+
+   // A state file can be opened more than once
+   char rid2[40];
+   args = xstrdup("{\"top\":\"tb\",\"std\":\"2008\","
+                  "\"restore_from\":\"state.ckpt\"}");
+   sc = structured(tool(f.mp, f.srv, &f.sink, "nvc_sim_open", args));
+   free(args);
+   snprintf(rid2, sizeof(rid2), "%s", str_field(sc, "sim_id"));
+   ck_assert_str_ne(rid, rid2);
+   ck_assert_int_eq(int_field(sc, "now_fs"), 100000000);
+
+   // Errors say what is wrong
+   const char *err = tool_error(sim_tool(&f, "nvc_sim_checkpoint", rid2,
+                                         "\"to_file\":\"../evil.ckpt\""));
+   ck_assert_ptr_nonnull(strstr(err, "Invalid state file name"));
+
+   err = tool_error(tool(f.mp, f.srv, &f.sink, "nvc_sim_open",
+                         "{\"top\":\"tb\",\"restore_from\":\"nothere.ckpt\"}"));
+   ck_assert_ptr_nonnull(strstr(err, "does not exist"));
+
+   write_file(f.root, ".nvc-mcp/bad.ckpt", "not a checkpoint file at all\n",
+              0644);
+   err = tool_error(tool(f.mp, f.srv, &f.sink, "nvc_sim_open",
+                         "{\"top\":\"tb\",\"std\":\"2008\","
+                         "\"restore_from\":\"bad.ckpt\"}"));
+   ck_assert_ptr_nonnull(strstr(err, "not a checkpoint file"));
+
+   free(orig_out);
+   free(orig_q);
+   free(orig_cnt);
+   fixture_close(&f);
+}
+END_TEST
+
 START_TEST(test_sim_restore_errors)
 {
    fixture_t f;
@@ -3471,6 +3565,7 @@ Suite *get_mcp_tests(void)
    tcase_add_test(tc, test_sim_live_trace);
    tcase_add_test(tc, test_sim_queries);
    tcase_add_test(tc, test_sim_checkpoint);
+   tcase_add_test(tc, test_sim_checkpoint_file);
    tcase_add_test(tc, test_sim_restore_files);
    tcase_add_test(tc, test_sim_restore_errors);
    tcase_add_test(tc, test_sim_restore_failed);

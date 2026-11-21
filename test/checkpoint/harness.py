@@ -1,0 +1,539 @@
+#!/usr/bin/env python3
+#
+# Validation harness for nvc checkpoints (nvc -r --checkpoint / --restore).
+#
+# For each design it
+#
+#   1. runs straight to the end with a waveform dump,
+#   2. picks a time T near the middle of the run that is an event time in
+#      that dump, and runs again with `--checkpoint=F@T --stop-time=T`.  The
+#      output of this run is exactly what the straight run printed up to T,
+#   3. restores F in a new process (`--restore=F`) with a waveform dump and
+#      lets it run to the end,
+#   4. compares what the restored run printed (stdout and stderr, separately)
+#      with what the straight run printed after the output of step 2, the
+#      exit status, and the waveform from T on: the value of every signal at
+#      T and all later changes, taken from the FST dumps with build/bin/fstdump.
+#
+# A design is "refused" if nvc declined to write the checkpoint (the message
+# is kept), "identical" if everything agrees, and "different" otherwise.
+# "n/a" means the test cannot be run this way (expected elaboration failure,
+# plugins, shell or Tcl driven, no simulated time elapses ...).
+#
+# Usage (from the build directory, after `make`):
+#
+#   ../test/checkpoint/harness.py regress [NAME ...]    # default: all
+#   ../test/checkpoint/harness.py bench                 # test/mcp/bench
+#   ../test/checkpoint/harness.py design --top T --stop 5us a.vhd b.vhd
+#
+# Common options: --at Q1,Q2,.. (positions of the checkpoint as fractions
+# of the event times of the run, default 0.5), --nvc PATH (default bin/nvc), --lib DIR (default lib),
+# --json FILE (full results), --keep (keep the temporary directories),
+# --timeout SECONDS (per nvc command, default 120).
+#
+# Exit status is 1 if any design is "different".
+
+import argparse
+import collections
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
+
+
+class Design:
+    def __init__(self, name, files, top, std="1993", stop=None, gens=(),
+                 env=None, aflags=(), rflags=(), heap=None, olevel=0,
+                 expect_fail=False):
+        self.name = name
+        self.files = list(files)
+        self.top = top
+        self.std = std
+        self.stop = stop
+        self.gens = list(gens)
+        self.env = dict(env or {})
+        self.aflags = list(aflags)
+        self.rflags = list(rflags)
+        self.heap = heap
+        self.olevel = olevel
+        self.expect_fail = expect_fail
+
+
+class NA(Exception):
+    pass
+
+
+def run(cmd, cwd, env, timeout):
+    t0 = time.time()
+    try:
+        p = subprocess.run(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, b"", b"", time.time() - t0
+    return p.returncode, p.stdout, p.stderr, time.time() - t0
+
+
+# --------------------------------------------------------------------------
+# Test lists
+
+def regress_designs(names):
+    path = os.path.join(ROOT, "test", "regress", "testlist.txt")
+    designs = []
+    skipped = []
+    for line in open(path):
+        line = line.split("#")[0].strip()
+        if not line:
+            continue
+        name, _, opts = line.partition(" ")
+        opts = opts.strip().split(",") if opts.strip() else []
+        if names and name not in names:
+            continue
+
+        d = Design(name, [], name)
+        why = None
+        for o in opts:
+            if o in ("2000", "2002", "2008", "2019"):
+                d.std = o
+            elif o == "fail":
+                d.expect_fail = True
+            elif o.startswith("stop="):
+                d.stop = o[5:]
+            elif o in ("vhpi", "shell", "tcl", "slow", "gtkw", "wave",
+                       "shuffle", "!windows", "per-file") \
+                    or o.startswith(("plugin=", "cover", "work=", "export")):
+                if o not in ("!windows",):
+                    why = o
+            elif o in ("mixed", "verilog"):
+                pass
+            elif o == "psl":
+                d.aflags.append("--psl")
+            elif o == "relaxed":
+                d.aflags.append("--relaxed")
+            elif o.startswith("relax="):
+                d.aflags.append("--relax=" + o[6:])
+            elif o.startswith("define="):
+                d.aflags.append("--define=" + o[7:])
+            elif o == "no-collapse":
+                d.aflags.append("--no-collapse")
+            elif o.startswith("H="):
+                d.heap = o[2:]
+            elif o.startswith("O"):
+                d.olevel = int(o[1:])
+            elif o.startswith("g") and "=" in o:
+                k, v = o[1:].split("=", 1)
+                d.gens.append((k, v))
+            elif o.startswith("$") and "=" in o:
+                k, v = o[1:].split("=", 1)
+                d.env[k] = v
+            elif o.startswith("+"):
+                d.rflags.append(o)
+            elif o.startswith("seed=") or o.startswith("dump-arrays") \
+                    or o.startswith("exit="):
+                pass
+            elif o in ("normal", "gold"):
+                pass
+            else:
+                why = "option " + o
+
+        reg = os.path.join(ROOT, "test", "regress")
+        if os.path.exists(os.path.join(reg, name + ".vhd")) \
+                and "verilog" not in opts:
+            d.files.append(os.path.join(reg, name + ".vhd"))
+        for ext in (".sv", ".v"):
+            if ("mixed" in opts or "verilog" in opts) \
+                    and os.path.exists(os.path.join(reg, name + ext)):
+                d.files.append(os.path.join(reg, name + ext))
+                break
+
+        if why is None and not d.files:
+            why = "no source file"
+        d.skip = why
+        designs.append(d)
+    return designs
+
+
+BENCH = [
+    # design file, testbench file, top, stop time
+    ("ctrl", "ctrl_tb", "ctrl_tb", "5us"),
+    ("fifo", "fifo_tb", "fifo_tb", "5us"),
+    ("uart_tx", "uart_tx_tb", "uart_tx_tb", "5us"),
+    ("video_sync", "video_sync_tb", "video_sync_tb", "5us"),
+    ("pipe", "pipe_tb", "pipe_tb", "5us"),
+    ("dma", "dma_tb", "dma_tb", "40us"),
+    ("arb", "arb_tb", "arb_tb", "3us"),
+    ("uart_rx", "uart_rx_tb", "uart_rx_tb", "15us"),
+    ("crc_tx", "crc_tx_tb", "crc_tx_tb", "100us"),
+    ("timer", "timer_tb", "timer_tb", "300us"),
+]
+
+SOC_FILES = ["pkg_soc", "uart_rx", "uart_tx", "sync_fifo", "crc8_unit",
+             "watchdog", "cmd_parser", "reg_bank", "irq_ctrl", "timer",
+             "video_timing", "pattern_gen", "filter3", "gain_offset",
+             "threshold_stats", "rr_arbiter", "rsp_builder", "tx_path",
+             "ctrl_path", "video_pipe", "soc_top", "tb_pkg", "tb_soc"]
+
+
+def bench_designs():
+    b = os.path.join(ROOT, "test", "mcp", "bench")
+    out = []
+    for dut, tb, top, stop in BENCH:
+        d = Design("bench_" + dut,
+                   [os.path.join(b, dut + ".vhd"), os.path.join(b, tb + ".vhd")],
+                   top, std="2008", stop=stop)
+        d.skip = None
+        out.append(d)
+    soc = Design("bench_soc",
+                 [os.path.join(b, "soc", f + ".vhd") for f in SOC_FILES],
+                 "tb_soc", std="2008", stop="3ms")
+    soc.skip = None
+    out.append(soc)
+    return out
+
+
+# --------------------------------------------------------------------------
+# Waveforms
+
+def parse_dump(text):
+    """Return {time: {name: value}} from fstdump output."""
+    out = collections.OrderedDict()
+    for line in text.splitlines():
+        if not line.startswith("#"):
+            continue
+        parts = line.split(" ", 2)
+        if len(parts) != 3:
+            continue
+        t = int(parts[0][1:])
+        out.setdefault(t, {})[parts[1]] = parts[2]
+    return out
+
+
+def waveform_diff(straight, restored, t):
+    """Compare from time t.  Returns a list of difference descriptions."""
+    diffs = []
+
+    # Value of every signal at t in the straight run
+    state = {}
+    for time_, ch in straight.items():
+        if time_ <= t:
+            state.update(ch)
+
+    snap = restored.get(t, {})
+    for name, val in state.items():
+        if name not in snap:
+            diffs.append("restored dump has no value for %s at %d" % (name, t))
+        elif snap[name] != val:
+            diffs.append("%s at %d: straight %s, restored %s"
+                         % (name, t, val, snap[name]))
+    for name in snap:
+        if name not in state:
+            diffs.append("restored dump has extra signal %s" % name)
+
+    later_s = {k: v for k, v in straight.items() if k > t}
+    later_r = {k: v for k, v in restored.items() if k > t}
+    for time_ in sorted(set(later_s) | set(later_r)):
+        a, b = later_s.get(time_, {}), later_r.get(time_, {})
+        if a != b:
+            for name in sorted(set(a) | set(b)):
+                if a.get(name) != b.get(name):
+                    diffs.append("%s at %d: straight %s, restored %s"
+                                 % (name, time_, a.get(name), b.get(name)))
+                    break
+            else:
+                continue
+        if len(diffs) > 5:
+            break
+    return diffs
+
+
+# --------------------------------------------------------------------------
+# One design
+
+UNITS = {b"fs": 1, b"ps": 1000, b"ns": 1000000, b"us": 1000000000,
+         b"ms": 1000000000000, b"sec": 1000000000000000}
+CYCLE_RE = re.compile(rb"^TRACE (\d+)(fs|ps|ns|us|ms|sec)\+0: begin cycle",
+                      re.M)
+
+
+def trace_times(err):
+    return [int(m.group(1)) * UNITS[m.group(2)] for m in CYCLE_RE.finditer(err)]
+
+
+NOTE_RE = re.compile(rb"^\*\* Note: [^\n]*checkpoint [^\n]* (?:written|restored) at "
+                     rb"[^\n]*\n|^\*\* Note: restored checkpoint [^\n]*\n", re.M)
+
+
+WAVE_NOTE_RE = re.compile(rb"^\*\* Note: arrays of composite types[^\n]*\n", re.M)
+
+
+BLOCK_RE = re.compile(rb"^(?=\*\* (?:Note|Warning|Error|Fatal|Failure)\b)", re.M)
+STAMP_RE = re.compile(rb"^\*\* \w+: (\(init\)|\d+(?:fs|ps|ns|us|ms|sec)\+\d+): ")
+
+
+ADDR_RE = re.compile(rb"0x[0-9a-f]{8,16}")
+
+
+def norm(b):
+    # Notes that depend only on how the run was invoked, and heap addresses
+    # which differ between any two runs
+    return ADDR_RE.sub(b"0xADDR", WAVE_NOTE_RE.sub(b"", NOTE_RE.sub(b"", b)))
+
+
+def blocks(b):
+    """Split diagnostics into blocks: (is_init, text).  Blocks that carry
+    no simulation time are tool messages (waveform dumper warnings) and are
+    dropped.  Anything before the first block is kept as one block."""
+    out = []
+    for part in BLOCK_RE.split(b):
+        if not part:
+            continue
+        m = STAMP_RE.match(part)
+        if m is None:
+            if part.startswith(b"** "):
+                continue
+            out.append((False, part))
+        else:
+            out.append((m.group(1) == b"(init)", part))
+    return out
+
+
+def stderr_diff(s_err, a_err, r_err):
+    """The restored run repeats the reset, so the '(init)' diagnostics
+    appear at its start; the rest must equal what the straight run printed
+    after the checkpoint."""
+    sb, ab, rb = blocks(s_err), blocks(a_err), blocks(r_err)
+    s_init = [t for i, t in sb if i]
+    r_init = [t for i, t in rb if i]
+    s_rest = [t for i, t in sb if not i]
+    a_rest = [t for i, t in ab if not i]
+    r_rest = [t for i, t in rb if not i]
+    if r_init != s_init:
+        return "diagnostics during reset differ"
+    if s_rest[:len(a_rest)] != a_rest:
+        return "output before the checkpoint is not a prefix"
+    if r_rest != s_rest[len(a_rest):]:
+        return ("stderr differs: restored %r, expected %r"
+                % (b"".join(r_rest)[:300], b"".join(s_rest[len(a_rest):])[:300]))
+    return None
+
+
+def check(d, nvc, lib, fstdump, keep, timeout, quantile=0.5):
+    work = tempfile.mkdtemp(prefix="ckpt-")
+    env = dict(os.environ)
+    env["NVC_LIBPATH"] = lib
+    env["NVC_IMP_LIB"] = lib
+    env["LANG"] = "en_US.UTF-8"
+    env.update(d.env)
+    res = {"name": d.name, "status": None, "detail": ""}
+
+    try:
+        base = [nvc, "--std=" + d.std]
+        if d.heap:
+            base.append("-H" + d.heap)
+
+        rc, out, err, _ = run(base + ["-a"] + d.files + d.aflags
+                              + ["-e", d.top, "-O%d" % d.olevel]
+                              + ["-g%s=%s" % g for g in d.gens], work, env,
+                              timeout)
+        if rc != 0:
+            raise NA("analysis or elaboration failed" if not d.expect_fail
+                     else "expected failure before run")
+
+        def runcmd(extra, stop=None):
+            cmd = base + ["-r"]
+            if stop:
+                cmd.append("--stop-time=" + stop)
+            cmd += extra + d.rflags + [d.top]
+            return run(cmd, work, env, timeout)
+
+        # 1. straight run
+        s_rc, s_out, s_err, s_time = runcmd(["--wave=straight.fst"], d.stop)
+        if s_rc is None:
+            raise NA("straight run timed out")
+        s_err = norm(s_err)
+        s_out = norm(s_out)
+        if not os.path.exists(os.path.join(work, "straight.fst")):
+            raise NA("no waveform produced")
+
+        dump = subprocess.run([fstdump, "straight.fst"], cwd=work,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL).stdout.decode(
+                                  "utf-8", "replace")
+        straight = parse_dump(dump)
+        times = sorted(t for t in straight if t > 0)
+        if len(times) < 2:
+            # Few signal events: take the times of the time steps from the
+            # kernel trace instead
+            t_rc, t_out, t_err, _ = runcmd(["--trace"], d.stop)
+            times = sorted(set(trace_times(t_err)) - {0})
+        if len(times) < 2:
+            raise NA("no simulated time elapses")
+        tmid = times[int((len(times) - 1) * quantile)]
+        res["time_fs"] = tmid
+        res["straight_s"] = round(s_time, 3)
+
+        # 2. checkpoint run, stopping at the checkpoint
+        ck = os.path.join(work, "state.ckpt")
+        a_rc, a_out, a_err, _ = runcmd(
+            ["--checkpoint=%s@%dfs" % (ck, tmid), "--wave=a.fst"], "%dfs" % tmid)
+        if a_rc is None:
+            raise NA("checkpoint run timed out")
+
+        if not os.path.exists(ck):
+            m = re.search(rb"cannot write checkpoint [^\n]*? at [^:]*: ([^\n]*)",
+                          a_err)
+            res["status"] = "refused"
+            res["detail"] = (m.group(1).decode() if m
+                             else a_err.decode("utf-8", "replace")[-200:].strip())
+            return res
+
+        res["ckpt_bytes"] = os.path.getsize(ck)
+        a_err = norm(a_err)
+        a_out = norm(a_out)
+
+        if not s_out.startswith(a_out):
+            res["status"] = "different"
+            res["detail"] = ("the output of the run that wrote the "
+                             "checkpoint is not a prefix of the straight run")
+            return res
+
+        # 3. restore in a new process
+        r_rc, r_out, r_err, r_time = runcmd(
+            ["--restore=" + ck, "--wave=restored.fst"], d.stop)
+        r_err = norm(r_err)
+        r_out = norm(r_out)
+        res["restore_s"] = round(r_time, 3) if r_rc is not None else None
+        if r_rc is None:
+            res["status"] = "different"
+            res["detail"] = "restored run timed out"
+            return res
+
+        problems = []
+        if r_rc != s_rc:
+            problems.append("exit status %s, straight %s" % (r_rc, s_rc))
+        if r_out != s_out[len(a_out):]:
+            problems.append("stdout differs")
+        why = stderr_diff(s_err, a_err, r_err)
+        if why:
+            problems.append(why)
+
+        if not os.path.exists(os.path.join(work, "restored.fst")):
+            problems.append("no waveform from the restored run")
+        else:
+            rdump = subprocess.run([fstdump, "restored.fst"], cwd=work,
+                                   stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL).stdout.decode(
+                                       "utf-8", "replace")
+            problems += waveform_diff(straight, parse_dump(rdump), tmid)
+
+        if problems:
+            res["status"] = "different"
+            res["detail"] = "; ".join(problems[:4])
+        else:
+            res["status"] = "identical"
+        return res
+
+    except NA as e:
+        res["status"] = "n/a"
+        res["detail"] = str(e)
+        return res
+    finally:
+        if keep:
+            res["dir"] = work
+        else:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="nvc checkpoint validation harness (see the comment at the top of the file)")
+    ap.add_argument("mode", choices=["regress", "bench", "design"])
+    ap.add_argument("names", nargs="*")
+    ap.add_argument("--nvc", default="bin/nvc")
+    ap.add_argument("--lib", default="lib")
+    ap.add_argument("--fstdump", default=None)
+    ap.add_argument("--json")
+    ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--timeout", type=int, default=120)
+    ap.add_argument("--at", default="0.5",
+                    help="comma separated positions in the run, as fractions "
+                    "of its event times, at which to checkpoint (default 0.5)")
+    ap.add_argument("--top")
+    ap.add_argument("--stop")
+    ap.add_argument("--std", default="2008")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args()
+
+    nvc = os.path.abspath(args.nvc)
+    lib = os.path.abspath(args.lib)
+    fstdump = args.fstdump or os.path.join(os.path.dirname(nvc), "fstdump")
+
+    if args.mode == "regress":
+        designs = regress_designs(set(args.names))
+    elif args.mode == "bench":
+        designs = bench_designs()
+    else:
+        d = Design("design", [os.path.abspath(f) for f in args.names],
+                   args.top, std=args.std, stop=args.stop)
+        d.skip = None
+        designs = [d]
+
+    results = []
+    counts = collections.Counter()
+    reasons = collections.Counter()
+    quantiles = [float(q) for q in args.at.split(",")]
+    jobs = []
+    for d in designs:
+        if getattr(d, "skip", None):
+            jobs.append((d, None))
+        else:
+            jobs += [(d, q) for q in quantiles]
+
+    for d, q in jobs:
+        if q is None:
+            r = {"name": d.name, "status": "n/a", "detail": d.skip}
+        else:
+            r = check(d, nvc, lib, fstdump, args.keep, args.timeout, q)
+            if len(quantiles) > 1:
+                r["name"] = "%s@%g" % (d.name, q)
+        results.append(r)
+        counts[r["status"]] += 1
+        if r["status"] == "refused":
+            reasons[re.sub(r"[0-9]+", "N", re.sub(
+                r"(process|instance|package|signal|variable|file|trigger) \S+",
+                r"\1 X", r["detail"]))[:90]] += 1
+        if args.verbose or r["status"] in ("different",):
+            print("%-24s %-9s %s" % (r["name"], r["status"],
+                                     r["detail"][:150]), flush=True)
+        elif r["status"] != "n/a" and args.mode != "regress":
+            print("%-24s %-9s %s" % (r["name"], r["status"],
+                                     r["detail"][:150]), flush=True)
+
+    total = sum(counts.values())
+    applicable = total - counts["n/a"]
+    print("\nchecks: %d  n/a: %d  applicable: %d" % (total, counts["n/a"],
+                                                    applicable))
+    acc = counts["identical"] + counts["different"]
+    print("accepted (checkpoint written): %d   refused: %d"
+          % (acc, counts["refused"]))
+    print("  identical: %d   different: %d" % (counts["identical"],
+                                               counts["different"]))
+    if reasons:
+        print("\nrefusal reasons:")
+        for k, v in reasons.most_common(15):
+            print("  %5d  %s" % (v, k))
+
+    if args.json:
+        json.dump(results, open(args.json, "w"), indent=1)
+
+    return 1 if counts["different"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

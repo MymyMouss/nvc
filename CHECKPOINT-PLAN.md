@@ -1,6 +1,8 @@
 # Plan: checkpoint et reprise de simulation
 
-Statut: **proposé, rien n'est réalisé**. Soumis pour accord avant exécution.
+Statut: phases 0, 1 et 2 **réalisées** (phase 2: voir `CHECKPOINT-DESIGN.md`,
+fichiers ouverts, procédures suspendues et access simples compris). Phases 3
+et 4 à faire.
 Remplace et détaille `PLAN.md` §1.
 
 ## 1. Les deux besoins, qui ne se résolvent pas de la même façon

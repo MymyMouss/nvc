@@ -36,6 +36,6 @@ void mcp_format_time(int64_t fs, char *buf, size_t len);
 // Worker side: serve a loaded simulation on the control socket until the
 // supervisor closes it.  See mcp-worker.c.
 int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
-                    const char *files_dir);
+                    const char *files_dir, const char *restore_file);
 
 #endif   // _MCP_H

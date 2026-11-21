@@ -62,6 +62,53 @@ typedef struct {
 
 typedef void (*jit_irq_fn_t)(jit_t *, void *);
 
+// Typed description of the variables in a unit's persistent frame: this
+// is what lets a checkpoint save and restore a frame by variable name
+// instead of copying raw memory which may contain pointers
+typedef enum {
+   VT_INT, VT_OFFSET, VT_REAL, VT_VEC2, VT_VEC4, VT_CARRAY, VT_RECORD,
+   VT_UARRAY, VT_POINTER, VT_ACCESS, VT_SIGNAL, VT_CONTEXT, VT_FILE,
+   VT_TRIGGER, VT_RESOLUTION,
+} jit_vt_kind_t;
+
+typedef struct _jit_vtype jit_vtype_t;
+
+typedef struct {
+   uint32_t           offset;
+   const jit_vtype_t *type;
+} jit_vfield_t;
+
+struct _jit_vtype {
+   jit_vt_kind_t       kind;
+   uint32_t            size;     // Bytes occupied inside the frame
+   uint32_t            align;
+   uint32_t            count;    // Array length, field count or dimensions
+   const jit_vtype_t  *elem;     // Element or pointed-to type
+   jit_vfield_t       *fields;   // Record only
+};
+
+typedef struct {
+   ident_t            name;      // NULL for temporaries (not in frame)
+   ptrdiff_t          offset;
+   const jit_vtype_t *type;
+} jit_var_t;
+
+typedef struct {
+   unsigned         nvars;
+   const jit_var_t *vars;
+   unsigned         kind;       // mir_unit_kind_t
+   unsigned         hdrsz;      // Bytes before the first variable
+} jit_framelay_t;
+
+// Returns false if the unit has no persistent frame
+bool jit_get_framelay(jit_t *j, jit_handle_t handle, jit_framelay_t *out,
+                      bool compile);
+bool jit_get_cpool(jit_t *j, jit_handle_t handle, const void **base,
+                   size_t *size, bool compile);
+unsigned jit_handle_count(jit_t *j);
+void *jit_get_privdata(jit_t *j, jit_handle_t handle);
+void jit_set_privdata(jit_t *j, jit_handle_t handle, void *ptr);
+
 jit_t *jit_new(unit_registry_t *ur, mir_context_t *mc);
 void jit_free(jit_t *j);
 jit_handle_t jit_compile(jit_t *j, ident_t name);

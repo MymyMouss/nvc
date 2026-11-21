@@ -167,10 +167,24 @@ jit_t *jit_new(unit_registry_t *ur, mir_context_t *mc)
    return j;
 }
 
+static void jit_free_vtype(const jit_vtype_t *vt)
+{
+   if (vt == NULL)
+      return;
+
+   jit_free_vtype(vt->elem);
+   for (unsigned i = 0; i < vt->count && vt->fields != NULL; i++)
+      jit_free_vtype(vt->fields[i].type);
+   free(vt->fields);
+   free((void *)vt);
+}
+
 static void jit_free_func(jit_func_t *f)
 {
    mptr_free(f->jit->mspace, &(f->privdata));
    free(f->irbuf);
+   for (unsigned i = 0; f->linktab != NULL && i < f->nvars; i++)
+      jit_free_vtype(f->linktab[i].type);
    free(f->linktab);
    free(f->cpool);
    free(f);
@@ -401,6 +415,60 @@ void *jit_link(jit_t *j, jit_handle_t handle)
    assert(result.pointer == *mptr_get(f->privdata));
 
    return result.pointer;
+}
+
+bool jit_get_framelay(jit_t *j, jit_handle_t handle, jit_framelay_t *out,
+                      bool compile)
+{
+   jit_func_t *f = jit_get_func(j, handle);
+
+   if (compile)
+      jit_fill_irbuf(f);
+   else if (load_acquire(&(f->state)) != JIT_FUNC_READY)
+      return false;
+
+   if (f->linktab == NULL)
+      return false;
+
+   out->nvars = f->nvars;
+   out->vars  = f->linktab;
+   out->kind  = f->ukind;
+   out->hdrsz = f->hdrsz;
+   return true;
+}
+
+bool jit_get_cpool(jit_t *j, jit_handle_t handle, const void **base,
+                   size_t *size, bool compile)
+{
+   jit_func_t *f = jit_get_func(j, handle);
+   if (compile)
+      jit_fill_irbuf(f);
+   else if (load_acquire(&(f->state)) != JIT_FUNC_READY)
+      return false;
+
+   if (f->cpool == NULL)
+      return false;
+
+   *base = f->cpool;
+   *size = f->cpoolsz;
+   return true;
+}
+
+unsigned jit_handle_count(jit_t *j)
+{
+   return j->next_handle;
+}
+
+void *jit_get_privdata(jit_t *j, jit_handle_t handle)
+{
+   jit_func_t *f = jit_get_func(j, handle);
+   return f->privdata == MPTR_INVALID ? NULL : *mptr_get(f->privdata);
+}
+
+void jit_set_privdata(jit_t *j, jit_handle_t handle, void *ptr)
+{
+   jit_func_t *f = jit_get_func(j, handle);
+   *jit_get_privdata_ptr(j, f) = ptr;
 }
 
 void **jit_get_privdata_ptr(jit_t *j, jit_func_t *f)

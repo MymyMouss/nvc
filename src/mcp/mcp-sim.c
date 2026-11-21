@@ -848,6 +848,12 @@ static const char open_input[] = MCP_JSON({
          "minimum": 1000,
          "maximum": 300000,
          "description": "Time allowed to load the design. Defaults to 60000."
+      },
+      "restore_from": {
+         "type": "string",
+         "minLength": 1,
+         "maxLength": 128,
+         "description": "Start from a state file written by nvc_sim_checkpoint with to_file instead of at time zero. The design must be elaborated from the same sources, the same top, std and library, by the same nvc. Give the file name or its path below .nvc-mcp/."
       }
    },
    "required": ["top"],
@@ -906,15 +912,60 @@ static void begin_open_result(json_writer_t *out, const sim_t *s,
    free(copy);
 }
 
+
+// State files are kept in <root>/.nvc-mcp so they can only be written or
+// read there.  The name is a bare file name or that name below .nvc-mcp/.
+static char *state_file_path(mcp_call_t *call, const char *name, bool exists,
+                             char **relative)
+{
+   const char *base = name;
+   if (strncmp(name, ".nvc-mcp/", 9) == 0)
+      base = name + 9;
+
+   bool ok = *base != '\0' && strlen(base) <= 100 && base[0] != '.';
+   for (const char *p = base; ok && *p; p++)
+      ok = isalnum((unsigned char)*p) || *p == '_' || *p == '-' || *p == '.';
+
+   if (!ok) {
+      mcp_call_error(call, "Invalid state file name '%s': use letters, "
+                     "digits, underscores, hyphens and dots, for example "
+                     "\"state.ckpt\"; the file is kept in .nvc-mcp/", name);
+      return NULL;
+   }
+
+   char *path = xasprintf("%s/.nvc-mcp/%s", mcp_call_root(call), base);
+   if (exists) {
+      struct stat st;
+      if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+         mcp_call_error(call, "The state file .nvc-mcp/%s does not exist. "
+                        "Write one with nvc_sim_checkpoint and to_file", base);
+         free(path);
+         return NULL;
+      }
+   }
+
+   if (relative != NULL)
+      *relative = xasprintf(".nvc-mcp/%s", base);
+
+   return path;
+}
+
 static bool tool_sim_open(mcp_call_t *call, const json_t *args,
                           json_writer_t *out)
 {
    const char *top = json_string(json_get(args, "top"));
    const char *library = json_string(json_get(args, "library"));
    const char *std = json_string(json_get(args, "std"));
+   const char *restore_from = json_string(json_get(args, "restore_from"));
 
    int64_t timeout_ms = DEFAULT_OPEN_MS;
    json_as_int(json_get(args, "timeout_ms"), &timeout_ms);
+
+   char *restore_path = NULL;
+   if (restore_from != NULL
+       && (restore_path = state_file_path(call, restore_from, true,
+                                          NULL)) == NULL)
+      return false;
 
    if (!valid_unit_name(top)) {
       mcp_call_error(call, "Invalid design unit name '%s': use a letter "
@@ -954,9 +1005,11 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
    int ngargs;
    const char *const *gargs = mcp_call_global_argv(call, &ngargs);
 
-   const char **argv = xcalloc_array(ngargs + 9, sizeof(char *));
+   const char **argv = xcalloc_array(ngargs + 10, sizeof(char *));
    size_t argc = 0;
 
+   char *restore_opt = restore_path ? xasprintf("--restore-from=%s",
+                                                restore_path) : NULL;
    char *work_opt = library ? xasprintf("--work=%s", library) : NULL;
    char *std_opt = std ? xasprintf("--std=%s", std) : NULL;
    char *fd_opt = xasprintf("--fd=%d", WORKER_CTL_FD);
@@ -979,6 +1032,8 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
       free(fd_opt);
       free(work_opt);
       free(std_opt);
+      free(restore_opt);
+      free(restore_path);
       free(argv);
       close(ctl[0]);
       close(child_fd);
@@ -1000,6 +1055,8 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
    argv[argc++] = "--mcp-worker";
    argv[argc++] = fd_opt;
    argv[argc++] = files_opt;
+   if (restore_opt != NULL)
+      argv[argc++] = restore_opt;
    argv[argc++] = top;
    argv[argc] = NULL;
 
@@ -1012,6 +1069,8 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
    free(std_opt);
    free(fd_opt);
    free(files_opt);
+   free(restore_opt);
+   free(restore_path);
 
    close(outp[1]);
    close(child_fd);
@@ -1993,7 +2052,13 @@ static bool tool_sim_close(mcp_call_t *call, const json_t *args,
 static const char ckpt_input[] = MCP_JSON({
    "type": "object",
    "properties": {
-      "sim_id": { "type": "string", "minLength": 32, "maxLength": 32 }
+      "sim_id": { "type": "string", "minLength": 32, "maxLength": 32 },
+      "to_file": {
+         "type": "string",
+         "minLength": 1,
+         "maxLength": 128,
+         "description": "Instead of a frozen copy that lasts while this simulation is open, write the state to this file in .nvc-mcp/ (a file name such as state.ckpt). It is saved at the end of the current time step, which is finished first, and can be opened later, even after the server restarts, with nvc_sim_open and restore_from. Only designs without PSL, Verilog, coverage, forced signals or VHPI can be saved this way: otherwise the error names the object. Not allowed while a background run is in progress."
+      }
    },
    "required": ["sim_id"],
    "additionalProperties": false
@@ -2011,9 +2076,11 @@ static const char ckpt_output[] = MCP_JSON({
       "memory_mb": { "type": "integer" },
       "pid": { "type": "integer" },
       "checkpoints": { "type": "integer" },
-      "hint": { "type": "string" }
+      "hint": { "type": "string" },
+      "file": { "type": "string" },
+      "bytes": { "type": "integer" }
    },
-   "required": ["checkpoint_id", "now_fs", "now", "checkpoints"]
+   "required": ["now_fs", "now"]
 });
 
 static bool tool_sim_checkpoint(mcp_call_t *call, const json_t *args,
@@ -2024,6 +2091,47 @@ static bool tool_sim_checkpoint(mcp_call_t *call, const json_t *args,
    sim_t *s = lookup(call, sim_id);
    if (s == NULL)
       return false;
+
+   const char *to_file = json_string(json_get(args, "to_file"));
+   if (to_file != NULL) {
+      char *rel = NULL;
+      char *path = state_file_path(call, to_file, false, &rel);
+      if (path == NULL)
+         return false;
+
+      char *parent = xasprintf("%s/.nvc-mcp", mcp_call_root(call));
+      mkdir(parent, 0755);
+      free(parent);
+
+      LOCAL_TEXT_BUF req = tb_new();
+      json_writer_t jw;
+      jw_init(&jw, req);
+      jw_begin_object(&jw);
+      jw_key(&jw, "op");
+      jw_string(&jw, "checkpoint_file");
+      jw_key(&jw, "path");
+      jw_string(&jw, path);
+      jw_end_object(&jw);
+
+      char *result = sim_call(call, s, tb_get(req), 120000);
+      free(path);
+      if (result == NULL) {
+         free(rel);
+         return false;
+      }
+
+      // The name was checked to hold only plain characters
+      LOCAL_TEXT_BUF members = tb_new();
+      tb_printf(members, "\"file\":\"%s\",\"hint\":\"Open it later with "
+                "nvc_sim_open and restore_from set to this file, with the "
+                "same top, std and library.\"", rel);
+      result = append_members(result, tb_get(members));
+
+      jw_raw(out, result);
+      free(result);
+      free(rel);
+      return true;
+   }
 
    if (ckpt_count(s, false) >= MAX_CKPTS) {
       LOCAL_TEXT_BUF list = tb_new();
@@ -2802,7 +2910,10 @@ static const mcp_tool_t sim_tools[] = {
          "after 30 minutes without use and at most 4 can be open, so call "
          "nvc_sim_close when you are done.  Signal paths start at / for the "
          "top-level design, for example /clk or /dut/cnt.  messages lists "
-         "anything the design reported while initialising.",
+         "anything the design reported while initialising.  With "
+         "restore_from the simulation starts from a state file written by "
+         "nvc_sim_checkpoint with to_file, at the time it was saved, "
+         "instead of at time 0; the design must be the same.",
       .input_schema  = open_input,
       .output_schema = open_output,
       .example       = open_example,
@@ -2979,7 +3090,11 @@ static const mcp_tool_t sim_tools[] = {
          "the simulation has ended, or when a VHPI plugin or foreign "
          "library is loaded.  A checkpoint costs real memory only for what "
          "changes afterwards.  A background run also takes automatic "
-         "checkpoints, listed by nvc_sim_status.",
+         "checkpoints, listed by nvc_sim_status.  With to_file the state "
+         "is instead written to a file in .nvc-mcp/ at the end of the "
+         "current time step, which keeps it after the simulation is closed "
+         "and across server restarts: open it with nvc_sim_open and "
+         "restore_from.",
       .input_schema  = ckpt_input,
       .output_schema = ckpt_output,
       .example       = sim_id_example,

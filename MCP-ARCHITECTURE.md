@@ -981,6 +981,21 @@ réception des checkpoints à chaque réveil (toutes les 30 s), ce qui relance
 le compteur du worker. Après correction l'agent restaure à 128 ms et lit la
 valeur demandée sans repartir de zéro.
 
+### 8.12 Checkpoints sur fichier (phase 2)
+
+`nvc_sim_checkpoint` avec `to_file` n'a pas la même nature que les
+instantanés de la section 8.11: au lieu de geler une copie du processus, le
+worker termine le pas de temps courant (`model_step` jusqu'à
+`model_at_step_end`) puis écrit l'état typé dans `.nvc-mcp/NOM`
+(`checkpoint_save`, voir `CHECKPOINT-DESIGN.md`). Le fichier survit à la
+simulation et au serveur; `nvc_sim_open` avec `restore_from` lance un worker
+qui, après `model_reset`, appelle `checkpoint_restore` (l'option
+`--restore-from=` de `nvc --mcp-worker`), refuse un design ou un binaire
+différent, et vérifie l'état restauré avant de répondre « ready ». Les deux
+opérations échouent avec un message qui nomme l'objet hors périmètre (PSL,
+Verilog, signaux forcés, ...); elles ne sont pas permises pendant un run en
+arrière-plan (le worker n'est alors pas entre deux pas de temps).
+
 ## Références
 
 - Spécification MCP 2026-07-28, changements:

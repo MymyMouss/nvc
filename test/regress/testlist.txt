@@ -1517,3 +1517,5 @@ covpkg1         shell
 covpkg2         shell
 covpkg3         shell
 covpkg4         shell
+ckpt1           shell
+ckpt2           shell

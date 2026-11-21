@@ -25,6 +25,7 @@
 #include "mcp/mcp.h"
 #include "mcp/mcp-json.h"
 #include "option.h"
+#include "rt/checkpoint.h"
 #include "rt/fileio.h"
 #include "rt/model.h"
 #include "rt/printer.h"
@@ -182,6 +183,7 @@ typedef struct {
    unsigned      auto_unseen;      // Taken since the supervisor last wrote
    off_t         ckpt_log_size;    // Size of the output log at the checkpoint
    char         *dropped_wave;     // File recording not carried into a copy
+   ckpt_id_t    *ckpt_id;          // Identity of the design for saved files
 } worker_t;
 
 static void files_check(worker_t *w, bool force);
@@ -2734,11 +2736,62 @@ static void op_checkpoint(worker_t *w)
       reply_error(w, "A checkpoint cannot be taken: %s", tb_get(err));
 }
 
+// Save the state to a file.  Unlike a checkpoint of the process this can
+// only be done between time steps so the current one is finished first.
+static void op_checkpoint_file(worker_t *w, const json_t *req)
+{
+   const char *path = json_string(json_get(req, "path"));
+   if (path == NULL) {
+      reply_error(w, "path is required");
+      return;
+   }
+   else if (model_is_terminated(w->model)) {
+      reply_error(w, "The simulation has ended and cannot be saved");
+      return;
+   }
+
+   const uint64_t t0 = get_timestamp_us();
+
+   if (!w->started) {
+      w->started = true;
+      model_start(w->model);
+   }
+
+   for (int i = 0; i < 100000 && !model_at_step_end(w->model)
+           && !model_is_terminated(w->model); i++)
+      model_step(w->model);
+
+   char *err = checkpoint_save(w->model, w->jit, w->ckpt_id, path);
+   if (err != NULL) {
+      reply_error(w, "The state cannot be saved: %s", err);
+      free(err);
+      return;
+   }
+
+   struct stat st;
+   const off_t size = stat(path, &st) == 0 ? st.st_size : 0;
+
+   LOCAL_TEXT_BUF tb = tb_new();
+   json_writer_t jw;
+   jw_init(&jw, tb);
+   begin_reply(&jw, true);
+   jw_key(&jw, "result");
+   jw_begin_object(&jw);
+   write_state(w, &jw);
+   jw_key(&jw, "bytes");
+   jw_int(&jw, size);
+   jw_key(&jw, "wall_ms");
+   jw_int(&jw, (get_timestamp_us() - t0) / 1000);
+   jw_end_object(&jw);
+   jw_end_object(&jw);
+   ctl_send(w, tb);
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Entry point
 
 int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
-                    const char *files_dir)
+                    const char *files_dir, const char *restore_file)
 {
    worker_t w = {
       .model       = m,
@@ -2762,6 +2815,16 @@ int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
    diag_set_consumer(worker_diag, &w);
 
    model_reset(m);
+
+   // The identity of the design must be taken before the state of a
+   // checkpoint is restored over it
+   w.ckpt_id = checkpoint_identify(m, jit);
+
+   if (restore_file != NULL) {
+      char *err = checkpoint_restore(m, jit, restore_file);
+      if (err != NULL)
+         fatal("cannot restore checkpoint: %s", err);
+   }
 
    rt_scope_t *root = find_scope(m, tree_stmt(top, 0));
    if (root == NULL)
@@ -2846,6 +2909,12 @@ int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
          op_wave_stop(&w);
       else if (!strcmp(op, "checkpoint"))
          op_checkpoint(&w);
+      else if (!strcmp(op, "checkpoint_file") && busy)
+         reply_error(&w, "The simulation is running a background run: wait "
+                     "for it with nvc_sim_wait or end it with nvc_sim_stop, "
+                     "then save the state to a file");
+      else if (!strcmp(op, "checkpoint_file"))
+         op_checkpoint_file(&w, req);
       else if (busy)
          reply_error(&w, "The simulation is running a background run, which "
                      "only allows reading: wait for it with nvc_sim_wait or "

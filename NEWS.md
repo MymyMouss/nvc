@@ -1,4 +1,15 @@
 ## Unreleased changes
+- The state of a running simulation can be saved to a file and restored
+  in a new process of the same elaborated design: `nvc -r
+  --checkpoint=FILE@TIME` writes FILE at the end of the first time step
+  at or after TIME and carries on, and `nvc -r --restore=FILE` continues
+  from it, with processes, signals, drivers, pending transactions, files
+  opened by the design and heap data restored by name rather than copied
+  from memory.  A checkpoint is refused for a different design or build
+  of nvc, and a save that cannot be exact (for example PSL properties or
+  forced signals) fails with a message naming the object.  A restore is
+  checked by saving the restored state again and comparing it with the
+  file.
 - Added an experimental Model Context Protocol server, started with
   `nvc --mcp`, that lets AI agents drive nvc.  Its tools compile and
   elaborate designs (`nvc_analyse`, `nvc_elaborate`), list source files

@@ -534,6 +534,37 @@ Stop after
 delta cycles.  This can be used to detect zero-time loops in your model.
 The default is 10000 if not specified.  Setting this to zero disables
 the delta cycle limit.
+.\" --checkpoint
+.It Fl \-checkpoint Ns = Ns Ar FILE@TIME
+Save the state of the simulation to
+.Ar FILE
+at the end of the first time step at or after the simulated time
+.Ar TIME ,
+which has the same format as for
+.Fl \-stop-time ,
+and then carry on.  The file can be given to
+.Fl \-restore
+in another run of the same elaborated design to continue from that point.
+The checkpoint is not written, and the run fails, if the state cannot be
+saved exactly: the message names the object and the reason.  Currently
+this includes designs with PSL properties, Verilog, coverage, plugins,
+forced or deposited signal values and values waited on with the
+.Cm 'active
+attribute.  Signals, drivers and their pending transactions, processes
+(including those suspended inside a procedure), variables, files open
+at that time, and the heap data of access values and dynamically sized
+arrays are saved.  Files written by the design are saved with their
+contents and input files must not have changed when the checkpoint is
+restored.
+.\" --restore
+.It Fl \-restore Ns = Ns Ar FILE
+Start the simulation from a checkpoint written by
+.Fl \-checkpoint
+instead of at time zero.  The design must be elaborated from the same
+sources by the same build of nvc, which is checked, and the restored
+state is verified before the simulation resumes.  Text printed during
+initialisation is printed again.  Files named relative to the current
+directory are looked up there, so run from the same directory.
 .\" --stop-time
 .It Fl \-stop-time Ns = Ns Ar T
 Stop the simulation after the given time has elapsed.  Format of

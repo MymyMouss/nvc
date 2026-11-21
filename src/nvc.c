@@ -30,6 +30,7 @@
 #include "printf.h"
 #include "rt/assert.h"
 #include "rt/defs.h"
+#include "rt/checkpoint.h"
 #include "rt/model.h"
 #include "rt/mspace.h"
 #include "rt/wave.h"
@@ -47,6 +48,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <assert.h>
+#include <inttypes.h>
 #include <sys/types.h>
 #include <limits.h>
 #include <unistd.h>
@@ -776,10 +778,10 @@ static int elaborate(int argc, char **argv, cmd_state_t *state)
 static uint64_t parse_time(const char *str)
 {
    char     unit[4];
-   unsigned base;
+   uint64_t base;
    uint64_t mult = 1;
 
-   if (sscanf(str, "%u%3s", &base, unit) != 2)
+   if (sscanf(str, "%"SCNu64"%3s", &base, unit) != 2)
       fatal("invalid time format: %s", str);
 
    if      (strcmp(unit, "fs") == 0)  mult = 1;
@@ -967,9 +969,14 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       { "vhpi-trace",    no_argument,       0, 'T' },
       { "gtkw",          optional_argument, 0, 'g' },
       { "shuffle",       no_argument,       0, 'H' },
+      { "checkpoint",    required_argument, 0, 'C' },
+      { "restore",       required_argument, 0, 'R' },
       { 0, 0, 0, 0 }
    };
 
+   const char     *ckpt_file = NULL;
+   uint64_t        ckpt_time = 0;
+   const char     *restore_file = NULL;
    wave_format_t   wave_fmt = WAVE_FORMAT_FST;
    uint64_t        stop_time = TIME_HIGH;
    const char     *wave_fname = NULL;
@@ -1068,6 +1075,21 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
             opt_set_int(OPT_DUMP_ARRAYS, INT_MAX);
          else
             opt_set_int(OPT_DUMP_ARRAYS, parse_int(optarg));
+         break;
+      case 'C':
+         {
+            // FILE@TIME: the last @ separates the time as a file name
+            // may contain one
+            const char *at = strrchr(optarg, '@');
+            if (at == NULL || at == optarg || at[1] == '\0')
+               fatal("invalid argument to $bold$--checkpoint$$: expected "
+                     "FILE@TIME such as state.ckpt@1ms");
+            ckpt_file = xstrndup(optarg, at - optarg);
+            ckpt_time = parse_time(at + 1);
+         }
+         break;
+      case 'R':
+         restore_file = optarg;
          break;
       case 'H':
          warnf("the $bold$--shuffle$$ option is intended for debug use only "
@@ -1171,6 +1193,29 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
 
    model_reset(state->model);
 
+   if ((ckpt_file != NULL || restore_file != NULL)
+       && (tb_len(pli_plugins) > 0 || tb_len(state->plugins) > 0))
+      fatal("$bold$--checkpoint$$ and $bold$--restore$$ cannot be used "
+            "with VHPI or VPI plugins");
+
+   // The checkpoint identifies the design as it is just after reset so
+   // this must come before the state is restored
+   if (ckpt_file != NULL)
+      checkpoint_schedule(state->model, state->jit, ckpt_file, ckpt_time);
+
+   if (restore_file != NULL) {
+      const uint64_t t0 = get_timestamp_us();
+      char *err = checkpoint_restore(state->model, state->jit, restore_file);
+      if (err != NULL)
+         fatal("cannot restore checkpoint: %s", err);
+
+      char tmbuf[64];
+      checkpoint_format_time(model_now(state->model, NULL), tmbuf,
+                             sizeof(tmbuf));
+      notef("restored checkpoint %s at %s (%.1f ms)", restore_file, tmbuf,
+            (get_timestamp_us() - t0) / 1000.0);
+   }
+
    if (dumper != NULL)
       wave_dumper_restart(dumper, state->model, state->jit);
 
@@ -1182,7 +1227,18 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
 
    set_ctrl_c_handler(NULL, NULL);
 
-   const int rc = model_exit_status(state->model);
+   int rc = model_exit_status(state->model);
+
+   if (ckpt_file != NULL && checkpoint_finish(state->model) && rc == 0)
+      rc = EXIT_FAILURE;
+
+   if (getenv("NVC_CKPT_INVENTORY") != NULL) {
+      FILE *inv = fopen(getenv("NVC_CKPT_INVENTORY"), "a");
+      if (inv != NULL) {
+         checkpoint_inventory(state->model, state->jit, inv);
+         fclose(inv);
+      }
+   }
 
    if (dumper != NULL)
       wave_dumper_free(dumper);
@@ -1689,12 +1745,13 @@ static int mcp_worker_cmd(int argc, char **argv, cmd_state_t *state)
    static struct option long_options[] = {
       { "fd", required_argument, 0, 'f' },
       { "files-dir", required_argument, 0, 'd' },
+      { "restore-from", required_argument, 0, 'R' },
       { 0, 0, 0, 0 }
    };
 
    const int next_cmd = scan_cmd(2, argc, argv);
    int c, index = 0, ctl_fd = -1;
-   const char *files_dir = NULL;
+   const char *files_dir = NULL, *restore_from = NULL;
    const char *spec = ":";
    while ((c = getopt_long(next_cmd, argv, spec, long_options, &index)) != -1) {
       switch (c) {
@@ -1704,6 +1761,9 @@ static int mcp_worker_cmd(int argc, char **argv, cmd_state_t *state)
          break;
       case 'd':
          files_dir = optarg;
+         break;
+      case 'R':
+         restore_from = optarg;
          break;
       case '?': bad_option("mcp-worker", argv);
       case ':': missing_argument("mcp-worker", argv);
@@ -1743,7 +1803,8 @@ static int mcp_worker_cmd(int argc, char **argv, cmd_state_t *state)
    state->vhpi = vhpi_context_new();
    state->vpi = vpi_context_new();
 
-   const int rc = mcp_worker_main(state->model, top, state->jit, ctl_fd, files_dir);
+   const int rc = mcp_worker_main(state->model, top, state->jit, ctl_fd,
+                                  files_dir, restore_from);
 
    vhpi_context_free(state->vhpi);
    state->vhpi = NULL;

@@ -136,6 +136,22 @@ void heap_insert(heap_t *h, uint64_t key, void *user)
    heap_decrease_key(h, h->size, key);
 }
 
+void heap_append_raw(heap_t *h, uint64_t key, void *user)
+{
+   // Used to reload a heap saved in array order: the order of nodes with
+   // equal keys depends on the history so it must be reproduced exactly
+   RT_LOCK(h->lock);
+
+   if (unlikely(h->size == h->max_size)) {
+      h->max_size *= 2;
+      h->nodes = xrealloc_array(h->nodes, h->max_size, sizeof(heap_node_t));
+   }
+
+   ++(h->size);
+   KEY(h, h->size) = key;
+   USER(h, h->size) = user;
+}
+
 void heap_walk(heap_t *h, heap_walk_fn_t fn, void *context)
 {
    RT_LOCK(h->lock);

@@ -61,6 +61,8 @@ typedef struct _rt_trigger {
    void           *pending;
    rt_trigger_t   *chain;
    trigger_kind_t  kind;
+   ident_t         owner;     // Name of the process that created it
+   unsigned        id;        // Creation order, for checkpoints
    jit_scalar_t    result;
    jit_scalar_t    args[];
 } rt_trigger_t;
