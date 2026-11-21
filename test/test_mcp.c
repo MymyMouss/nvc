@@ -3234,6 +3234,122 @@ START_TEST(test_sim_restore_changed)
 }
 END_TEST
 
+static const char conf_src[] =
+   "entity conf is end entity;\n"
+   "architecture a of conf is\n"
+   "  signal clk : bit := '0';\n"
+   "  signal n : integer := 0;\n"
+   "begin\n"
+   "  clk <= not clk after 5 ns;\n"
+   "  process (clk)\n"
+   "    variable v : integer := 0;\n"
+   "  begin\n"
+   "    if clk = '1' then\n"
+   "      if now >= 300 ns then v := v + %d; else v := v + 1; end if;\n"
+   "      n <= v;\n"
+   "    end if;\n"
+   "  end process;\n"
+   "end architecture;\n";
+
+static void rebuild_conf(fixture_t *f, int step)
+{
+   char *text = xasprintf(conf_src, step);
+   write_file(f->root, "conf.vhd", text, 0644);
+   free(text);
+   const json_t *sc = structured(tool(f->mp, f->srv, &f->sink, "nvc_analyse",
+                                      "{\"files\":[\"counter.vhd\","
+                                      "\"conf.vhd\"],\"std\":\"2008\"}"));
+   ck_assert(bool_field(sc, "ok"));
+   sc = structured(tool(f->mp, f->srv, &f->sink, "nvc_elaborate",
+                        "{\"top\":\"conf\",\"std\":\"2008\"}"));
+   ck_assert(bool_field(sc, "ok"));
+}
+
+// Open the fixed design from a periodic file and wait for the confirmation
+static const json_t *confirm_with(fixture_t *f, char *id, int step)
+{
+   rebuild_conf(f, step);
+   const json_t *sc = structured(
+      tool(f->mp, f->srv, &f->sink, "nvc_sim_open",
+           "{\"top\":\"conf\",\"std\":\"2008\",\"allow_changes\":true,"
+           "\"restore_from\":\"run1/ck-00000000000200000000.ckpt\","
+           "\"confirm_dir\":\"run1\",\"confirm_jobs\":2}"));
+   snprintf(id, 40, "%s", str_field(sc, "sim_id"));
+   ck_assert_int_eq(int_field(sc, "now_fs"), 200000000);
+
+   for (int i = 0; i < 30; i++) {
+      sc = structured(sim_tool(f, "nvc_sim_wait", id, "\"timeout_ms\":2000"));
+      const json_t *conf = json_get(sc, "confirmation");
+      ck_assert_ptr_nonnull(conf);
+      if (strcmp(str_field(conf, "state"), "running"))
+         return sc;
+   }
+
+   ck_abort_msg("the confirmation did not end");
+   return NULL;
+}
+
+START_TEST(test_sim_confirm)
+{
+   fixture_t f;
+   char *v1 = xasprintf(conf_src, 1);
+   const char *names[] = { "conf.vhd" }, *sources[] = { v1 };
+   const char *tops[] = { "conf" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   // The original run writes a file every 100 ns
+   const json_t *sc = structured(tool(f.mp, f.srv, &f.sink, "nvc_sim_open",
+                                      "{\"top\":\"conf\",\"std\":\"2008\","
+                                      "\"checkpoint_dir\":\"run1\","
+                                      "\"checkpoint_every\":\"100 ns\"}"));
+   char id[40];
+   snprintf(id, sizeof(id), "%s", str_field(sc, "sim_id"));
+   sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"500 ns\","
+            "\"pause_on\":\"never\"");
+   sc = structured(sim_tool(&f, "nvc_sim_status", id, ""));
+   const json_t *pc = json_get(sc, "periodic_checkpoints");
+   ck_assert_ptr_nonnull(pc);
+   ck_assert_int_ge(int_field(pc, "count"), 4);
+   sim_tool(&f, "nvc_sim_close", id, "");
+
+   // A directory in use is not written again
+   const char *err = tool_error(tool(f.mp, f.srv, &f.sink, "nvc_sim_open",
+                                     "{\"top\":\"conf\",\"std\":\"2008\","
+                                     "\"checkpoint_dir\":\"run1\","
+                                     "\"checkpoint_every\":\"100 ns\"}"));
+   ck_assert_ptr_nonnull(strstr(err, "already holds"));
+
+   // Confirming needs a restore into a changed design
+   err = tool_error(tool(f.mp, f.srv, &f.sink, "nvc_sim_open",
+                         "{\"top\":\"conf\",\"std\":\"2008\","
+                         "\"confirm_dir\":\"run1\"}"));
+   ck_assert_ptr_nonnull(strstr(err, "restore_from and allow_changes"));
+
+   // A fix that does not change the behaviour is confirmed
+   sc = confirm_with(&f, id, 1);
+   const json_t *conf = json_get(sc, "confirmation");
+   ck_assert_str_eq(str_field(conf, "state"), "confirmed");
+   ck_assert(bool_field(conf, "restore_point_confirmed"));
+   ck_assert_int_eq(int_field(json_get(conf, "result"), "confirmed_up_to_fs"),
+                    500000000);
+   sim_tool(&f, "nvc_sim_close", id, "");
+
+   // One that does is not, and the first segment that differs is named
+   sc = confirm_with(&f, id, 2);
+   conf = json_get(sc, "confirmation");
+   ck_assert_str_eq(str_field(conf, "state"), "different");
+   ck_assert_int_eq(int_field(json_get(json_get(conf, "result"),
+                                      "first_difference"), "segment"), 4);
+   ck_assert(!bool_field(conf, "restore_point_confirmed") ||
+             int_field(json_get(conf, "result"), "confirmed_up_to_fs")
+             >= 200000000);
+   sim_tool(&f, "nvc_sim_close", id, "");
+
+   free(v1);
+   fixture_close(&f);
+}
+END_TEST
+
 START_TEST(test_sim_restore_errors)
 {
    fixture_t f;
@@ -3656,6 +3772,7 @@ Suite *get_mcp_tests(void)
    tcase_add_test(tc, test_sim_checkpoint);
    tcase_add_test(tc, test_sim_checkpoint_file);
    tcase_add_test(tc, test_sim_restore_changed);
+   tcase_add_test(tc, test_sim_confirm);
    tcase_add_test(tc, test_sim_restore_files);
    tcase_add_test(tc, test_sim_restore_errors);
    tcase_add_test(tc, test_sim_restore_failed);

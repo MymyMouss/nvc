@@ -18,6 +18,7 @@ bin_unit_test_SOURCES = \
 	test/test_util.h \
 	test/unit_test.c \
 	test/test_ident.c \
+	test/test_checkmap.c \
 	test/test_lower.c \
 	test/test_parse.c \
 	test/test_lib.c \

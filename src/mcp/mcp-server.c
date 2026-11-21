@@ -61,7 +61,12 @@ static const char instructions[] =
    "verdict), then nvc_sim_open with restore_from and allow_changes.  "
    "The reply says whether the resume is exact or only approximate; "
    "after an approximate resume always run the fixed design from time 0 "
-   "to confirm the fix.";
+   "to confirm the fix, or let it be confirmed in the background: give "
+   "the first run checkpoint_dir and checkpoint_every, and open the "
+   "fixed design with restore_from (one of those files), allow_changes "
+   "and confirm_dir.  The status of that simulation shows the "
+   "confirmation; only the result confirmed means the fix reproduces the "
+   "original run, and nvc_sim_wait wakes when it ends.";
 
 typedef struct {
    char   *line;

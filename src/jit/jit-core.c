@@ -483,7 +483,7 @@ static uint64_t code_value(jit_t *j, uint64_t h, const jit_value_t *v)
          return code_mix(h, bits);
       }
    case JIT_VALUE_LABEL:
-      return code_mix(h, v->label);
+      return h;   // Kept apart: see jit_get_code
    case JIT_VALUE_EXIT:
       return code_mix(h, v->exit);
    case JIT_VALUE_HANDLE:
@@ -514,10 +514,44 @@ bool jit_get_code(jit_t *j, jit_handle_t handle, jit_code_t *out)
    out->restart_top = f->restart_top;
    out->restart_state = f->restart_state;
    out->has_next_tier = f->next_tier != NULL;
-   out->ihash = xmalloc_array(MAX(f->nirs, 1), sizeof(uint32_t));
+   out->hash = xmalloc_array(MAX(f->nirs, 1), sizeof(uint64_t));
+   out->label = xmalloc_array(MAX(f->nirs, 1), sizeof(uint32_t));
+   out->kind = xmalloc_array(MAX(f->nirs, 1), sizeof(uint8_t));
+   out->unsupported = false;
 
    for (unsigned i = 0; i < f->nirs; i++) {
       const jit_ir_t *ir = &(f->irbuf[i]);
+
+      // Only jumps and the case macro have a label, and only one
+      out->label[i] = JIT_NO_LABEL;
+      out->kind[i] = JIT_FLOW_NEXT;
+
+      const bool l1 = ir->arg1.kind == JIT_VALUE_LABEL;
+      const bool l2 = ir->arg2.kind == JIT_VALUE_LABEL;
+      if (l1 || l2) {
+         out->label[i] = l1 ? ir->arg1.label : ir->arg2.label;
+         if ((l1 && l2) || (ir->op != J_JUMP && ir->op != MACRO_CASE))
+            out->unsupported = true;
+      }
+
+      switch (ir->op) {
+      case J_JUMP:
+         out->kind[i] = ir->cc == JIT_CC_NONE ? JIT_FLOW_JUMP : JIT_FLOW_BRANCH;
+         break;
+      case MACRO_CASE:
+         out->kind[i] = JIT_FLOW_BRANCH;
+         break;
+      case J_RET: case J_TRAP:
+         out->kind[i] = JIT_FLOW_END;
+         break;
+      case MACRO_REEXEC:
+         out->kind[i] = JIT_FLOW_END;
+         out->unsupported = true;
+         break;
+      default:
+         break;
+      }
+
       uint64_t h = 0xcbf29ce484222325ULL;
       h = code_mix(h, ir->op);
       if (ir->op != J_DEBUG) {
@@ -527,7 +561,7 @@ bool jit_get_code(jit_t *j, jit_handle_t handle, jit_code_t *out)
          h = code_value(j, h, &(ir->arg1));
          h = code_value(j, h, &(ir->arg2));
       }
-      out->ihash[i] = (uint32_t)(h ^ (h >> 32));
+      out->hash[i] = h;
    }
 
    uint64_t ch = 0xcbf29ce484222325ULL;

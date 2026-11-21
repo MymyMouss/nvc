@@ -591,6 +591,72 @@ With
 .Fl \-allow-changes ,
 write the verdict, the changed units and whether each had run, as JSON to
 .Ar FILE .
+.\" --checkpoint every
+.It Fl \-checkpoint Ns = Ns Ar DIR@every=INTERVAL[,max=N]
+Write a checkpoint into the new directory
+.Ar DIR
+every
+.Ar INTERVAL
+of simulated time (the format is that of
+.Fl \-stop-time ) ,
+at the end of the first time step at or after each multiple, in files named
+by the time they were written at.  At most
+.Ar N
+(default 64) are kept: when there would be more every second one is deleted
+and the interval doubles.  Checkpoints written while waveform dumping is on
+cannot be used for confirmation.
+.\" --confirm
+.It Fl \-confirm Ns = Ns Ar DIR
+Instead of simulating, check that the design as it is now reproduces the
+run that wrote the checkpoints in
+.Ar DIR :
+the state of each checkpoint is restored into the design, which runs to the
+time of the next checkpoint and saves its state, and the two states are
+compared section by section.  The first segment starts from time zero.
+The state restored for each segment is verified by saving it again, and a
+segment that cannot be verified is reported as not checked, never as
+confirmed.  The result is
+.Cm confirmed
+if the design run from time zero would pass through every saved state,
+.Cm different
+with the first segment, its time interval and the object that differs, or
+.Cm incomplete
+with the segments that were not checked and why.  The exit status is 0, 1 or
+2.  Progress is printed as segments end and the result is written to
+.Fl \-confirm-result .
+A run that is interrupted (SIGINT) can be repeated with the same arguments:
+segments already settled for the same design, program, inputs and
+checkpoints are not run again.  Segments run in directories below
+.Ar DIR
+with the input files the design read made available by name, so a design
+that writes files by absolute path may overwrite them.
+.\" --jobs
+.It Fl \-jobs Ns = Ns Ar N
+With
+.Fl \-confirm ,
+run up to
+.Ar N
+segments at the same time.  The default is 1.
+.\" --confirm-budget
+.It Fl \-confirm-budget Ns = Ns Ar SECONDS
+With
+.Fl \-confirm ,
+start no new segment after this much real time and report the coverage
+reached, which is then incomplete.
+.\" --confirm-max
+.It Fl \-confirm-max Ns = Ns Ar N
+With
+.Fl \-confirm ,
+run at most
+.Ar N
+segments.
+.\" --confirm-result
+.It Fl \-confirm-result Ns = Ns Ar FILE
+With
+.Fl \-confirm ,
+write the result as JSON to
+.Ar FILE
+instead of standard output.
 .\" --stop-time
 .It Fl \-stop-time Ns = Ns Ar T
 Stop the simulation after the given time has elapsed.  Format of

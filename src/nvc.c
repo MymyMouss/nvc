@@ -31,6 +31,7 @@
 #include "rt/assert.h"
 #include "rt/defs.h"
 #include "rt/checkpoint.h"
+#include "rt/confirm.h"
 #include "rt/model.h"
 #include "rt/mspace.h"
 #include "rt/wave.h"
@@ -90,6 +91,8 @@ const char version_string[] =
    LLVM_ONLY(" (Using LLVM " LLVM_VERSION ")") DEBUG_ONLY(" [debug]");
 
 static int process_command(int argc, char **argv, cmd_state_t *state);
+static char **g_global_argv;
+static const char *g_global_work;
 static int parse_int(const char *str);
 static jit_t *get_jit(cmd_state_t *state);
 
@@ -973,11 +976,24 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       { "restore",       required_argument, 0, 'R' },
       { "allow-changes", no_argument,       0, 'A' },
       { "verdict",       required_argument, 0, 'V' },
+      { "resave",        required_argument, 0, 'J' },
+      { "confirm",       required_argument, 0, 'F' },
+      { "jobs",          required_argument, 0, 'j' },
+      { "confirm-budget", required_argument, 0, 'B' },
+      { "confirm-max",   required_argument, 0, 'N' },
+      { "confirm-result", required_argument, 0, 'Q' },
       { 0, 0, 0, 0 }
    };
 
    bool            allow_changes = false;
    const char     *verdict_file = NULL;
+   const char     *resave_file = NULL;
+   const char     *confirm_dir = NULL, *confirm_result = NULL;
+   unsigned        confirm_jobs = 1, confirm_max = 0;
+   double          confirm_budget = 0;
+   const char     *every_dir = NULL;
+   uint64_t        every = 0;
+   unsigned        every_max = 64;
    const char     *ckpt_file = NULL;
    uint64_t        ckpt_time = 0;
    const char     *restore_file = NULL;
@@ -1087,9 +1103,27 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
             const char *at = strrchr(optarg, '@');
             if (at == NULL || at == optarg || at[1] == '\0')
                fatal("invalid argument to $bold$--checkpoint$$: expected "
-                     "FILE@TIME such as state.ckpt@1ms");
-            ckpt_file = xstrndup(optarg, at - optarg);
-            ckpt_time = parse_time(at + 1);
+                     "FILE@TIME such as state.ckpt@1ms or DIR@every=1ms");
+
+            if (strncmp(at + 1, "every=", 6) == 0) {
+               // DIR@every=INTERVAL[,max=COUNT]
+               char *spec = xstrdup(at + 7);
+               char *comma = strchr(spec, ',');
+               if (comma != NULL) {
+                  *comma = '\0';
+                  if (strncmp(comma + 1, "max=", 4) != 0)
+                     fatal("invalid argument to $bold$--checkpoint$$: "
+                           "expected max=COUNT after the interval");
+                  every_max = parse_int(comma + 5);
+               }
+               every = parse_time(spec);
+               every_dir = xstrndup(optarg, at - optarg);
+               free(spec);
+            }
+            else {
+               ckpt_file = xstrndup(optarg, at - optarg);
+               ckpt_time = parse_time(at + 1);
+            }
             jit_exec_tracking = true;
          }
          break;
@@ -1102,6 +1136,24 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
          break;
       case 'V':
          verdict_file = optarg;
+         break;
+      case 'J':
+         resave_file = optarg;   // For tests: save right after a restore
+         break;
+      case 'F':
+         confirm_dir = optarg;
+         break;
+      case 'j':
+         confirm_jobs = parse_int(optarg);
+         break;
+      case 'B':
+         confirm_budget = parse_int(optarg);
+         break;
+      case 'N':
+         confirm_max = parse_int(optarg);
+         break;
+      case 'Q':
+         confirm_result = optarg;
          break;
       case 'H':
          warnf("the $bold$--shuffle$$ option is intended for debug use only "
@@ -1125,6 +1177,28 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
    }
 
    set_top_level(argv, next_cmd, state);
+
+   if (confirm_dir != NULL) {
+      // Run segments of the simulation in other processes: nothing is loaded
+      // here
+      unsigned nglobal = 0;
+      while (g_global_argv[nglobal] != NULL)
+         nglobal++;
+
+      char **args = xcalloc_array(nglobal + 3, sizeof(char *));
+      for (unsigned i = 0; i < nglobal; i++)
+         args[i] = g_global_argv[i];
+
+      char *abswork = realpath(g_global_work, NULL);
+      args[nglobal] = xasprintf("--work=%s", abswork ?: g_global_work);
+
+      const confirm_opts_t opts = {
+         .dir = confirm_dir, .top = state->top_level_arg, .child_args = args,
+         .jobs = confirm_jobs, .budget_s = confirm_budget,
+         .max_segments = confirm_max, .result_file = confirm_result,
+      };
+      return confirm_run(&opts);
+   }
 
    ident_t ename = ident_prefix(state->top_level, well_known(W_ELAB), '.');
 
@@ -1205,15 +1279,25 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
 
    model_reset(state->model);
 
-   if ((ckpt_file != NULL || restore_file != NULL)
+   if ((ckpt_file != NULL || restore_file != NULL || every_dir != NULL)
        && (tb_len(pli_plugins) > 0 || tb_len(state->plugins) > 0))
       fatal("$bold$--checkpoint$$ and $bold$--restore$$ cannot be used "
             "with VHPI or VPI plugins");
 
    // The checkpoint identifies the design as it is just after reset so
    // this must come before the state is restored
+   checkpoint_note_wave(dumper != NULL);
+
    if (ckpt_file != NULL)
       checkpoint_schedule(state->model, state->jit, ckpt_file, ckpt_time);
+
+   if (every_dir != NULL)
+      checkpoint_schedule_every(state->model, state->jit, every_dir, every,
+                                every_max);
+
+   ckpt_id_t *resave_id = NULL;
+   if (restore_file != NULL && resave_file != NULL)
+      resave_id = checkpoint_identify(state->model, state->jit);
 
    if (restore_file != NULL) {
       const uint64_t t0 = get_timestamp_us();
@@ -1258,6 +1342,13 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       }
 
       checkpoint_report_free(&rep);
+
+      if (resave_file != NULL) {
+         char *serr = checkpoint_save(state->model, state->jit, resave_id,
+                                      resave_file);
+         if (serr != NULL)
+            fatal("cannot save after restore: %s", serr);
+      }
    }
 
    if (dumper != NULL)
@@ -1273,7 +1364,8 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
 
    int rc = model_exit_status(state->model);
 
-   if (ckpt_file != NULL && checkpoint_finish(state->model) && rc == 0)
+   if ((ckpt_file != NULL || every_dir != NULL)
+       && checkpoint_finish(state->model) && rc == 0)
       rc = EXIT_FAILURE;
 
    if (getenv("NVC_CKPT_INVENTORY") != NULL) {
@@ -1792,12 +1884,15 @@ static int mcp_worker_cmd(int argc, char **argv, cmd_state_t *state)
       { "restore-from", required_argument, 0, 'R' },
       { "allow-changes", no_argument, 0, 'A' },
       { "track-code", no_argument, 0, 'T' },
+      { "checkpoint-dir", required_argument, 0, 'D' },
+      { "checkpoint-every", required_argument, 0, 'E' },
       { 0, 0, 0, 0 }
    };
 
    const int next_cmd = scan_cmd(2, argc, argv);
    int c, index = 0, ctl_fd = -1;
-   const char *files_dir = NULL, *restore_from = NULL;
+   const char *files_dir = NULL, *restore_from = NULL, *every_dir = NULL;
+   uint64_t every_fs = 0;
    bool allow_changes = false;
    const char *spec = ":";
    while ((c = getopt_long(next_cmd, argv, spec, long_options, &index)) != -1) {
@@ -1818,6 +1913,13 @@ static int mcp_worker_cmd(int argc, char **argv, cmd_state_t *state)
          break;
       case 'T':
          jit_exec_tracking = true;
+         break;
+      case 'D':
+         every_dir = optarg;
+         jit_exec_tracking = true;
+         break;
+      case 'E':
+         every_fs = strtoull(optarg, NULL, 10);
          break;
       case '?': bad_option("mcp-worker", argv);
       case ':': missing_argument("mcp-worker", argv);
@@ -1860,7 +1962,8 @@ static int mcp_worker_cmd(int argc, char **argv, cmd_state_t *state)
    state->vpi = vpi_context_new();
 
    const int rc = mcp_worker_main(state->model, top, state->jit, ctl_fd,
-                                  files_dir, restore_from, allow_changes);
+                                  files_dir, restore_from, allow_changes,
+                                  every_dir, every_fs);
 
    vhpi_context_free(state->vhpi);
    state->vhpi = NULL;
@@ -2883,6 +2986,14 @@ int main(int argc, char **argv)
    cmd_state_t state = { .plugins = tb_new() };
 
    const int next_cmd = scan_cmd(1, argc, argv);
+
+   // Kept for programs started to run parts of a simulation
+   g_global_argv = xcalloc_array(next_cmd + 2, sizeof(char *));
+   g_global_argv[0] = xstrdup("/proc/self/exe");
+   for (int i = 1; i < next_cmd; i++)
+      g_global_argv[i] = xstrdup(argv[i]);
+   g_global_argv[next_cmd] = NULL;
+   g_global_work = work_name;
    int c, index = 0;
    const char *spec = ":hivL:M:P:G:H:";
    while ((c = getopt_long(next_cmd, argv, spec, long_options, &index)) != -1) {
@@ -2965,6 +3076,7 @@ int main(int argc, char **argv)
 
    state.work = lib_new(work_name);
    lib_set_work(state.work);
+   g_global_work = work_name;
 
    // Shuffle the arguments to put all the plusargs first
    qsort(argv + optind, next_cmd - optind, sizeof(char *), plusarg_cmp);

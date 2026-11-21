@@ -111,9 +111,21 @@ unsigned jit_handle_count(jit_t *j);
 // flag before any function is compiled.
 extern bool jit_exec_tracking;
 
+#define JIT_NO_LABEL UINT32_MAX
+
+typedef enum {
+   JIT_FLOW_NEXT,      // Continues with the next instruction
+   JIT_FLOW_JUMP,      // Always goes to its label
+   JIT_FLOW_BRANCH,    // Goes to its label or to the next instruction
+   JIT_FLOW_END,       // Does not continue
+} jit_flow_t;
+
 typedef struct {
    unsigned       nirs;
-   uint32_t      *ihash;      // Of each instruction, free with free()
+   uint64_t      *hash;       // Of each instruction without its branch target
+   uint32_t      *label;      // Branch target of each, or JIT_NO_LABEL
+   uint8_t       *kind;       // JIT_FLOW_* of each: free all three with free()
+   bool           unsupported;   // Control flow that is not understood
    const uint8_t *exec;       // NULL if not tracked
    uint64_t       cpool_hash;
    size_t         cpool_size;

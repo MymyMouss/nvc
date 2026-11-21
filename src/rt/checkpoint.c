@@ -36,6 +36,7 @@
 #include "mir/mir-unit.h"
 #include "rt/assert.h"
 #include "rt/checkpoint.h"
+#include "rt/checkmap.h"
 #include "rt/fileio.h"
 #include "rt/heap.h"
 #include "rt/model.h"
@@ -453,6 +454,7 @@ typedef struct {
    unit_class_t cls;
    bool         old_restart, new_restart;
    int          new_state;     // Resume state of the new code, if it restarts
+   bool         by_mapping, prefix_ran;
 } unit_t;
 
 __attribute__((format(printf, 2, 3)))
@@ -480,6 +482,8 @@ void checkpoint_report_free(ckpt_report_t *rep)
       free(rep->notes[i]);
    free(rep->changed);
    free(rep->executed);
+   free(rep->by_mapping);
+   free(rep->prefix_ran);
    free(rep->notes);
    memset(rep, '\0', sizeof(*rep));
 }
@@ -501,14 +505,18 @@ static void json_escape(text_buf_t *tb, const char *s)
 char *checkpoint_report_json(const ckpt_report_t *rep)
 {
    LOCAL_TEXT_BUF tb = tb_new();
-   tb_printf(tb, "{\"verdict\":\"%s\",\"tracked\":%s,\"changed_units\":[",
+   tb_printf(tb, "{\"verdict\":\"%s\",\"verdict_without_mappings\":\"%s\","
+             "\"tracked\":%s,\"state_verified\":%s,\"changed_units\":[",
              rep->exact ? "exact" : "approximate",
-             rep->tracked ? "true" : "false");
+             rep->exact_prefix ? "exact" : "approximate",
+             rep->tracked ? "true" : "false",
+             rep->verified ? "true" : "false");
    for (unsigned i = 0; i < rep->nchanged; i++) {
       tb_printf(tb, "%s{\"unit\":", i ? "," : "");
       json_escape(tb, rep->changed[i]);
-      tb_printf(tb, ",\"executed_before_checkpoint\":%s}",
-                rep->executed[i] ? "true" : "false");
+      tb_printf(tb, ",\"executed_before_checkpoint\":%s,\"equivalent_by_mapping\":%s}",
+                rep->executed[i] ? "true" : "false",
+                rep->by_mapping[i] ? "true" : "false");
    }
    tb_cat(tb, "],\"reasons\":[");
    for (unsigned i = 0; i < rep->nnotes; i++) {
@@ -543,6 +551,13 @@ typedef struct {
    unsigned     fkind;
    size_t       size;
 } range_t;
+
+static bool g_wave;
+
+void checkpoint_note_wave(bool on)
+{
+   g_wave = on;
+}
 
 typedef struct {
    rt_model_t   *m;
@@ -585,6 +600,7 @@ typedef struct {
    file_ckpt_t  *sfiles;      // Files named by a checkpoint being restored
    file_handle_t *sfh;        // Handle each was given in this model
    unsigned      nsfiles;
+   const char   *saved_cwd;   // Where the design was when it was saved
    bool          allow;       // Restoring into a changed design
    ckpt_report_t *rep;
    shash_t      *units;       // Code of the checkpoint against this build
@@ -2285,10 +2301,10 @@ static void save_files(index_t *ix, wbuf_t *w)
    for (unsigned i = 0; i < ix->nfiles; i++)
       user |= !ix->fst[i].predef;
 
-   char cwd[4096] = "";
-   if (user && getcwd(cwd, sizeof(cwd)) == NULL)
-      cwd[0] = '\0';
-   w_cname(w, cwd);
+   // The directory is recorded after the state, where it takes no part in
+   // comparing two checkpoints
+   w_cname(w, "");
+   (void)user;
 
    for (unsigned i = 0; i < ix->nfiles; i++) {
       const file_ckpt_t *f = &(ix->fst[i]);
@@ -2410,6 +2426,7 @@ static char *serialise_model(index_t *ix, wbuf_t *w, bool check_quiet)
    for (int i = 0; i < 4; i++)
       w_u32(w, counts[i]);
    w_u32(w, mask);
+   w_u8(w, g_wave);
 
    // Packages are initialised lazily so a restore must do the same ones
    w_tag(w, "PKGS");
@@ -2472,7 +2489,10 @@ typedef struct {
    unsigned  nirs;
    bool      restart;
    uint64_t  cphash;
-   uint32_t *ihash;
+   bool      unsupported;
+   uint64_t *hash;
+   uint32_t *label;
+   uint8_t  *kind;
    uint8_t  *bits;      // One bit per instruction, or NULL if not known
 } oldunit_t;
 
@@ -2480,13 +2500,17 @@ typedef struct {
    bool       tracked;
    oldunit_t *units;
    unsigned   nunits;
+   char      *cwd;
 } exec_info_t;
 
 static void exec_free(exec_info_t *e)
 {
+   free(e->cwd);
    for (unsigned i = 0; i < e->nunits; i++) {
       free(e->units[i].name);
-      free(e->units[i].ihash);
+      free(e->units[i].hash);
+      free(e->units[i].label);
+      free(e->units[i].kind);
       free(e->units[i].bits);
    }
    free(e->units);
@@ -2522,8 +2546,12 @@ static void save_exec(jit_t *jit, wbuf_t *t)
       w_u32(t, c->nirs);
       w_u8(t, c->restart_top);
       w_u64(t, c->cpool_hash);
-      for (unsigned i = 0; i < c->nirs; i++)
-         w_u32(t, c->ihash[i]);
+      w_u8(t, c->unsupported);
+      for (unsigned i = 0; i < c->nirs; i++) {
+         w_u64(t, c->hash[i]);
+         w_u32(t, c->label[i]);
+         w_u8(t, c->kind[i]);
+      }
       if (tracked) {
          for (unsigned i = 0; i < c->nirs; i += 8) {
             uint8_t b = 0;
@@ -2533,11 +2561,18 @@ static void save_exec(jit_t *jit, wbuf_t *t)
          }
       }
 
-      free(c->ihash);
+      free(c->hash);
+      free(c->label);
+      free(c->kind);
    }
 
    free(codes);
    free(have);
+
+   char cwd[4096] = "";
+   if (getcwd(cwd, sizeof(cwd)) == NULL)
+      cwd[0] = '\0';
+   w_str(t, cwd);
 }
 
 static bool parse_exec(const uint8_t *data, size_t len, exec_info_t *e)
@@ -2563,12 +2598,18 @@ static bool parse_exec(const uint8_t *data, size_t len, exec_info_t *e)
       u->nirs    = r_u32(&r);
       u->restart = r_u8(&r);
       u->cphash  = r_u64(&r);
-      if (r.err != NULL || (size_t)u->nirs * 4 > (size_t)(r.end - r.p))
+      u->unsupported = r_u8(&r);
+      if (r.err != NULL || (size_t)u->nirs * 13 > (size_t)(r.end - r.p))
          break;
 
-      u->ihash = xmalloc_array(MAX(u->nirs, 1), sizeof(uint32_t));
-      for (unsigned k = 0; k < u->nirs; k++)
-         u->ihash[k] = r_u32(&r);
+      u->hash = xmalloc_array(MAX(u->nirs, 1), sizeof(uint64_t));
+      u->label = xmalloc_array(MAX(u->nirs, 1), sizeof(uint32_t));
+      u->kind = xmalloc_array(MAX(u->nirs, 1), sizeof(uint8_t));
+      for (unsigned k = 0; k < u->nirs; k++) {
+         u->hash[k] = r_u64(&r);
+         u->label[k] = r_u32(&r);
+         u->kind[k] = r_u8(&r);
+      }
 
       if (e->tracked) {
          const size_t nb = (u->nirs + 7) / 8;
@@ -2580,6 +2621,13 @@ static bool parse_exec(const uint8_t *data, size_t len, exec_info_t *e)
       }
 
       e->nunits++;
+   }
+
+   if (r.err == NULL) {
+      const uint32_t clen = r_u32(&r);
+      const uint8_t *cw = r_bytes(&r, clen);
+      if (cw != NULL)
+         e->cwd = xstrndup((const char *)cw, clen);
    }
 
    const bool ok = r.err == NULL && e->nunits == count;
@@ -2630,7 +2678,13 @@ static void analyse_units(const exec_info_t *e, jit_t *jit, shash_t *units,
          rep->executed = xrealloc_array(rep->executed, rep->nchanged + 1,
                                         sizeof(bool));
          rep->changed[rep->nchanged] = xstrdup(u->name);
-         rep->executed[rep->nchanged++] = ran;
+         rep->executed[rep->nchanged] = ran;
+         rep->by_mapping = xrealloc_array(rep->by_mapping, rep->nchanged + 1,
+                                          sizeof(bool));
+         rep->by_mapping[rep->nchanged] = false;
+         rep->prefix_ran = xrealloc_array(rep->prefix_ran, rep->nchanged + 1,
+                                          sizeof(bool));
+         rep->prefix_ran[rep->nchanged++] = ran;
          if (ran)
             info->cls = U_APPROX;
          continue;
@@ -2640,7 +2694,8 @@ static void analyse_units(const exec_info_t *e, jit_t *jit, shash_t *units,
       info->new_state = c.restart_state;
 
       bool same = c.nirs == u->nirs && c.cpool_hash == u->cphash
-         && memcmp(c.ihash, u->ihash, u->nirs * sizeof(uint32_t)) == 0;
+         && memcmp(c.hash, u->hash, u->nirs * sizeof(uint64_t)) == 0
+         && memcmp(c.label, u->label, u->nirs * sizeof(uint32_t)) == 0;
 
       if (same) {
          info->cls = U_SAME;
@@ -2649,37 +2704,77 @@ static void analyse_units(const exec_info_t *e, jit_t *jit, shash_t *units,
       else {
          unsigned prefix = 0;
          const unsigned lim = MIN(c.nirs, u->nirs);
-         while (prefix < lim && c.ihash[prefix] == u->ihash[prefix])
+         while (prefix < lim && c.hash[prefix] == u->hash[prefix]
+                && c.label[prefix] == u->label[prefix])
             prefix++;
 
          // Constants of the unit are shared by all its code so a change
          // to them counts as a change from the start
-         if (c.cpool_hash != u->cphash)
+         const bool cpool_same = c.cpool_hash == u->cphash;
+         if (!cpool_same)
             prefix = 0;
 
          if (getenv("NVC_CKPT_DEBUG"))
             fprintf(stderr, "unit %s changed: nirs %u->%u prefix %u cpool %s\n",
                     u->name, u->nirs, c.nirs, prefix,
-                    c.cpool_hash != u->cphash ? "differs" : "same");
+                    cpool_same ? "same" : "differs");
 
+         // The old rule: nothing at or after the first difference ran
          bool ran = !e->tracked;
          for (unsigned k = prefix; e->tracked && k < u->nirs; k++)
             ran |= bit_set(u->bits, k);
 
-         info->cls = ran ? U_APPROX : U_COMPAT;
+         // The new rule: the code that ran maps onto the new code
+         bool confirmed = false;
+         if (ran && e->tracked && cpool_same && !u->unsupported) {
+            uint8_t *marks = xmalloc(MAX(u->nirs, 1));
+            for (unsigned k = 0; k < u->nirs; k++)
+               marks[k] = bit_set(u->bits, k);
+
+            const code_view_t ov = {
+               .n = u->nirs, .hash = u->hash, .label = u->label,
+               .kind = u->kind, .exec = marks,
+            };
+            const code_view_t nv = {
+               .n = c.nirs, .hash = c.hash, .label = c.label, .kind = c.kind,
+               .unsupported = c.unsupported,
+            };
+
+            int32_t *image = xmalloc_array(MAX(u->nirs, 1), sizeof(int32_t));
+            checkmap_propose(&ov, &nv, image);
+            const char *why = checkmap_confirm(&ov, &nv, image);
+            if (getenv("NVC_CKPT_DEBUG"))
+               fprintf(stderr, "unit %s mapping: %s\n", u->name,
+                       why ?: "confirmed");
+            confirmed = (why == NULL);
+            free(image);
+            free(marks);
+         }
+
+         info->cls = (ran && !confirmed) ? U_APPROX : U_COMPAT;
+         info->by_mapping = ran && confirmed;
+         info->prefix_ran = ran;
 
          rep->changed = xrealloc_array(rep->changed, rep->nchanged + 1,
                                        sizeof(char *));
          rep->executed = xrealloc_array(rep->executed, rep->nchanged + 1,
                                         sizeof(bool));
          rep->changed[rep->nchanged] = xstrdup(u->name);
-         rep->executed[rep->nchanged++] = ran;
+         rep->executed[rep->nchanged] = ran && !confirmed;
+         rep->by_mapping = xrealloc_array(rep->by_mapping, rep->nchanged + 1,
+                                          sizeof(bool));
+         rep->by_mapping[rep->nchanged] = ran && confirmed;
+         rep->prefix_ran = xrealloc_array(rep->prefix_ran, rep->nchanged + 1,
+                                          sizeof(bool));
+         rep->prefix_ran[rep->nchanged++] = ran;
 
          // Whatever ran in the old code says nothing about the new code
          jit_set_exec(jit, h, NULL, 0, true);
       }
 
-      free(c.ihash);
+      free(c.hash);
+      free(c.label);
+      free(c.kind);
    }
 }
 
@@ -3110,12 +3205,21 @@ static bool restore_file_table(index_t *ix, rbuf_t *r)
    if (r->err != NULL)
       return false;
 
-   if (n > 0 && *name_str(cwd) != '\0') {
+   (void)cwd;
+   bool user = false;
+
+   // Files are named as the design named them, so they are looked for in
+   // the directory it was in, unless told it does not matter
+   const uint8_t *scan = r->p;
+   (void)scan;
+   if (n > 0 && ix->saved_cwd != NULL && *ix->saved_cwd != '\0'
+       && getenv("NVC_CKPT_ANYDIR") == NULL) {
       char here[4096];
-      if (getcwd(here, sizeof(here)) == NULL || strcmp(here, name_str(cwd)) != 0) {
-         r_fail(r, "the design had files open, which are named relative to "
-                "the directory %s: run from there", istr(cwd));
-         return false;
+      if (getcwd(here, sizeof(here)) == NULL
+          || strcmp(here, ix->saved_cwd) != 0) {
+         // Only a problem for files that are not the standard streams, which
+         // the table shows below
+         user = true;
       }
    }
 
@@ -3131,6 +3235,11 @@ static bool restore_file_table(index_t *ix, rbuf_t *r)
    for (unsigned i = 0; i < n && r->err == NULL; i++) {
       file_ckpt_t *f = &(ix->sfiles[i]);
       f->predef = r_u8(r);
+      if (!f->predef && user) {
+         r_fail(r, "the design had files open, which are named relative to "
+                "the directory %s: run from there", ix->saved_cwd);
+         return false;
+      }
       f->mode   = r_u8(r);
       f->name   = xstrdup(istr(r_name(r)));
       f->pos    = r_u64(r);
@@ -3293,7 +3402,8 @@ static bool restore_processes(index_t *ix, rbuf_t *r)
           && pu->old_restart && pu->new_restart && pu->new_state >= 0) {
          // It starts again from the top whatever it was waiting for
          resume = pu->new_state;
-         ix->rep->layout_changed = true;   // So not byte for byte comparable
+         if (resume != state)
+            ix->rep->layout_changed = true;   // Not byte for byte comparable
          report_note(ix->rep, "process %s resumes from its start", istr(name));
       }
       else if (pu != NULL && pu->cls == U_APPROX) {
@@ -3573,6 +3683,7 @@ static void restore_model_cb(void *arg)
    for (int i = 0; i < 4; i++)
       counts[i] = r_u32(r);
    mask = r_u32(r);
+   r_u8(r);   // Whether waveform dumping was on
    if (r->err != NULL)
       goto fail;
 
@@ -3593,6 +3704,7 @@ static void restore_model_cb(void *arg)
 
    ix.allow = ra->allow;
    ix.rep   = ra->rep;
+   ix.saved_cwd = ra->exec->cwd;
    ix.units = units;
 
    for (unsigned i = 0; i < ix.nprocs; i++) {
@@ -3988,6 +4100,9 @@ char *checkpoint_restore(rt_model_t *m, jit_t *jit, const char *path,
    // the design is the same apart from that code
    unsigned nran = 0;
    for (unsigned i = 0; i < rep->nchanged; i++) {
+      if (rep->by_mapping[i])
+         report_note(rep, "unit %s changed in code that had not run, shown "
+                     "by a mapping of the code that had", rep->changed[i]);
       if (rep->executed[i]) {
          nran++;
          report_note(rep, "unit %s changed and had already run",
@@ -4001,6 +4116,12 @@ char *checkpoint_restore(rt_model_t *m, jit_t *jit, const char *path,
       report_note(rep, "the elaborated design is not the same");
 
    rep->exact = design_same && !rep->layout_changed && nran == 0
+      && (rep->nchanged == 0 || exec.tracked);
+
+   unsigned nprefix = 0;
+   for (unsigned i = 0; i < rep->nchanged; i++)
+      nprefix += rep->prefix_ran[i];
+   rep->exact_prefix = design_same && !rep->layout_changed && nprefix == 0
       && (rep->nchanged == 0 || exec.tracked);
 
    // Serialise the restored model again: it must come out identical to
@@ -4036,6 +4157,9 @@ char *checkpoint_restore(rt_model_t *m, jit_t *jit, const char *path,
                          section_before(payload, off), (size_t)length, wlen);
       }
 
+      if (err == NULL)
+         rep->verified = true;
+
       free(wbody);
       w_free(&w);
    }
@@ -4048,6 +4172,334 @@ char *checkpoint_restore(rt_model_t *m, jit_t *jit, const char *path,
    free(data);
    exec_free(&exec);
    return err;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Reading and comparing files
+
+static bool load_payload(const char *path, uint8_t **data, const uint8_t **pl,
+                         size_t *length, const uint8_t **trailer,
+                         size_t *tlen, char **err)
+{
+   FILE *f = fopen(path, "rb");
+   if (f == NULL) {
+      *err = xasprintf("cannot open %s: %s", path, strerror(errno));
+      return false;
+   }
+
+   fseek(f, 0, SEEK_END);
+   const long fsize = ftell(f);
+   fseek(f, 0, SEEK_SET);
+
+   *data = xmalloc(MAX(fsize, 1));
+   const bool rd = fread(*data, 1, fsize, f) == (size_t)fsize;
+   fclose(f);
+
+   if (!rd || fsize < 20 || memcmp(*data, CKPT_MAGIC, 8) != 0) {
+      *err = xasprintf("%s is not a checkpoint file", path);
+      free(*data);
+      return false;
+   }
+
+   rbuf_t r = { .p = *data + 8, .end = *data + fsize };
+   r_u32(&r);
+   const uint32_t vlen = r_u32(&r);
+   r_bytes(&r, vlen);
+   r_u64(&r);
+   r_u64(&r);
+   r_u64(&r);
+   const uint64_t len = r_u64(&r);
+   r_u64(&r);
+   if (r.err != NULL || len > (uint64_t)(r.end - r.p)) {
+      *err = xasprintf("%s is truncated", path);
+      free(r.err);
+      free(*data);
+      return false;
+   }
+
+   *pl = r.p;
+   *length = len;
+
+   if (trailer != NULL) {
+      rbuf_t t = { .p = r.p + len, .end = r.end };
+      const uint64_t xlen = r_u64(&t);
+      r_u64(&t);
+      *trailer = r_bytes(&t, xlen);
+      *tlen = xlen;
+      free(t.err);
+   }
+
+   return true;
+}
+
+char *checkpoint_describe(const char *path, ckpt_info_t *info)
+{
+   memset(info, '\0', sizeof(*info));
+
+   uint8_t *data;
+   const uint8_t *pl;
+   size_t length;
+   char *err = NULL;
+   if (!load_payload(path, &data, &pl, &length, NULL, NULL, &err))
+      return err;
+
+   rbuf_t r = { .p = pl, .end = pl + length };
+   if (r_names_load(&r) && r_tag(&r, "META")) {
+      info->time_fs = r_u64(&r);
+      r_u32(&r);
+      r_u64(&r);
+      for (int i = 0; i < 5; i++)
+         r_u32(&r);
+      info->wave = r_u8(&r);
+
+      if (r_tag(&r, "PKGS")) {
+         const uint32_t npkgs = r_u32(&r);
+         for (unsigned i = 0; i < npkgs && r.err == NULL; i++)
+            r_name(&r);
+      }
+
+      if (r.err == NULL && r_tag(&r, "FILE")) {
+         const uint32_t n = r_u32(&r);
+         r_name(&r);
+         for (unsigned i = 0; i < n && r.err == NULL; i++) {
+            const uint8_t predef = r_u8(&r);
+            const uint8_t mode = r_u8(&r);
+            ident_t name = r_name(&r);
+            r_u64(&r);
+            const uint64_t size = r_u64(&r);
+            r_u64(&r);
+            if (!predef && mode != FILE_READ)
+               r_bytes(&r, size);
+            else if (!predef && r.err == NULL) {
+               info->inputs = xrealloc_array(info->inputs, info->ninputs + 1,
+                                             sizeof(char *));
+               info->inputs[info->ninputs++] = xstrdup(istr(name));
+            }
+         }
+      }
+   }
+
+   if (r.err != NULL)
+      err = xasprintf("%s: %s", path, r.err);
+
+   free(r.err);
+   free(r.names);
+   free(data);
+   return err;
+}
+
+void checkpoint_info_free(ckpt_info_t *info)
+{
+   for (unsigned i = 0; i < info->ninputs; i++)
+      free(info->inputs[i]);
+   free(info->inputs);
+   memset(info, '\0', sizeof(*info));
+}
+
+// The name of the record that holds a byte of a section, found by walking
+// the records that have a name and a length
+static char *record_at(const uint8_t *pl, size_t length, size_t off,
+                       const char *section)
+{
+   rbuf_t r = { .p = pl, .end = pl + length };
+   if (!r_names_load(&r))
+      return NULL;
+
+   char *result = NULL;
+   const uint8_t *base = pl;
+
+   for (const uint8_t *p = r.p; p + 4 <= pl + length; p++) {
+      if (memcmp(p, section, 4) != 0)
+         continue;
+
+      rbuf_t q = { .p = p + 4, .end = pl + length, .names = r.names,
+                   .nnames = r.nnames };
+      const uint32_t n = r_u32(&q);
+      for (unsigned i = 0; i < n && q.err == NULL; i++) {
+         uint8_t kind = 0;
+         if (!strcmp(section, "FRMS"))
+            kind = r_u8(&q);
+         ident_t name = r_name(&q);
+         const uint32_t len = r_u32(&q);
+         if (q.err != NULL || !r_ok(&q, len))
+            break;
+
+         if ((size_t)(q.p - base) <= off && off < (size_t)(q.p + len - base)) {
+            result = xasprintf("%s%s%s", istr(name), kind ? " (kind " : "",
+                               kind ? "" : "");
+            break;
+         }
+         q.p += len;
+      }
+      free(q.err);
+      if (result != NULL || (size_t)(p - base) > off)
+         break;
+   }
+
+   free(r.names);
+   free(r.err);
+   return result;
+}
+
+char *checkpoint_compare(const char *a, const char *b)
+{
+   uint8_t *da, *db;
+   const uint8_t *pa, *pb;
+   size_t la, lb;
+   char *err = NULL;
+
+   if (!load_payload(a, &da, &pa, &la, NULL, NULL, &err))
+      return err;
+   else if (!load_payload(b, &db, &pb, &lb, NULL, NULL, &err)) {
+      free(da);
+      return err;
+   }
+
+   char *result = NULL;
+   if (la != lb || memcmp(pa, pb, la) != 0) {
+      size_t off = 0;
+      while (off < la && off < lb && pa[off] == pb[off])
+         off++;
+
+      static const char *tags[] = {
+         "NAMT", "META", "PKGS", "FILE", "OBJS", "TRIG", "LAYT", "SIGS",
+         "PROC", "FRMS", "HEAP"
+      };
+
+      const char *where = "header";
+      size_t best = 0;
+      for (size_t i = 0; i + 4 <= off && i + 4 <= la; i++) {
+         for (unsigned t = 0; t < ARRAY_LEN(tags); t++) {
+            if (memcmp(pa + i, tags[t], 4) == 0 && i >= best) {
+               where = tags[t];
+               best = i;
+            }
+         }
+      }
+
+      char *rec = record_at(pa, la, off, where);
+      result = xasprintf("the saved state differs in section %s%s%s (first "
+                         "difference at byte %zu of %zu and %zu)", where,
+                         rec ? ", " : "", rec ?: "", off, la, lb);
+      free(rec);
+   }
+
+   free(da);
+   free(db);
+   return result;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Periodic checkpoints
+
+typedef struct {
+   jit_t     *jit;
+   ckpt_id_t *id;
+   char      *dir;
+   uint64_t   every, next;
+   unsigned   max;
+} periodic_t;
+
+static bool g_periodic_failed;
+
+static int str_cmp2(const void *a, const void *b)
+{
+   return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+static char **list_checkpoints(const char *dir, unsigned *n)
+{
+   char **names = NULL;
+   *n = 0;
+
+   DIR *d = opendir(dir);
+   if (d == NULL)
+      return NULL;
+
+   for (struct dirent *e; (e = readdir(d)); ) {
+      const size_t len = strlen(e->d_name);
+      if (strncmp(e->d_name, "ck-", 3) == 0 && len > 8
+          && strcmp(e->d_name + len - 5, ".ckpt") == 0) {
+         names = xrealloc_array(names, *n + 1, sizeof(char *));
+         names[(*n)++] = xstrdup(e->d_name);
+      }
+   }
+   closedir(d);
+
+   if (*n > 0)
+      qsort(names, *n, sizeof(char *), str_cmp2);
+   return names;
+}
+
+static void periodic_cb(rt_model_t *m, void *arg)
+{
+   periodic_t *p = arg;
+
+   const uint64_t now = model_now(m, NULL);
+   if (now < p->next) {
+      model_set_phase_cb(m, END_TIME_STEP, periodic_cb, p);
+      return;
+   }
+
+   char *path = xasprintf("%s/ck-%020"PRIu64".ckpt", p->dir, now);
+   char *err = checkpoint_save(m, p->jit, p->id, path);
+   if (err != NULL) {
+      char tm[32];
+      checkpoint_format_time(now, tm, sizeof(tm));
+      errorf("cannot write checkpoint %s at %s: %s", path, tm, err);
+      free(err);
+      free(path);
+      g_periodic_failed = true;
+      model_stop(m);
+      return;
+   }
+   free(path);
+
+   p->next = (now / p->every + 1) * p->every;
+
+   unsigned n;
+   char **names = list_checkpoints(p->dir, &n);
+   if (n > p->max) {
+      // Keep every second one and the newest, and space the next further
+      for (unsigned i = 1; i + 1 < n; i += 2) {
+         char *victim = xasprintf("%s/%s", p->dir, names[i]);
+         unlink(victim);
+         free(victim);
+      }
+      p->every *= 2;
+      p->next = (now / p->every + 1) * p->every;
+   }
+
+   for (unsigned i = 0; i < n; i++)
+      free(names[i]);
+   free(names);
+
+   model_set_phase_cb(m, END_TIME_STEP, periodic_cb, p);
+}
+
+void checkpoint_schedule_every(rt_model_t *m, jit_t *jit, const char *dir,
+                               uint64_t every, unsigned max)
+{
+   if (mkdir(dir, 0777) != 0 && errno != EEXIST)
+      fatal_errno("cannot create %s", dir);
+
+   unsigned n;
+   char **names = list_checkpoints(dir, &n);
+   for (unsigned i = 0; i < n; i++)
+      free(names[i]);
+   free(names);
+   if (n > 0)
+      fatal("%s already holds checkpoints: use an empty directory", dir);
+
+   periodic_t *p = xcalloc(sizeof(periodic_t));
+   p->jit   = jit;
+   p->id    = checkpoint_identify(m, jit);
+   p->dir   = xstrdup(dir);
+   p->every = MAX(every, 1);
+   p->next  = p->every;
+   p->max   = MAX(max, 2);
+
+   model_set_phase_cb(m, END_TIME_STEP, periodic_cb, p);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -4136,7 +4588,7 @@ void checkpoint_schedule(rt_model_t *m, jit_t *jit, const char *path,
 bool checkpoint_finish(rt_model_t *m)
 {
    if (the_sched == NULL)
-      return false;
+      return g_periodic_failed;
 
    if (!the_sched->done && !the_sched->failed) {
       char tm[32], tm2[32];

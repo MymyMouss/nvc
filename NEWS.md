@@ -13,7 +13,24 @@
   source was changed (for example after fixing a bug) and says whether the
   result is exact, because the changed code had not run any of the changed
   part before the checkpoint, or only approximate (as if the fix had been
-  applied at that time); `--verdict=FILE` writes it as JSON.
+  applied at that time); `--verdict=FILE` writes it as JSON.  The code
+  that ran is compared basic block by basic block, so a fix in a branch
+  that had not been reached yet in a unit that did run is still exact.
+- A fix can be confirmed against a whole earlier run: `--checkpoint=DIR@every=TIME`
+  writes a checkpoint file every TIME of simulated time (at most 64 are
+  kept, the interval doubling when there would be more), and `nvc -r
+  --confirm=DIR top` runs the changed design from each file to the next,
+  `--jobs=N` at a time, and compares the states.  The result is printed
+  and written with `--confirm-result=FILE` as JSON: confirmed (the changed
+  design reaches every saved state from time zero), different (the first
+  segment, time interval and object that differ) or incomplete (segments
+  that could not be checked, or the `--confirm-budget` or `--confirm-max`
+  limit was reached).  It can be interrupted and resumed.
+- The MCP tool `nvc_sim_open` takes `checkpoint_dir` and `checkpoint_every`
+  to write checkpoint files during a run, and `confirm_dir` to confirm in
+  the background a fix restored with `restore_from` and `allow_changes`;
+  `nvc_sim_status` shows the progress and result and `nvc_sim_wait` wakes
+  when it ends.
 - Added an experimental Model Context Protocol server, started with
   `nvc --mcp`, that lets AI agents drive nvc.  Its tools compile and
   elaborate designs (`nvc_analyse`, `nvc_elaborate`), list source files

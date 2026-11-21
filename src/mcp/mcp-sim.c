@@ -19,6 +19,7 @@
 #include "mcp/mcp-server.h"
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -101,6 +102,16 @@ typedef struct {
    int      fdq[MAX_FDQ];   // Received with a line and not yet matched to it
    size_t   nfdq;
    int      reply_fd;       // Taken from the reply to the last request, or -1
+   char    *ckpt_dir;       // Periodic checkpoint files, relative to the root
+   char    *ckpt_abs;
+   pid_t    confirm_pid;    // Background confirmation process, or 0
+   char    *confirm_dir;    // Checkpoints being confirmed (relative)
+   char    *confirm_result; // Files of the confirmation (absolute)
+   char    *confirm_log;
+   char    *confirm_json;   // Its final result once read
+   uint64_t confirm_start_us;
+   int64_t  confirm_restore_fs;   // Time of the restored file in the set, or -1
+   unsigned confirm_jobs;
 } sim_t;
 
 struct _mcp_sims {
@@ -118,6 +129,14 @@ mcp_sims_t *mcp_sims_new(void)
 
 static void sim_reap_process(sim_t *s)
 {
+   if (s->confirm_pid > 0) {
+      kill(-s->confirm_pid, SIGKILL);
+      kill(s->confirm_pid, SIGKILL);
+      while (waitpid(s->confirm_pid, NULL, 0) < 0 && errno == EINTR)
+         ;
+      s->confirm_pid = 0;
+   }
+
    if (s->pid > 0) {
       kill(-s->pid, SIGKILL);
       kill(s->pid, SIGKILL);
@@ -157,6 +176,12 @@ static void sim_free(sim_t *s)
    free(s->buf);
    free(s->top);
    free(s->files_dir);
+   free(s->ckpt_dir);
+   free(s->ckpt_abs);
+   free(s->confirm_dir);
+   free(s->confirm_result);
+   free(s->confirm_log);
+   free(s->confirm_json);
    free(s);
 }
 
@@ -861,7 +886,30 @@ static const char open_input[] = MCP_JSON({
          "type": "string",
          "minLength": 1,
          "maxLength": 128,
-         "description": "Start from a state file written by nvc_sim_checkpoint with to_file instead of at time zero. The design must be elaborated from the same sources, the same top, std and library, by the same nvc. Give the file name or its path below .nvc-mcp/."
+         "description": "Start from a state file written by nvc_sim_checkpoint with to_file instead of at time zero. The design must be elaborated from the same sources, the same top, std and library, by the same nvc. Give the file name or its path below .nvc-mcp/, which may be a file in a directory of periodic checkpoints such as run1/ck-00000000500000000000.ckpt."
+      },
+      "checkpoint_dir": {
+         "type": "string",
+         "minLength": 1,
+         "maxLength": 64,
+         "description": "Write the state to files in this new directory below .nvc-mcp/ at regular simulated times while the simulation runs (see checkpoint_every), so that a later fix can be confirmed against them with confirm_dir. Implies track_code. Only designs that nvc_sim_checkpoint can save work. The files are named by the time they were written at. Do not start a waveform recording in a run you want to confirm: checkpoints written while it is on cannot be compared."
+      },
+      "checkpoint_every": {
+         "type": "string",
+         "maxLength": 32,
+         "description": "Simulated time between the files of checkpoint_dir, for example 1 ms. At most 64 files are kept: when there would be more every second one is deleted and the interval doubles, so a long run keeps a bounded number spread over its length."
+      },
+      "confirm_dir": {
+         "type": "string",
+         "minLength": 1,
+         "maxLength": 64,
+         "description": "With restore_from and allow_changes: start confirming in the background that the fixed design really produces the states of the original run. The directory (below .nvc-mcp/) holds the files written by a run with checkpoint_dir. The fixed design is run from each file to the next in parallel and the states compared. nvc_sim_status shows the progress and the result under confirmation; nvc_sim_wait wakes when it ends. Result confirmed means a rerun of the fixed design from time zero would have reached the same state at every file (so the restored simulation continues exactly as that rerun would, whatever restore_verdict said); different names the first segment, time interval and object that differ; incomplete says which segments could not be checked and why, and never counts as confirmed. The file restored should be one of the files of the directory: the result says if it is not."
+      },
+      "confirm_jobs": {
+         "type": "integer",
+         "minimum": 1,
+         "maximum": 8,
+         "description": "Segments checked at the same time by confirm_dir. Defaults to 2."
       }
    },
    "required": ["top"],
@@ -931,8 +979,15 @@ static char *state_file_path(mcp_call_t *call, const char *name, bool exists,
       base = name + 9;
 
    bool ok = *base != '\0' && strlen(base) <= 100 && base[0] != '.';
-   for (const char *p = base; ok && *p; p++)
+   int slashes = 0;
+   for (const char *p = base; ok && *p; p++) {
+      // One directory level, such as a directory of periodic checkpoints
+      if (*p == '/') {
+         ok = ++slashes == 1 && p[1] != '\0' && p[1] != '.' && p > base;
+         continue;
+      }
       ok = isalnum((unsigned char)*p) || *p == '_' || *p == '-' || *p == '.';
+   }
 
    if (!ok) {
       mcp_call_error(call, "Invalid state file name '%s': use letters, "
@@ -958,6 +1013,279 @@ static char *state_file_path(mcp_call_t *call, const char *name, bool exists,
    return path;
 }
 
+
+// A directory of checkpoint files below .nvc-mcp, written by a run with
+// checkpoint_dir and read by confirm_dir
+static char *ckpt_dir_path(mcp_call_t *call, const char *name, char **relative)
+{
+   bool ok = *name != '\0' && strlen(name) <= 64 && name[0] != '.';
+   for (const char *p = name; ok && *p; p++)
+      ok = isalnum((unsigned char)*p) || *p == '_' || *p == '-';
+
+   if (!ok) {
+      mcp_call_error(call, "Invalid directory name '%s': use letters, digits, "
+                     "underscores and hyphens, for example \"run1\"; it is "
+                     "kept in .nvc-mcp/", name);
+      return NULL;
+   }
+
+   *relative = xasprintf(".nvc-mcp/%s", name);
+   return xasprintf("%s/.nvc-mcp/%s", mcp_call_root(call), name);
+}
+
+static unsigned ckpt_files_in(const char *abs_dir, int64_t *latest_fs)
+{
+   unsigned count = 0;
+   *latest_fs = -1;
+
+   DIR *d = opendir(abs_dir);
+   if (d == NULL)
+      return 0;
+
+   for (struct dirent *e; (e = readdir(d)); ) {
+      const size_t len = strlen(e->d_name);
+      if (strncmp(e->d_name, "ck-", 3) == 0 && len > 8
+          && strcmp(e->d_name + len - 5, ".ckpt") == 0) {
+         count++;
+         const int64_t t = strtoll(e->d_name + 3, NULL, 10);
+         if (t > *latest_fs)
+            *latest_fs = t;
+      }
+   }
+   closedir(d);
+   return count;
+}
+
+static bool same_file_contents(const char *a, const char *b)
+{
+   FILE *fa = fopen(a, "rb"), *fb = fopen(b, "rb");
+   bool same = fa != NULL && fb != NULL;
+   while (same) {
+      char ba[8192], bb[8192];
+      const size_t na = fread(ba, 1, sizeof(ba), fa);
+      const size_t nb = fread(bb, 1, sizeof(bb), fb);
+      same = na == nb && memcmp(ba, bb, na) == 0;
+      if (na < sizeof(ba))
+         break;
+   }
+   if (fa != NULL)
+      fclose(fa);
+   if (fb != NULL)
+      fclose(fb);
+   return same;
+}
+
+// Which checkpoint of the directory is the file that was restored, if any
+static int64_t find_restored_in(const char *abs_dir, const char *restore_path)
+{
+   DIR *d = opendir(abs_dir);
+   if (d == NULL)
+      return -1;
+
+   int64_t found = -1;
+   for (struct dirent *e; found < 0 && (e = readdir(d)); ) {
+      const size_t len = strlen(e->d_name);
+      if (strncmp(e->d_name, "ck-", 3) == 0 && len > 8
+          && strcmp(e->d_name + len - 5, ".ckpt") == 0) {
+         char *path = xasprintf("%s/%s", abs_dir, e->d_name);
+         if (same_file_contents(path, restore_path))
+            found = strtoll(e->d_name + 3, NULL, 10);
+         free(path);
+      }
+   }
+   closedir(d);
+   return found;
+}
+
+static char *read_whole_file(const char *path)
+{
+   FILE *f = fopen(path, "rb");
+   if (f == NULL)
+      return NULL;
+
+   size_t len = 0, alloc = 4096;
+   char *buf = xmalloc(alloc);
+   size_t n;
+   while ((n = fread(buf + len, 1, alloc - len - 1, f)) > 0) {
+      len += n;
+      if (len + 1 >= alloc)
+         buf = xrealloc(buf, alloc *= 2);
+   }
+   fclose(f);
+   buf[len] = '\0';
+   return buf;
+}
+
+// Has the confirmation process ended?
+static void confirm_poll(sim_t *s)
+{
+   if (s->confirm_pid <= 0)
+      return;
+
+   int st;
+   const pid_t r = waitpid(s->confirm_pid, &st, WNOHANG);
+   if (r == s->confirm_pid || (r < 0 && errno == ECHILD))
+      s->confirm_pid = 0;
+}
+
+static bool confirm_running(sim_t *s)
+{
+   confirm_poll(s);
+   return s->confirm_pid > 0;
+}
+
+// Members for the status of a simulation that has a confirmation or writes
+// periodic checkpoint files, without the braces, or NULL
+static char *confirm_members(sim_t *s)
+{
+   if (s->ckpt_dir == NULL && s->confirm_dir == NULL)
+      return NULL;
+
+   LOCAL_TEXT_BUF tb = tb_new();
+
+   if (s->ckpt_dir != NULL) {
+      int64_t latest;
+      const unsigned count = ckpt_files_in(s->ckpt_abs, &latest);
+      tb_printf(tb, "\"periodic_checkpoints\":{\"dir\":\"%s\",\"count\":%u,"
+                "\"latest_fs\":%"PRIi64"}", s->ckpt_dir, count, latest);
+   }
+
+   if (s->confirm_dir != NULL) {
+      if (tb_len(tb) > 0)
+         tb_append(tb, ',');
+
+      const bool running = confirm_running(s);
+      const uint64_t elapsed_ms =
+         (get_timestamp_us() - s->confirm_start_us) / 1000;
+
+      if (!running && s->confirm_json == NULL) {
+         s->confirm_json = read_whole_file(s->confirm_result);
+         if (s->confirm_json != NULL) {
+            size_t len = strlen(s->confirm_json);
+            while (len > 0 && isspace((unsigned char)s->confirm_json[len - 1]))
+               s->confirm_json[--len] = '\0';
+         }
+      }
+
+      // Progress lines look like "confirm: segment 3 of 10 (...): same"
+      unsigned done = 0, total = 0;
+      char *log = read_whole_file(s->confirm_log);
+      for (const char *p = log; p != NULL && (p = strstr(p, "confirm: segment ")); ) {
+         unsigned k, n;
+         if (sscanf(p, "confirm: segment %u of %u", &k, &n) == 2) {
+            total = n;
+            done++;
+         }
+         p += 10;
+      }
+      free(log);
+
+      const char *state = running ? "running" : "failed";
+      char *result_state = NULL;
+      if (!running && s->confirm_json != NULL) {
+         mem_pool_t *mp = pool_new();
+         const char *perr;
+         json_t *j = json_parse(mp, s->confirm_json, strlen(s->confirm_json),
+                                NULL, &perr);
+         const char *r = json_string(json_get(j, "result"));
+         if (r != NULL) {
+            result_state = xstrdup(r);
+            state = result_state;
+         }
+         pool_free(mp);
+      }
+
+      tb_printf(tb, "\"confirmation\":{\"state\":\"%s\",\"dir\":\"%s\","
+                "\"jobs\":%u,\"segments_finished\":%u,\"segments_total\":%u,"
+                "\"elapsed_ms\":%"PRIu64",\"restored_checkpoint_fs\":%"PRIi64,
+                state, s->confirm_dir, s->confirm_jobs, done, total,
+                elapsed_ms, s->confirm_restore_fs);
+
+      if (s->confirm_restore_fs < 0)
+         tb_cat(tb, ",\"note\":\"The restored file is not one of the "
+                "checkpoints in the directory, so the confirmation says "
+                "nothing about the state this simulation started from\"");
+
+      if (!running && s->confirm_json != NULL) {
+         // Does what was confirmed reach the point that was restored?
+         mem_pool_t *mp = pool_new();
+         const char *perr;
+         json_t *j = json_parse(mp, s->confirm_json, strlen(s->confirm_json),
+                                NULL, &perr);
+         int64_t upto = 0;
+         json_as_int(json_get(j, "confirmed_up_to_fs"), &upto);
+         pool_free(mp);
+
+         tb_printf(tb, ",\"restore_point_confirmed\":%s",
+                   s->confirm_restore_fs >= 0 && upto >= s->confirm_restore_fs
+                   ? "true" : "false");
+         tb_cat(tb, ",\"result\":");
+         tb_cat(tb, s->confirm_json);
+      }
+      else if (!running)
+         tb_cat(tb, ",\"detail\":\"the confirmation process ended without a "
+                "result\"");
+
+      free(result_state);
+      tb_append(tb, '}');
+   }
+
+   return xstrdup(tb_get(tb));
+}
+
+static void confirm_spawn(mcp_call_t *call, sim_t *s, const char *root,
+                          const char *library, const char *std, int jobs,
+                          const char *abs_dir)
+{
+   int ngargs;
+   const char *const *gargs = mcp_call_global_argv(call, &ngargs);
+
+   const char **argv = xcalloc_array(ngargs + 12, sizeof(char *));
+   size_t argc = 0;
+
+   char *work_opt = library ? xasprintf("--work=%s", library) : NULL;
+   char *std_opt = std ? xasprintf("--std=%s", std) : NULL;
+   char *conf_opt = xasprintf("--confirm=%s", abs_dir);
+   char *jobs_opt = xasprintf("--jobs=%d", jobs);
+   char *res_opt = xasprintf("--confirm-result=%s", s->confirm_result);
+
+   argv[argc++] = mcp_call_exe(call);
+   for (int i = 0; i < ngargs; i++)
+      argv[argc++] = gargs[i];
+   if (work_opt != NULL)
+      argv[argc++] = work_opt;
+   if (std_opt != NULL)
+      argv[argc++] = std_opt;
+   argv[argc++] = "-r";
+   argv[argc++] = conf_opt;
+   argv[argc++] = jobs_opt;
+   argv[argc++] = res_opt;
+   argv[argc++] = s->top;
+   argv[argc] = NULL;
+
+   const int log_fd = open(s->confirm_log, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+   const pid_t pid = fork();
+   if (pid == 0) {
+      if (log_fd < 0)
+         _exit(126);
+      worker_exec(root, (char **)argv, log_fd, -1);
+   }
+
+   if (log_fd >= 0)
+      close(log_fd);
+
+   s->confirm_pid = pid > 0 ? pid : 0;
+   s->confirm_start_us = get_timestamp_us();
+
+   free(argv);
+   free(work_opt);
+   free(std_opt);
+   free(conf_opt);
+   free(jobs_opt);
+   free(res_opt);
+}
+
 static bool tool_sim_open(mcp_call_t *call, const json_t *args,
                           json_writer_t *out)
 {
@@ -975,6 +1303,81 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
                                           NULL)) == NULL)
       return false;
 
+   bool allow_changes = false, track_code = false;
+   json_as_bool(json_get(args, "allow_changes"), &allow_changes);
+   json_as_bool(json_get(args, "track_code"), &track_code);
+
+   const char *ckpt_dir_arg = json_string(json_get(args, "checkpoint_dir"));
+   const char *every_arg = json_string(json_get(args, "checkpoint_every"));
+   const char *confirm_arg = json_string(json_get(args, "confirm_dir"));
+   int64_t confirm_jobs = 2;
+   json_as_int(json_get(args, "confirm_jobs"), &confirm_jobs);
+
+   char *ckpt_rel = NULL, *ckpt_abs = NULL, *confirm_rel = NULL,
+      *confirm_abs = NULL;
+   int64_t every_fs = 0;
+   {
+      const char *bad = NULL;
+      if ((ckpt_dir_arg == NULL) != (every_arg == NULL))
+         bad = "checkpoint_dir and checkpoint_every go together";
+      else if (confirm_arg != NULL && (restore_path == NULL || !allow_changes))
+         bad = "confirm_dir needs restore_from and allow_changes: it "
+            "confirms a fix against the files of an earlier run";
+      else if (ckpt_dir_arg != NULL && confirm_arg != NULL
+               && !strcmp(ckpt_dir_arg, confirm_arg))
+         bad = "checkpoint_dir and confirm_dir must be different";
+
+      if (bad != NULL) {
+         mcp_call_error(call, "%s", bad);
+         goto bad_args;
+      }
+   }
+
+   if (every_arg != NULL) {
+      if (!mcp_parse_sim_time(call, "checkpoint_every", every_arg, &every_fs))
+         goto bad_args;
+      else if (every_fs < 1000000) {
+         mcp_call_error(call, "checkpoint_every must be at least 1 ns");
+         goto bad_args;
+      }
+
+      if ((ckpt_abs = ckpt_dir_path(call, ckpt_dir_arg, &ckpt_rel)) == NULL)
+         goto bad_args;
+
+      int64_t latest;
+      if (ckpt_files_in(ckpt_abs, &latest) > 0) {
+         mcp_call_error(call, "The directory %s already holds checkpoint "
+                        "files: use a new name for checkpoint_dir", ckpt_rel);
+         goto bad_args;
+      }
+      track_code = true;
+   }
+
+   if (confirm_arg != NULL) {
+      if ((confirm_abs = ckpt_dir_path(call, confirm_arg, &confirm_rel))
+          == NULL)
+         goto bad_args;
+
+      int64_t latest;
+      if (ckpt_files_in(confirm_abs, &latest) == 0) {
+         mcp_call_error(call, "The directory %s holds no checkpoint files: "
+                        "write them with checkpoint_dir and checkpoint_every "
+                        "in the run to confirm against", confirm_rel);
+         goto bad_args;
+      }
+   }
+
+   goto args_ok;
+
+ bad_args:
+   free(restore_path);
+   free(ckpt_rel);
+   free(ckpt_abs);
+   free(confirm_rel);
+   free(confirm_abs);
+   return false;
+
+ args_ok:
    if (!valid_unit_name(top)) {
       mcp_call_error(call, "Invalid design unit name '%s': use a letter "
                      "followed by letters, digits, underscores or hyphens, for "
@@ -1013,15 +1416,15 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
    int ngargs;
    const char *const *gargs = mcp_call_global_argv(call, &ngargs);
 
-   const char **argv = xcalloc_array(ngargs + 12, sizeof(char *));
+   const char **argv = xcalloc_array(ngargs + 14, sizeof(char *));
    size_t argc = 0;
-
-   bool allow_changes = false, track_code = false;
-   json_as_bool(json_get(args, "allow_changes"), &allow_changes);
-   json_as_bool(json_get(args, "track_code"), &track_code);
 
    char *restore_opt = restore_path ? xasprintf("--restore-from=%s",
                                                 restore_path) : NULL;
+   char *ckpt_dir_opt = ckpt_rel ? xasprintf("--checkpoint-dir=%s", ckpt_rel)
+      : NULL;
+   char *ckpt_every_opt = ckpt_rel ? xasprintf("--checkpoint-every=%"PRIi64,
+                                               every_fs) : NULL;
    char *work_opt = library ? xasprintf("--work=%s", library) : NULL;
    char *std_opt = std ? xasprintf("--std=%s", std) : NULL;
    char *fd_opt = xasprintf("--fd=%d", WORKER_CTL_FD);
@@ -1073,6 +1476,10 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
       argv[argc++] = "--allow-changes";
    if (track_code)
       argv[argc++] = "--track-code";
+   if (ckpt_dir_opt != NULL) {
+      argv[argc++] = ckpt_dir_opt;
+      argv[argc++] = ckpt_every_opt;
+   }
    argv[argc++] = top;
    argv[argc] = NULL;
 
@@ -1086,7 +1493,7 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
    free(fd_opt);
    free(files_opt);
    free(restore_opt);
-   free(restore_path);
+   char *restore_abs = restore_path;   // Freed on every way out
 
    close(outp[1]);
    close(child_fd);
@@ -1097,6 +1504,8 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
       close(outp[0]);
       mcp_call_error(call, "Could not start the simulation process: %s",
                      strerror(errno));
+      free(restore_abs);
+      free(confirm_abs);
       return false;
    }
 
@@ -1109,6 +1518,11 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
    s->files_dir = files_dir;
    s->last_used_us = get_timestamp_us();
    strcpy(s->id, sim_id);
+   s->ckpt_dir = ckpt_rel;
+   s->ckpt_abs = ckpt_abs;
+   s->confirm_restore_fs = -1;
+   free(ckpt_dir_opt);
+   free(ckpt_every_opt);
 
    // Wait for the worker to report that the design is loaded.  Until
    // then anything it prints on its standard streams is kept so a
@@ -1187,7 +1601,12 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
 
          free(s->top);
          free(s->buf);
+         free(s->ckpt_dir);
+         free(s->ckpt_abs);
          free(s);
+         free(restore_abs);
+         free(confirm_abs);
+         free(confirm_rel);
          return false;
       }
    }
@@ -1198,15 +1617,34 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
    if (ready == NULL) {
       mcp_call_error(call, "%s", failure);
       sim_free(s);
+      free(restore_abs);
+      free(confirm_abs);
+      free(confirm_rel);
       return false;
    }
 
    sims->sims[sims->count++] = s;
 
+   if (confirm_abs != NULL) {
+      // Run the fixed design from each file of the earlier run to the next
+      // in another process while this simulation is used
+      s->confirm_dir = confirm_rel;
+      s->confirm_jobs = confirm_jobs;
+      s->confirm_result = xasprintf("%s/%s/confirm-result.json",
+                                    mcp_call_root(call), s->files_dir);
+      s->confirm_log = xasprintf("%s/%s/confirm.log", mcp_call_root(call),
+                                 s->files_dir);
+      s->confirm_restore_fs = find_restored_in(confirm_abs, restore_abs);
+      confirm_spawn(call, s, mcp_call_root(call), library, std,
+                    confirm_jobs, confirm_abs);
+      free(confirm_abs);
+   }
+
    begin_open_result(out, s, sims, ready);
    jw_end_object(out);
 
    free(ready);
+   free(restore_abs);
    return true;
 }
 
@@ -1577,6 +2015,12 @@ static char *sim_status(mcp_call_t *call, sim_t *s, const char *request)
          free(ckpts);
       }
 
+      char *conf = confirm_members(s);
+      if (conf != NULL) {
+         result = append_members(result, conf);
+         free(conf);
+      }
+
       return result;
    }
 
@@ -1627,6 +2071,12 @@ static char *sim_status(mcp_call_t *call, sim_t *s, const char *request)
    if (ckpts != NULL) {
       result = append_members(result, ckpts);
       free(ckpts);
+   }
+
+   char *conf = confirm_members(s);
+   if (conf != NULL) {
+      result = append_members(result, conf);
+      free(conf);
    }
 
    s->last_now_fs = now_fs;
@@ -1704,6 +2154,8 @@ static const char status_output[] = MCP_JSON({
       "advanced_since_last_status_fs": { "type": "integer" },
       "ms_since_last_status": { "type": "integer" },
       "worker": { "type": "object" },
+      "periodic_checkpoints": { "type": "object" },
+      "confirmation": { "type": "object" },
       "next_seq": { "type": "integer" },
       "counts": { "type": "object" },
       "sim_output": { "type": "string" },
@@ -1777,12 +2229,16 @@ static bool tool_sim_wait(mcp_call_t *call, const json_t *args,
 
    const uint64_t start_us = get_timestamp_us();
    unsigned bad_at_start = 0;
-   bool first = true;
+   bool first = true, confirming_at_start = false;
 
    for (;;) {
       sim_t *s = lookup(call, sim_id);
       if (s == NULL)
          return false;
+
+      const bool confirming = confirm_running(s);
+      if (first)
+         confirming_at_start = confirming;
 
       char *result = sim_status(call, s, tb_get(req));
       if (result == NULL)
@@ -1812,9 +2268,11 @@ static bool tool_sim_wait(mcp_call_t *call, const json_t *args,
       bool responsive = true;
       json_as_bool(json_get(j, "responsive"), &responsive);
 
-      if (!running)
+      if (confirming_at_start && !confirming)
+         why = "confirmation_finished";
+      else if (!running && !confirming)
          why = "stopped";
-      else if (!responsive)
+      else if (running && !responsive)
          why = "unresponsive";
       else if (bad > bad_at_start)
          why = "new_errors";
@@ -2933,7 +3391,17 @@ static const mcp_tool_t sim_tools[] = {
          "allow_changes is given, which restores into a fixed design and "
          "returns restore_verdict (exact or approximate, with the changed "
          "units and which of them had already run).  After an approximate "
-         "restore run the fixed design from time 0 to validate the fix.",
+         "restore run the fixed design from time 0 to validate the fix, or "
+         "have it done in the background: a run opened with checkpoint_dir "
+         "and checkpoint_every writes state files at regular simulated "
+         "times, and opening the fixed design with restore_from, "
+         "allow_changes and confirm_dir runs it from each file to the next "
+         "in parallel and compares the states.  nvc_sim_status reports the "
+         "progress and, when it ends, the result under confirmation: "
+         "confirmed, different (with the first segment, time interval and "
+         "object that differ) or incomplete (which segments were not "
+         "checked and why).  Only confirmed means the fix reproduces the "
+         "original run.",
       .input_schema  = open_input,
       .output_schema = open_output,
       .example       = open_example,
@@ -3005,6 +3473,9 @@ static const mcp_tool_t sim_tools[] = {
          "Wait up to timeout_ms (at most 30 seconds) for a background run "
          "to stop or for the design to report a new error, then return what "
          "nvc_sim_status returns plus woke_because: stopped, new_errors, "
+         "confirmation_finished (a background confirmation started by "
+         "nvc_sim_open with confirm_dir has ended; it keeps the wait going "
+         "after the run itself stopped), "
          "unresponsive or timeout.  Call it again after a timeout while the "
          "state is still running: each call is cheap and keeps you in "
          "touch with the run.  Use the percent and eta_ms fields to decide "

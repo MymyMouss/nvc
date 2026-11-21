@@ -388,3 +388,264 @@ was 0.57 s to 0.77 s (35%) on the SoC testbench with the debug interpreter.
   checkpoint made with them is marked as not tracked.
 * Messages of the output before the checkpoint were printed by the old code
   and are not part of the comparison.
+
+## 11. Exact verdicts over the code that ran (basic block mappings)
+
+Section 10.3 declared a change harmless only if nothing at or after its first
+instruction had run.  That fails the typical RTL case: a clocked process runs
+its code after the changed branch on every cycle.  The rule is now
+(`src/rt/checkmap.c`, about 120 lines for the checker):
+
+A unit whose code changed is *equivalent over what ran* if the prefix rule
+holds, or if the checker confirms a mapping from the basic blocks of the old
+code that ran to blocks of the new code.  A mapping that the checker does not
+confirm counts as "changed code had run" as before.
+
+### 11.1 The condition checked
+
+Blocks are the straight runs of instructions between leaders: the first
+instruction, every branch target, every instruction after a jump, a
+conditional branch (`J_JUMP` with a condition, `MACRO_CASE`), a return or a
+trap.  A block has *run* if its first instruction was fetched.  The mapping
+gives, for the first instruction of an old block, the first instruction of a
+new block.  It is confirmed iff:
+
+1. neither unit has control flow the checker does not understand (a label
+   operand on anything but a jump or case, two labels, `MACRO_REEXEC`), the
+   old marks are known, and every label points inside the code;
+2. if the entry block ran, it maps to the entry block;
+3. every block that ran maps to the start of a new block, and no two share
+   an image;
+4. a block that ran and its image have the same length and the same
+   instructions: 64-bit hashes of opcode, size, condition, result register,
+   both operands (registers, immediates, displacements in addresses, exits,
+   callee names; not source locations, loci, debug instructions) and the
+   same flow kind, with a label present in both or neither;
+5. for every label in such a block whose target block ran, the target's image
+   is exactly the label of the corresponding instruction of the image;
+6. if the block can fall through and the next old block ran, the image of
+   the next old block is the block that follows the image.
+
+Blocks that never ran may be different or absent.
+
+### 11.2 Why that is enough
+
+Claim: if every unit is unchanged or confirmed, and the constant pool, frame
+layouts, variable names and types, signals, processes and the post-reset
+design are identical (all of which are still checked as strictly as before),
+then the new design run from zero reaches the state the old one had at the
+checkpoint, and so the restored simulation is the new design at that time.
+
+By induction on the steps of the old run.  Its configuration is the registers
+and flags of each active function, the frames and heap, the signals and every
+queue of the model.  Initially the configurations are equal (same design,
+same reset).  Suppose they are equal and the old run is about to execute
+instruction i of unit U, which is in a block that ran.  By 2 to 4 the new run is
+at the corresponding instruction of the image of that block, whose
+instruction is the same operation on the same registers and immediates.  A
+step depends only on the instruction and the configuration, not on its
+position, so the result is the same configuration, except for where control
+goes next.  Inside a block control goes to the next instruction in both.  At
+the end of a block: for a jump or a taken branch whose target block ran, 5 says
+the new instruction goes to the image of the target; for a branch not taken or
+a fall-through to a block that ran, 6 says the new run falls into the image; and
+for a branch whose target never ran the old run did not take it, the condition
+is the same in the new run (same instruction, same configuration) so the new
+run does not take it either.  A call goes to the callee of the same name,
+which by assumption is itself unchanged or confirmed, and returns to the
+next instruction; a wait is a return and the state number it stored is an
+immediate in a block that ran, so it is the same in both and means the same
+in the new code, where the table that dispatches on it begins at the same
+entry.  So both runs perform the same steps up to the checkpoint.  The new
+code that was not run is not involved.
+
+A process saved suspended is therefore restored with its saved state number
+as it is.  This replaces the refusals of section 10.2 when the mapping is
+confirmed; without a confirmation they stand.
+
+### 11.3 Assumptions
+
+* Marks are complete: every execution of every instruction before the
+  checkpoint was through the interpreter, from the start of the process (or
+  carried by a restore: units of a restored run that changed are marked
+  fully run).  Compiled tiers are not covered and make the checkpoint
+  untracked.
+* A step is a function of the instruction and the configuration.  Position
+  independence of the interpreter's instructions was checked by reading it:
+  `anchor->irpos` and locations only affect diagnostics, which are
+  re-derived from the new code after the restore.
+* Hash collisions: 64 bits per instruction; a collision could equate two
+  different instructions.
+* Content that is compared elsewhere is complete: the constant pool by a
+  hash of all of it, frame layouts by a hash of names, offsets and types.
+  A change in any of those is approximate, as before; in particular a new
+  string literal in an unrun branch still makes the unit approximate
+  because the constant pool changed.
+* Registers live across blocks are covered by the induction: the register
+  numbers are part of the instruction, and the register file is part of
+  the configuration.
+* The checkpoint code compared the machine state of the model for the units
+  it saves; state outside it (see section 8) is as at Phase 2.
+
+### 11.4 Where it is, and the proposal
+
+The proposal (`checkmap_propose`) follows the control flow of the old code
+that ran in step with the new, from the entry.  It can be arbitrarily wrong:
+the checker alone decides.  The checkpoint holds, per instruction, the 64-bit
+hash without the label, the label, the flow kind and the mark, so contents
+are checked by hash and targets are checked exactly (64 bits per instruction,
+rather than the instruction stream, because the stream contains addresses
+that differ between processes and would have to be normalised anyway; the
+size grows from 4 to 13 bytes per instruction, about 0.8 MB for the SoC).
+`test/test_checkmap.c` feeds the checker wrong mappings (entry elsewhere,
+missing, shared or mid-block images, swapped blocks, a changed block that ran,
+a changed jump target, a block inserted into a fall-through, unknown marks)
+and checks that each is rejected.
+
+### 11.5 Oracle and measurements
+
+`harness.py fix` and `mutate` save, for each exact verdict, the fixed design
+run from zero to the same time and compare its state section by section
+(everything except the identity of the build and the execution marks) with
+the state saved right after the restore (`--resave`).  Waveform dumping must
+be on in both runs: it changes delta cycle numbers, which are part of the
+state.  See the final report for counts.
+
+## 12. Confirmation by segments
+
+An approximate restore says that the fixed design continues from a state the
+original run reached; it does not say that the fixed design, run from time
+zero, would have reached it.  Confirmation checks that, for every checkpoint
+of an earlier run, in parallel instead of by running the whole thing again.
+
+### 12.1 Argument
+
+Let `C0` be the initial state, `C1 ... Cn` the files written by the original
+run with `--checkpoint=DIR@every=T` at times `T1 < ... < Tn` (the end of the
+first time step at or after each multiple), and `F` the fixed design.  Segment
+`i` restores `C(i-1)` into `F` (for `i = 1` there is nothing to restore: `F`
+starts from time zero, which covers the initialisation of the new code),
+runs to the time step `Ti` and saves its state `S(i)`.  If `S(i)` equals `Ci`
+for every `i`, then by induction the state of `F` run from zero at `Ti` is
+`Ci`: the state of `F` at `T(i-1)` is `C(i-1)` by hypothesis, a restore of
+`C(i-1)` into `F` is `F` at `T(i-1)` provided the restore is faithful, and
+the run is deterministic, so what follows is `S(i)`.
+
+The step that needs care is "provided the restore is faithful".  It is not
+assumed: each segment restores with `--allow-changes`, and the restore checks
+itself by saving the restored state again and comparing it with the file
+(`state_verified` in the verdict).  A segment whose restore could not be
+verified (for example the saved process was in code that is not equivalent,
+section 10) is incomplete and does not count; so is every later segment that
+follows it in the chain, because the induction needs every link.  The confirmation never says `confirmed` unless every
+segment was run, was verified and agreed.  "Different" is reported for the
+first segment that disagrees: all segments before it are confirmed, so the
+fixed design reproduces the original up to the previous checkpoint and the
+first real difference lies in the interval of that segment.  Nothing checks that `C1 ... Cn` came
+from one run of one design, but each `Ci` is checked against what `F` does
+from `C(i-1)`, so a file from another run shows up as a difference.
+
+### 12.2 Decisions
+
+* **Comparison.**  The payload of a file (everything but the header, which
+  identifies the build, and the trailer of execution marks) is compared
+  byte for byte: the name table is built in a
+  fixed order, so equal states have equal bytes.  When they differ
+  `checkpoint_compare` walks the sections to name the first one that differs
+  and the record (signal, process, frame, heap object) in it; this is only
+  an explanation, the verdict is the byte comparison.  A section-aware
+  comparison that ignored some differences would be a way to be wrong, so it
+  is not used for the decision.
+* **Differences are repeated before they are believed.**  A segment whose
+  state differs from `Ci` is run a second time from the same checkpoint.  If
+  the two runs end in different states the segment is incomplete ("not
+  reproducible"), never different: bytes that are not part of what the design
+  computes can vary from run to run.  The second run costs one segment.
+* **Frames start zeroed.**  The frame of a process or procedure was
+  allocated without being cleared, so a variable not yet assigned (the
+  bounds and index of a `for` loop not yet entered) held whatever the memory
+  held before.  Those bytes are dead for the design but they are saved, and
+  they differed from run to run: on the SoC bench, replaying a segment of
+  the *same* design gave a state that differed from the original's in some
+  segments, reported as `different` or as "not reproducible".  The frame is
+  now cleared when it is allocated (`irgen_context_struct`), which makes the
+  saved state a function of what the design computed.  With this the same
+  design confirms on every segment at every interval tried (250 segments).
+  The repeat of a differing segment is kept as a guard.
+* **Alignment of times.**  The segment runs to exactly the time step the
+  original file was saved at (`Ti` is read from the file), not to a multiple
+  of the interval, and saves at the end of the first time step at or after
+  it: the same rule as the original, so the two are saved at the same point
+  of the same delta sequence.
+* **Waveform dumping** changes the delta cycle numbers, which are part of the
+  state.  A checkpoint records whether dumping was on (`META`) and a
+  checkpoint written with it, or a segment that starts from one, is
+  incomplete.  The segments themselves run without dumping.
+* **Segments in separate directories.**  Each segment runs in
+  `DIR/seg-<time>`, so files the design writes by relative name do not
+  collide between parallel segments, and the files the design read (the
+  union of the `FILE` sections of the checkpoints) are made available there
+  by name with symbolic links.  The cwd check of a restore is bypassed
+  (`NVC_CKPT_ANYDIR`) since segments run elsewhere by design.  Limits: a
+  design that writes a file by absolute path is not isolated; a file that was
+  opened and closed again between two checkpoints is not in any `FILE`
+  section and is not staged; output files are only compared as far as they
+  are part of the saved state.
+* **Interrupting and resuming.**  Each settled segment is appended to
+  `confirm-progress.txt` with a key: a 64-bit hash of this program, the top
+  level, the global options, the contents of the work library and of every
+  library directory on the path, the input files, and the two checkpoint
+  files at the ends of the segment.  A saved result is used only if the key
+  is the same.  The key was added after a test showed that a second run for
+  a changed design reused the results of the first (found by
+  `test/regress/ckpt4.sh`).
+* **Budget.**  `--confirm-budget` and `--confirm-max` stop starting segments
+  and report incomplete with the list of segments that were not run, and the
+  prefix that was confirmed (`confirmed_up_to_fs`).
+* **Disk and memory.**  Files are about 0.6 MB each on the SoC bench (25 MB
+  for 41 files), and the number is bounded by thinning (`max`, default 64):
+  at the limit every second file is deleted and the interval doubles, so a
+  long run keeps at most `max` files spread over its length at the cost of
+  coarser segments.  A confirmation holds one restored model per running
+  segment: about the memory of the simulation times `--jobs`.
+* **Cost of writing.**  Code tracking (needed so that the files can later give
+  exact verdicts) costs about a third on the interpreter; each file costs a
+  few milliseconds on the SoC bench (see the report).
+
+### 12.3 Assumptions
+
+* The simulation is deterministic given the state and the files it reads:
+  no `now`-independent wall clock values, no randomness not derived from the
+  state, no plusargs that differ between the runs (the options of the
+  confirming run are those given to it: they must be those of the original).
+* A run of `F` from `C(i-1)` to `Ti` needs the same input files as the
+  original; those that changed are the user's responsibility and the
+  comparison will show it as a difference if it matters.
+* The verification of a restore compares the model after the restore with
+  the file; state that is not saved (section 8) is not checked.
+
+### 12.4 Measurements (final tree)
+
+* **Agreement with a reference.**  The reference for a pair of designs is the
+  changed design run from zero to exactly the time of each original
+  checkpoint (`--checkpoint=FILE@TIME`, one run per checkpoint), compared
+  with the original's file; it does not use restore or segments.
+  `harness.py fix --confirm` on the 62 pairs (test/mcp/bench bugs, own and
+  `x_*` pairs): confirmed 2 (reference same), different 55, incomplete 5
+  (3 where the reference is the same; the reasons were not tabulated).  `harness.py mutate --confirm` on 846 mutants (swapped
+  operators, changed constants and conditions, deleted statements, changed
+  wait durations): confirmed 173 (reference same), different 540 (reference
+  differs), incomplete 65 (63 where the reference is the same), not
+  applicable 68.  **Confirmed where the reference differs: 0.  Different
+  where the reference is the same: 0.**  Different in an earlier segment than
+  the reference: 2 of the 62 pairs, both on the SoC bench (the limit of
+  12.2).
+* **Cost of writing.**  SoC bench (0.4 ms simulated, about 0.6 s): code
+  tracking about +30%; one file about 0.6 MB and 5 ms; every 10 us 41 files,
+  25 MB, 1.0 s; every 1 us thinned to 52 files, 32 MB, 1.3 s.
+* **Wall time**, a design of 5 ms simulated time that takes 24 s on four
+  cores (10 files of 20 KB): original plain 24.3 s, with the files 29.5 s,
+  fixed design rerun from zero 25.9 s, confirmation with 1, 2, 4 and 8 jobs
+  32.5, 16.2, 9.4 and 9.9 s (CPU 30 to 32 s; four cores, so 8 jobs do not
+  help).  The confirmation does the work of one run, plus one extra
+  segment startup per file, spread over the workers.

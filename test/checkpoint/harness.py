@@ -464,9 +464,26 @@ def elaborate(d, base, work, env, timeout):
     return rc == 0
 
 
-def check_fix(before, after, nvc, lib, fstdump, keep, timeout, quantile=0.5):
-    """Checkpoint `before`, restore into `after` and compare with `after`
-    run from time zero.  The verdict is the one nvc printed."""
+def payload_of(path):
+    """The state part of a checkpoint file: not the identity of the build or
+    design, nor the record of which code had run"""
+    import struct
+    data = open(path, "rb").read()
+    if data[:8] != b"NVCCKPT1":
+        return None
+    off = 12
+    vlen = struct.unpack_from("<I", data, off)[0]
+    off += 4 + vlen + 24
+    length = struct.unpack_from("<Q", data, off)[0]
+    off += 16
+    return data[off:off + length]
+
+
+def check_fix(before, after, nvc, lib, fstdump, keep, timeout, quantiles=(0.5,)):
+    """Checkpoint `before` at each position, restore into `after` and compare
+    with `after` run from time zero.  The verdict is the one nvc printed.
+    For an exact verdict the state of the restored simulation is also
+    compared with the state `after` has at that time when run from zero."""
     work = tempfile.mkdtemp(prefix="ckfix-")
     wb, wa = os.path.join(work, "b"), os.path.join(work, "a")
     os.makedirs(wb)
@@ -475,7 +492,12 @@ def check_fix(before, after, nvc, lib, fstdump, keep, timeout, quantile=0.5):
     env["NVC_LIBPATH"] = lib
     env["NVC_IMP_LIB"] = lib
     env["LANG"] = "en_US.UTF-8"
-    res = {"name": after.name, "status": None, "detail": "", "verdict": None}
+    results = []
+
+    def na(why):
+        return [{"name": after.name, "status": "n/a", "detail": why,
+                 "verdict": None}]
+
     try:
         base = [nvc, "--std=" + after.std]
 
@@ -488,97 +510,263 @@ def check_fix(before, after, nvc, lib, fstdump, keep, timeout, quantile=0.5):
 
         if not elaborate(before, base, wb, env, timeout) \
                 or not elaborate(after, base, wa, env, timeout):
-            raise NA("analysis or elaboration failed")
+            return na("analysis or elaboration failed")
 
         b_rc, b_out, b_err, _ = runin(before, wb, ["--wave=b.fst"], before.stop)
         if b_rc is None or not os.path.exists(os.path.join(wb, "b.fst")):
-            raise NA("the design before the fix did not run")
+            return na("the design before the fix did not run")
         dump = subprocess.run([fstdump, "b.fst"], cwd=wb, stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL).stdout.decode(
                                   "utf-8", "replace")
         times = sorted(t for t in parse_dump(dump) if t > 0)
         if len(times) < 2:
-            raise NA("no simulated time elapses")
-        t = times[int((len(times) - 1) * quantile)]
-        res["time_fs"] = t
-
-        ck = os.path.join(wb, "state.ckpt")
-        a_rc, a_out, a_err, _ = runin(
-            before, wb, ["--checkpoint=%s@%dfs" % (ck, t), "--wave=c.fst"],
-            "%dfs" % t)
-        m = WRITTEN_RE.search(a_err)
-        if not os.path.exists(ck) or m is None:
-            res["status"] = "refused"
-            mm = re.search(rb"cannot write checkpoint [^\n]*? at [^:]*: ([^\n]*)",
-                           a_err)
-            res["detail"] = mm.group(1).decode() if mm else "no checkpoint"
-            return res
-        tc = int(m.group(1)) * UNITS[m.group(2)]
+            return na("no simulated time elapses")
 
         # The fixed design from time zero is the reference
         s_rc, s_out, s_err, _ = runin(after, wa, ["--wave=s.fst"], after.stop)
         if s_rc is None or not os.path.exists(os.path.join(wa, "s.fst")):
-            raise NA("the design after the fix did not run")
-        p_rc, p_out, p_err, _ = runin(after, wa, ["--wave=p.fst"], "%dfs" % tc)
+            return na("the design after the fix did not run")
         s_err, s_out = norm(s_err), norm(s_out)
-        p_err, p_out = norm(p_err), norm(p_out)
         sdump = subprocess.run([fstdump, "s.fst"], cwd=wa, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL).stdout.decode(
                                    "utf-8", "replace")
         straight = parse_dump(sdump)
 
-        verdict = os.path.join(wa, "verdict.json")
-        r_rc, r_out, r_err, _ = runin(
-            after, wa, ["--restore=" + ck, "--allow-changes",
-                        "--verdict=" + verdict, "--wave=r.fst"], after.stop)
-        if r_rc is None:
-            res["status"] = "different"
-            res["detail"] = "restored run timed out"
-            return res
-        if b"cannot restore checkpoint" in r_err:
-            mm = re.search(rb"cannot restore checkpoint: ([^\n]*)", r_err)
-            res["status"] = "refused"
-            res["detail"] = mm.group(1).decode() if mm else "?"
-            return res
+        for q in quantiles:
+            res = {"name": "%s@%g" % (after.name, q), "status": None,
+                   "detail": "", "verdict": None, "state": None}
+            results.append(res)
+            t = times[int((len(times) - 1) * q)]
+            res["time_fs"] = t
 
-        v = json.load(open(verdict))
-        res["verdict"] = v["verdict"]
-        res["changed"] = len(v["changed_units"])
-        res["ran"] = sum(1 for u in v["changed_units"]
-                         if u["executed_before_checkpoint"])
+            ck = os.path.join(wb, "state.ckpt")
+            if os.path.exists(ck):
+                os.unlink(ck)
+            a_rc, a_out, a_err, _ = runin(
+                before, wb, ["--checkpoint=%s@%dfs" % (ck, t), "--wave=c.fst"],
+                "%dfs" % t)
+            m = WRITTEN_RE.search(a_err)
+            if not os.path.exists(ck) or m is None:
+                res["status"] = "refused"
+                mm = re.search(rb"cannot write checkpoint [^\n]*? at [^:]*: ([^\n]*)",
+                               a_err)
+                res["detail"] = mm.group(1).decode() if mm else "no checkpoint"
+                continue
+            tc = int(m.group(1)) * UNITS[m.group(2)]
 
-        r_err, r_out = norm(r_err), norm(r_out)
-        problems = []
-        if r_rc != s_rc:
-            problems.append("exit status %s, reference %s" % (r_rc, s_rc))
-        if not s_out.startswith(p_out):
-            problems.append("reference output is not a prefix")
-        elif r_out != s_out[len(p_out):]:
-            problems.append("stdout differs")
-        why = stderr_diff(s_err, p_err, r_err)
-        if why:
-            problems.append(why)
-        if not os.path.exists(os.path.join(wa, "r.fst")):
-            problems.append("no waveform from the restored run")
-        else:
-            rdump = subprocess.run([fstdump, "r.fst"], cwd=wa,
-                                   stdout=subprocess.PIPE,
-                                   stderr=subprocess.DEVNULL).stdout.decode(
-                                       "utf-8", "replace")
-            problems += waveform_diff(straight, parse_dump(rdump), tc)
+            p_rc, p_out, p_err, _ = runin(after, wa, ["--wave=p.fst"],
+                                          "%dfs" % tc)
+            p_err, p_out = norm(p_err), norm(p_out)
 
-        res["status"] = "different" if problems else "identical"
-        res["detail"] = "; ".join(problems[:3])
-        return res
-    except NA as e:
-        res["status"] = "n/a"
-        res["detail"] = str(e)
-        return res
+            verdict = os.path.join(wa, "verdict.json")
+            resave = os.path.join(wa, "resave.ckpt")
+            for f in (verdict, resave):
+                if os.path.exists(f):
+                    os.unlink(f)
+            r_rc, r_out, r_err, _ = runin(
+                after, wa, ["--restore=" + ck, "--allow-changes",
+                            "--verdict=" + verdict, "--resave=" + resave,
+                            "--wave=r.fst"], after.stop)
+            if r_rc is None:
+                res["status"] = "different"
+                res["detail"] = "restored run timed out"
+                continue
+            if b"cannot restore checkpoint" in r_err:
+                mm = re.search(rb"cannot restore checkpoint: ([^\n]*)", r_err)
+                res["status"] = "refused"
+                res["detail"] = mm.group(1).decode() if mm else "?"
+                continue
+
+            if not os.path.exists(verdict):
+                res["status"] = "error"
+                res["detail"] = ("no verdict: " + r_err.decode(
+                    "utf-8", "replace")[-200:]).strip()
+                continue
+
+            v = json.load(open(verdict))
+            res["verdict"] = v["verdict"]
+            res["verdict_old"] = v.get("verdict_without_mappings")
+            res["changed"] = len(v["changed_units"])
+            res["ran"] = sum(1 for u in v["changed_units"]
+                             if u["executed_before_checkpoint"])
+            res["mapped"] = sum(1 for u in v["changed_units"]
+                                if u.get("equivalent_by_mapping"))
+
+            r_err, r_out = norm(r_err), norm(r_out)
+            problems = []
+            if r_rc != s_rc:
+                problems.append("exit status %s, reference %s" % (r_rc, s_rc))
+            if not s_out.startswith(p_out):
+                problems.append("reference output is not a prefix")
+            elif r_out != s_out[len(p_out):]:
+                problems.append("stdout differs")
+            why = stderr_diff(s_err, p_err, r_err)
+            if why:
+                problems.append(why)
+            if not os.path.exists(os.path.join(wa, "r.fst")):
+                problems.append("no waveform from the restored run")
+            else:
+                rdump = subprocess.run([fstdump, "r.fst"], cwd=wa,
+                                       stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL).stdout.decode(
+                                           "utf-8", "replace")
+                problems += waveform_diff(straight, parse_dump(rdump), tc)
+
+            # The claim behind "exact" is equality of state at the
+            # checkpoint: the fixed design run from zero to the same time
+            # saves what the restored simulation saves right after restoring
+            if v["verdict"] == "exact":
+                ref = os.path.join(wa, "ref.ckpt")
+                if os.path.exists(ref):
+                    os.unlink(ref)
+                # Waveform dumping is on in the other runs and it can change
+                # delta cycle numbers, so it is on here too
+                runin(after, wa, ["--checkpoint=%s@%dfs" % (ref, tc),
+                                  "--wave=ref.fst"], "%dfs" % tc)
+                if not os.path.exists(ref) or not os.path.exists(resave):
+                    res["state"] = "unavailable"
+                else:
+                    a1, a2 = payload_of(ref), payload_of(resave)
+                    res["state"] = "same" if a1 == a2 and a1 else "differs"
+                    if res["state"] == "differs":
+                        problems.append("state at the checkpoint differs from "
+                                        "the fixed design run from zero")
+
+            res["status"] = "different" if problems else "identical"
+            res["detail"] = "; ".join(problems[:3])
+        return results
     finally:
         if keep:
-            res["dir"] = work
+            for r in results:
+                r["dir"] = work
         else:
             shutil.rmtree(work, ignore_errors=True)
+
+
+def ck_files(d):
+    out = {}
+    if os.path.isdir(d):
+        for f in sorted(os.listdir(d)):
+            m = re.match(r"ck-(\d+)\.ckpt$", f)
+            if m:
+                out[int(m.group(1))] = os.path.join(d, f)
+    return out
+
+
+def check_confirm(before, after, nvc, lib, fstdump, timeout, jobs=2):
+    """Confirmation by segments against the truth: the changed design run
+    from zero with checkpoints at the same interval, compared with those of
+    the original run file by file"""
+    work = tempfile.mkdtemp(prefix="ckconf-")
+    wb, wa = os.path.join(work, "b"), os.path.join(work, "a")
+    os.makedirs(wb)
+    os.makedirs(wa)
+    env = dict(os.environ)
+    env["NVC_LIBPATH"] = lib
+    env["NVC_IMP_LIB"] = lib
+    res = {"name": after.name, "confirm": None, "truth": None, "ok": True,
+           "detail": ""}
+    try:
+        base = [nvc, "--std=" + after.std]
+        if not elaborate(before, base, wb, env, timeout) \
+                or not elaborate(after, base, wa, env, timeout):
+            res["confirm"] = "n/a"
+            return res
+
+        b_rc, _, _, _ = run(base + ["-r", "--wave=b.fst"] +
+                            (["--stop-time=" + before.stop] if before.stop
+                             else []) + [before.top], wb, env, timeout)
+        dump = subprocess.run([fstdump, "b.fst"], cwd=wb, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL).stdout.decode(
+                                  "utf-8", "replace") \
+            if os.path.exists(os.path.join(wb, "b.fst")) else ""
+        times = sorted(t for t in parse_dump(dump) if t > 0)
+        if len(times) < 8:
+            res["confirm"] = "n/a"
+            return res
+        every = max(times[-1] // 8 // 1000000 * 1000000, 1000000)
+
+        stop = (["--stop-time=" + before.stop] if before.stop else [])
+        run(base + ["-r"] + stop + ["--checkpoint=%s@every=%dfs,max=100000"
+                                    % (os.path.join(work, "ckb"), every),
+                                    before.top], wb, env, timeout)
+        fb = ck_files(os.path.join(work, "ckb"))
+        if len(fb) < 2:
+            res["confirm"] = "n/a"
+            return res
+
+        # Truth: the first checkpoint of the original that the changed design
+        # does not reproduce when run from zero to exactly that time (one run
+        # per checkpoint, so a changed design with events at other times is
+        # still compared at the right one)
+        first = None
+        for i, (t, f) in enumerate(sorted(fb.items())):
+            one = os.path.join(work, "one%d.ckpt" % i)
+            run(base + ["-r", "--stop-time=%dfs" % t,
+                        "--checkpoint=%s@%dfs" % (one, t), after.top],
+                wa, env, timeout)
+            if not os.path.exists(one) or payload_of(f) != payload_of(one):
+                first = i
+                break
+        res["truth"] = "same" if first is None else "differs@%d" % (first + 1)
+
+        cr = os.path.join(work, "res.json")
+        rc, out, err, secs = run(
+            base + ["-r", "--confirm=" + os.path.join(work, "ckb"),
+                    "--jobs=%d" % jobs, "--confirm-result=" + cr, after.top],
+            wa, env, timeout)
+        if not os.path.exists(cr):
+            res["confirm"] = "error"
+            res["ok"] = False
+            res["detail"] = err.decode("utf-8", "replace")[-200:]
+            return res
+        r = json.load(open(cr))
+        res["confirm"] = r["result"]
+        res["wall_s"] = r["wall_s"]
+        if r["result"] == "confirmed" and first is not None:
+            res["ok"] = False
+            res["detail"] = "confirmed but the reference differs at checkpoint %d" \
+                % (first + 1)
+        elif r["result"] == "different":
+            seg = r["first_difference"]["segment"]
+            if first is None:
+                res["ok"] = False
+                res["detail"] = "different but the reference is the same"
+            elif seg != first + 1:
+                res["ok"] = False
+                res["detail"] = "different in segment %d, reference first " \
+                    "differs at checkpoint %d" % (seg, first + 1)
+        elif r["result"] == "incomplete" and first is None:
+            res["detail"] = "not confirmed although the reference is the same"
+        return res
+    finally:
+        if os.environ.get("CONFIRM_KEEP") and not res["ok"]:
+            print("kept", work, after.name, flush=True)
+        else:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def confirm_summary(results):
+    table = collections.Counter((r["confirm"], r["truth"] and
+                                 ("same" if r["truth"] == "same" else "differs"))
+                                for r in results)
+    print("\nconfirmation by segments against the reference:")
+    for (c, t), n in sorted(table.items(), key=str):
+        print("  %-11s reference %-8s %d" % (c, t, n))
+    bad = [r for r in results if not r["ok"]]
+    # A difference found earlier than the reference has it is the known
+    # limit of comparing bytes (design note 12.2): conservative, not wrong
+    early = [r for r in bad if r["detail"].startswith("different in segment")]
+    wrong = [r for r in bad if r not in early]
+    for r in wrong[:10]:
+        print("CONFIRM DISAGREES %s: %s" % (r["name"], r["detail"]))
+    for r in early[:10]:
+        print("confirm reports a difference earlier than the reference "
+              "%s: %s" % (r["name"], r["detail"]))
+    print("confirmation disagreements with the reference: %d "
+          "(+ %d differences reported earlier than the reference)"
+          % (len(wrong), len(early)))
+    return len(wrong)
 
 
 def write_sources(root, files):
@@ -639,6 +827,188 @@ def own_pairs():
     return pairs
 
 
+def tally(results, table):
+    for r in results:
+        table[(r["verdict"] or r["status"], r["status"], r.get("state"),
+               r.get("verdict_old"))] += 1
+
+
+def print_table(table):
+    print("\nverdict x result (restore from the design before the change):")
+    rows = collections.Counter()
+    for (verdict, status, state, old), n in table.items():
+        rows[(verdict, status)] += n
+    for verdict in ("exact", "approximate", "refused", "n/a"):
+        row = {k[1]: v for k, v in rows.items() if k[0] == verdict}
+        if row:
+            print("  %-12s %s" % (verdict, ", ".join(
+                "%s %d" % (k, v) for k, v in sorted(row.items()))))
+    states = collections.Counter()
+    for (verdict, status, state, old), n in table.items():
+        if verdict == "exact":
+            states[state] += n
+    print("exact: state at the checkpoint compared with the fixed design "
+          "from zero: %s" % (dict(states) or "none"))
+    new = sum(n for (v, st, sta, old), n in table.items() if v == "exact")
+    prev = sum(n for (v, st, sta, old), n in table.items()
+               if old == "exact" and v is not None)
+    both = sum(n for (v, st, sta, old), n in table.items()
+               if v == "exact" and old == "exact")
+    print("exact verdicts: %d with mappings, %d by the rule without them "
+          "(%d by both)" % (new, prev, both))
+    appr_id = sum(n for (v, st, sta, old), n in table.items()
+                  if v == "approximate" and st == "identical")
+    appr = sum(n for (v, st, sta, old), n in table.items()
+               if v == "approximate")
+    print("approximate but identical afterwards: %d of %d approximate"
+          % (appr_id, appr))
+    bad = sum(n for (v, st, sta, old), n in table.items()
+              if v == "exact" and (st == "different" or sta == "differs"))
+    print("exact and different (output, waves or state): %d" % bad)
+    unavail = sum(n for (v, st, sta, old), n in table.items()
+                  if v == "exact" and sta == "unavailable")
+    print("exact with no state comparison possible: %d" % unavail)
+    return bad
+
+
+# --------------------------------------------------------------------------
+# Mutants
+
+COND_RE = re.compile(r"^\s*(if|elsif|when|while|assert|exit when|next when)\b|\bwhen\b.*\belse\b")
+ASSIGN_RE = re.compile(r"^(\s*)[A-Za-z_][\w.()'\s,]*?\s*(<=|:=)[^;]*;\s*$")
+SKIP_RE = re.compile(r"^\s*(--|library|use|entity|architecture|end|package|"
+                     r"generic|port|constant|type|subtype|function|procedure|"
+                     r"signal|variable|component|begin|is\b)", re.I)
+NUM_RE = re.compile(r"(?<![\w.'#\"])(\d+)(?![\w.#\"'])(?!\s*(fs|ps|ns|us|ms|sec)\b)")
+
+
+def line_mutations(line):
+    """All the single changes that can be made to a line, as (name, text)"""
+    out = []
+    if SKIP_RE.match(line):
+        return out
+    m = ASSIGN_RE.match(line)
+    if m and "<=" not in line.split(":=")[0].replace("<=", "<=", 1) or m:
+        out.append(("delete", m.group(1) + "null;" if m else line))
+        out.append(("duplicate", line + "\n" + line))
+    cond = bool(COND_RE.match(line))
+    for name, old, new in (("plus", " + ", " - "), ("minus", " - ", " + "),
+                           ("times", " * ", " + "), ("and", " and ", " or "),
+                           ("or", " or ", " and ")):
+        if old in line:
+            out.append((name, line.replace(old, new, 1)))
+    if cond:
+        for name, old, new in (("eq", " = ", " /= "), ("neq", " /= ", " = "),
+                               ("lt", " < ", " > "), ("gt", " > ", " < "),
+                               ("le", " <= ", " >= "), ("ge", " >= ", " <= ")):
+            if old in line:
+                out.append((name, line.replace(old, new, 1)))
+    for mm in NUM_RE.finditer(line):
+        v = int(mm.group(1))
+        out.append(("const", line[:mm.start()] + str(v + 1) + line[mm.end():]))
+        break
+    mm = re.search(r"wait for (\d+) (ns|us)", line)
+    if mm:
+        out.append(("wait", line[:mm.start(1)] + str(int(mm.group(1)) * 2 + 1)
+                    + line[mm.end(1):]))
+    return out
+
+
+def mutants(files, rng, count):
+    """(description, {file: new text}) for count single mutations"""
+    sites = []
+    texts = {f: open(f).read().split("\n") for f in files}
+    for f, lines in texts.items():
+        for i, line in enumerate(lines):
+            for name, new in line_mutations(line):
+                sites.append((f, i, name, new))
+    rng.shuffle(sites)
+    return [("%s:%d:%s" % (os.path.basename(f), i + 1, name),
+             {f: "\n".join(texts[f][:i] + new.split("\n")
+                           + texts[f][i + 1:])})
+            for f, i, name, new in sites[:count]]
+
+
+def mutation_bases():
+    b = os.path.join(ROOT, "test", "mcp", "bench")
+    bases = []
+    for dut, tb, top, stop in BENCH:
+        bases.append(("m_" + dut, [os.path.join(b, dut + ".vhd"),
+                                   os.path.join(b, tb + ".vhd")], top, stop, 1))
+    bases.append(("m_soc", [os.path.join(b, "soc", f + ".vhd")
+                            for f in SOC_FILES], "tb_soc", "3ms", 0.25))
+    xb = os.path.join(HERE, "pairs", "x_c0", "before", "t.vhd")
+    bases.append(("m_x", [xb], "t", "1200ns", 2))
+    return bases
+
+
+def mutation_task(task):
+    (name, files, top, stop, desc, repl, nvc, lib, fstdump, timeout,
+     quantiles, root, confirm) = task
+    tmp = tempfile.mkdtemp(prefix="ckmut-")
+    try:
+        after_files = []
+        for f in files:
+            text = repl.get(f)
+            if text is None:
+                after_files.append(f)
+                continue
+            dst = os.path.join(tmp, os.path.basename(os.path.dirname(f))
+                               + "_" + os.path.basename(f))
+            open(dst, "w").write(text)
+            after_files.append(dst)
+        before = Design(name, files, top, std="2008", stop=stop)
+        after = Design(name + "/" + desc, after_files, top, std="2008",
+                       stop=stop)
+        res = check_fix(before, after, nvc, lib, fstdump, False, timeout,
+                        quantiles)
+        for r in res:
+            r["name"] = "%s/%s%s" % (name, desc, r["name"][r["name"].rfind("@"):])
+        if confirm:
+            c = check_confirm(before, after, nvc, lib, fstdump, timeout, 2)
+            c["name"] = "%s/%s" % (name, desc)
+            res.append({"name": c["name"], "status": "confirm", "confirm": c,
+                        "verdict": None})
+        return res
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def mutate_main(args, nvc, lib, fstdump):
+    import random
+    import multiprocessing
+    rng = random.Random(args.seed)
+    qs = [float(x) for x in args.at.split(",")]
+    tasks = []
+    for name, files, top, stop, weight in mutation_bases():
+        for desc, repl in mutants(files, rng, int(args.count * weight)):
+            tasks.append((name, files, top, stop, desc, repl, nvc, lib,
+                          fstdump, args.timeout, qs, ROOT, args.confirm))
+
+    table = collections.Counter()
+    results = []
+    cresults = []
+    with multiprocessing.Pool(args.jobs) as pool:
+        for res in pool.imap_unordered(mutation_task, tasks):
+            for r in res:
+                if r["status"] == "confirm":
+                    cresults.append(r["confirm"])
+                    continue
+                results.append(r)
+                tally([r], table)
+                if r["status"] == "different" and r["verdict"] == "exact":
+                    print("EXACT BUT DIFFERENT %s: %s" % (r["name"],
+                                                          r["detail"][:200]),
+                          flush=True)
+    print("mutants tried: %d, checks: %d" % (len(tasks), len(results)))
+    bad = print_table(table)
+    if args.confirm:
+        bad += confirm_summary(cresults)
+    if args.json:
+        json.dump(results, open(args.json, "w"), indent=1)
+    return 1 if bad else 0
+
+
 def fix_main(args, nvc, lib, fstdump):
     tmp = tempfile.mkdtemp(prefix="ckpairs-")
     pairs = own_pairs()
@@ -647,37 +1017,32 @@ def fix_main(args, nvc, lib, fstdump):
     if args.names:
         pairs = [p for p in pairs if p[0].name in args.names]
 
+    qs = [float(x) for x in args.at.split(",")]
     table = collections.Counter()
     results = []
-    for q in [float(x) for x in args.at.split(",")]:
-        for before, after in pairs:
-            r = check_fix(before, after, nvc, lib, fstdump, args.keep,
-                          args.timeout, q)
-            r["name"] = "%s@%g" % (before.name, q)
+    for before, after in pairs:
+        for r in check_fix(before, after, nvc, lib, fstdump, args.keep,
+                           args.timeout, qs):
             results.append(r)
-            table[(r["verdict"] or r["status"], r["status"])] += 1
+            tally([r], table)
             if args.verbose or r["status"] == "different":
                 print("%-28s %-12s %-10s %s" % (r["name"], r["verdict"] or "-",
                                                 r["status"], r["detail"][:140]),
                       flush=True)
 
-    print("\nverdict x result (changed designs, restore from the design "
-          "before the fix):")
-    for verdict in ("exact", "approximate", "refused", "n/a"):
-        row = {k[1]: v for k, v in table.items() if k[0] == verdict}
-        if row:
-            print("  %-12s %s" % (verdict, ", ".join(
-                "%s %d" % (k, v) for k, v in sorted(row.items()))))
+    bad = print_table(table)
+    if args.confirm:
+        cres = [check_confirm(b, a, nvc, lib, fstdump, args.timeout)
+                for b, a in pairs]
+        bad += confirm_summary(cres)
     if args.json:
         json.dump(results, open(args.json, "w"), indent=1)
-    bad = table[("exact", "different")]
-    print("exact and different: %d" % bad)
     return 1 if bad else 0
 
 
 def main():
     ap = argparse.ArgumentParser(description="nvc checkpoint validation harness (see the comment at the top of the file)")
-    ap.add_argument("mode", choices=["regress", "bench", "design", "fix"])
+    ap.add_argument("mode", choices=["regress", "bench", "design", "fix", "mutate"])
     ap.add_argument("--pairs", default="all", choices=["bench", "own", "all"],
                     help="for the fix mode: which pairs of designs")
     ap.add_argument("names", nargs="*")
@@ -690,6 +1055,13 @@ def main():
     ap.add_argument("--at", default="0.5",
                     help="comma separated positions in the run, as fractions "
                     "of its event times, at which to checkpoint (default 0.5)")
+    ap.add_argument("--confirm", action="store_true",
+                    help="fix and mutate modes: also run the confirmation by "
+                    "segments and compare it with the reference")
+    ap.add_argument("--count", type=int, default=40,
+                    help="mutate mode: mutants per base design")
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--jobs", type=int, default=4)
     ap.add_argument("--top")
     ap.add_argument("--stop")
     ap.add_argument("--std", default="2008")
@@ -702,6 +1074,8 @@ def main():
 
     if args.mode == "fix":
         return fix_main(args, nvc, lib, fstdump)
+    if args.mode == "mutate":
+        return mutate_main(args, nvc, lib, fstdump)
 
     if args.mode == "regress":
         designs = regress_designs(set(args.names))

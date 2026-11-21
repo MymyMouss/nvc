@@ -48,7 +48,12 @@ typedef struct {
    bool      exact;
    unsigned  nchanged;
    char    **changed;         // Names of the units whose code changed
-   bool     *executed;        // ... and whether they had already run
+   bool     *executed;        // ... and whether changed code had run that
+                              // could not be shown to be equivalent
+   bool     *by_mapping;      // Changed code that had run, shown equivalent
+   bool     *prefix_ran;      // What the rule without mappings would say
+   bool      exact_prefix;    // ... the verdict by that rule
+   bool      verified;        // The restored state was compared with the file
    unsigned  nnotes;
    char    **notes;           // Why the verdict is not exact, and more
 } ckpt_report_t;
@@ -74,6 +79,36 @@ void checkpoint_schedule(rt_model_t *m, jit_t *jit, const char *path,
 
 // Format a simulation time in the largest unit that divides it exactly
 void checkpoint_format_time(uint64_t t, char *buf, size_t len);
+
+// Write a checkpoint into DIR every `every` femtoseconds of simulated time
+// (at the end of the first time step at or after each multiple), named by
+// the time step it was saved at.  At most `max` are kept: when there would
+// be more every second one is deleted and the interval doubles, so a long
+// run keeps a bounded number spread over its length.
+void checkpoint_schedule_every(rt_model_t *m, jit_t *jit, const char *dir,
+                               uint64_t every, unsigned max);
+
+// Tell the checkpoint code whether waveform dumping is on: it changes the
+// numbers of the delta cycles, which are part of the saved state, so two
+// checkpoints can only be compared if it was the same for both
+void checkpoint_note_wave(bool on);
+
+// What can be read from a checkpoint file without restoring it
+typedef struct {
+   uint64_t  time_fs;
+   bool      wave;        // Waveform dumping was on
+   char    **inputs;      // Files the design had open for reading
+   unsigned  ninputs;
+} ckpt_info_t;
+
+char *checkpoint_describe(const char *path, ckpt_info_t *info);
+void checkpoint_info_free(ckpt_info_t *info);
+
+// Compare the saved state of two checkpoints, ignoring what identifies the
+// build and which code had run.  Returns NULL if they are the same or a
+// malloc'd description of the first difference: the section and the signal,
+// process or frame that holds it.
+char *checkpoint_compare(const char *a, const char *b);
 
 // Call when the simulation ends: reports a checkpoint that was never
 // reached and returns true if the checkpoint failed in any way.

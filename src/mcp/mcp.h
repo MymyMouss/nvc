@@ -37,6 +37,7 @@ void mcp_format_time(int64_t fs, char *buf, size_t len);
 // supervisor closes it.  See mcp-worker.c.
 int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
                     const char *files_dir, const char *restore_file,
-                    bool allow_changes);
+                    bool allow_changes, const char *every_dir,
+                    uint64_t every_fs);
 
 #endif   // _MCP_H

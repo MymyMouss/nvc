@@ -1009,6 +1009,52 @@ approximate, l'agent doit relancer le design corrigé depuis zéro pour
 valider (c'est dit dans la description de l'outil). Voir
 `CHECKPOINT-DESIGN.md` section 10.
 
+Le verdict est « exact » dès que le code modifié qui a tourné est le même,
+bloc de base par bloc de base, que dans le nouveau code (section 11 du même
+document): une correction dans une branche pas encore atteinte d'un process
+cadencé est donc exacte, alors qu'une règle de préfixe l'aurait classée
+approximate. La description de l'outil n'a pas changé: le verdict dit
+toujours ce qui est sûr.
+
+### 8.14 Confirmation en arrière-plan (segments)
+
+Un verdict « approximate » se valide en relançant le design corrigé depuis
+zéro, ce qui peut durer aussi longtemps que le run d'origine. La confirmation
+par segments le fait en parallèle: si les états d'origine `C0` (temps zéro),
+`C1`, ... `Cn` sont des fichiers, on restaure `C(i-1)` dans le design corrigé,
+on simule jusqu'au temps de `Ci`, on sauve et on compare avec `Ci`; si tous
+les segments donnent le même état, une exécution du design corrigé depuis
+zéro passe par chaque `Ci` (récurrence, voir `CHECKPOINT-DESIGN.md`
+section 12), et la simulation reprise depuis `Ck` continue comme elle l'aurait
+fait.
+
+**Outils.** Pas de nouvel outil, des paramètres de `nvc_sim_open`:
+`checkpoint_dir` et `checkpoint_every` (la simulation d'origine écrit
+`.nvc-mcp/DIR/ck-<temps en fs>.ckpt` tous les `every` de temps simulé, 64
+fichiers au plus, l'intervalle double quand il y en aurait plus; implique
+`track_code`; un répertoire déjà utilisé est refusé), puis, sur le design
+corrigé, `restore_from` (un de ces fichiers, `DIR/ck-....ckpt`, une
+profondeur de répertoire permise), `allow_changes` et `confirm_dir`
+(`confirm_jobs`, 2 par défaut, 8 au plus). Le serveur lance
+`nvc -r --confirm=DIR --jobs=N --confirm-result=FICHIER top` dans un groupe de
+processus à part (même exécutable et mêmes options globales que le worker),
+journal et résultat dans le répertoire des fichiers de la simulation. Il
+disparaît avec la simulation (`nvc_sim_close`, expiration, mort du serveur);
+rouvrir avec le même `confirm_dir` reprend où l'on s'était arrêté (le fichier
+de progression est lié par une empreinte au design, au binaire, aux entrées et
+aux deux checkpoints du segment).
+
+**Statut.** `nvc_sim_status` ajoute `periodic_checkpoints` (répertoire, nombre,
+dernier temps) et `confirmation` (`state`: running, confirmed, different,
+incomplete ou failed; segments terminés/total; `restored_checkpoint_fs`, le
+temps du fichier restauré s'il fait partie du répertoire, sinon une note qui
+dit que la confirmation ne dit rien de l'état de départ;
+`restore_point_confirmed`; `result`, l'objet JSON complet de `--confirm`).
+`nvc_sim_wait` ne rend pas la main sur « stopped » tant qu'une confirmation
+tourne et se réveille avec `woke_because: confirmation_finished`. Seul
+`confirmed` signifie que le correctif reproduit le run d'origine; `incomplete`
+(segments non vérifiables ou budget épuisé) ne compte jamais comme confirmé.
+
 ## Références
 
 - Spécification MCP 2026-07-28, changements:

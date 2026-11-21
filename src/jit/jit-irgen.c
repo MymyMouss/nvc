@@ -5448,6 +5448,15 @@ static void irgen_context_struct(jit_irgen_t *g)
       g->used_tlab = true;
    }
 
+   if (kind == MIR_UNIT_PROCESS || kind == MIR_UNIT_PROCEDURE) {
+      // Variables not yet assigned, such as those of a loop not yet
+      // entered, would otherwise hold stale memory that differs from one
+      // run to the next and so between two checkpoints of the same state
+      jit_value_t bytes = irgen_alloc_reg(g, 1);
+      j_mov(g, bytes, jit_value_from_int64(sz));
+      macro_bzero(g, jit_addr_from_value(g->statereg, 0), bytes);
+   }
+
    if (kind == MIR_UNIT_PROCEDURE) {
       jit_value_t stamp =
          jit_addr_from_value(g->statereg, 2 * sizeof(void *) + sizeof(int32_t));
