@@ -631,6 +631,38 @@ from `C(i-1)`, so a file from another run shows up as a difference.
   checkpoint (`--checkpoint=FILE@TIME`, one run per checkpoint), compared
   with the original's file; it does not use restore or segments.
   `harness.py fix --confirm` on the 62 pairs (test/mcp/bench bugs, own and
+  `x_*` pairs): confirmed 2 (reference same), different 57 (reference
+  differs), incomplete 3 (reference same; the reasons were not tabulated).
+  `harness.py mutate --confirm` on 846 mutants (swapped operators, changed
+  constants and conditions, deleted statements, changed wait durations):
+  confirmed 179 (reference same), different 542 (reference differs),
+  incomplete 56 (54 where the reference is the same), not applicable 69.
+  **Confirmed where the reference differs: 0.  Different where the
+  reference is the same: 0.  Different in an earlier segment than the
+  reference: 0** (2 before frames were cleared, see 12.2).
+* **Cost of writing.**  Code tracking (needed so that the files can later give
+  exact verdicts) costs about a third on the interpreter; each file costs a
+  few milliseconds on the SoC bench (see the report).
+
+### 12.3 Assumptions
+
+* The simulation is deterministic given the state and the files it reads:
+  no `now`-independent wall clock values, no randomness not derived from the
+  state, no plusargs that differ between the runs (the options of the
+  confirming run are those given to it: they must be those of the original).
+* A run of `F` from `C(i-1)` to `Ti` needs the same input files as the
+  original; those that changed are the user's responsibility and the
+  comparison will show it as a difference if it matters.
+* The verification of a restore compares the model after the restore with
+  the file; state that is not saved (section 8) is not checked.
+
+### 12.4 Measurements (final tree)
+
+* **Agreement with a reference.**  The reference for a pair of designs is the
+  changed design run from zero to exactly the time of each original
+  checkpoint (`--checkpoint=FILE@TIME`, one run per checkpoint), compared
+  with the original's file; it does not use restore or segments.
+  `harness.py fix --confirm` on the 62 pairs (test/mcp/bench bugs, own and
   `x_*` pairs): confirmed 2 (reference same), different 55, incomplete 5
   (3 where the reference is the same; the reasons were not tabulated).  `harness.py mutate --confirm` on 846 mutants (swapped
   operators, changed constants and conditions, deleted statements, changed
