@@ -37,10 +37,34 @@ void checkpoint_free_id(ckpt_id_t *id);
 char *checkpoint_save(rt_model_t *m, jit_t *jit, const ckpt_id_t *id,
                       const char *path);
 
+// What a restore into a changed design can say about the result.  The
+// verdict is "exact" only if the restored simulation is provably the one
+// the changed design would have had from time zero: every unit whose code
+// changed had not run any of the changed part before the checkpoint.
+typedef struct {
+   bool      tracked;         // The checkpoint knows which code had run
+   bool      changed_design;  // The library or the design hash differed
+   bool      layout_changed;  // Variables or signals were added or dropped
+   bool      exact;
+   unsigned  nchanged;
+   char    **changed;         // Names of the units whose code changed
+   bool     *executed;        // ... and whether they had already run
+   unsigned  nnotes;
+   char    **notes;           // Why the verdict is not exact, and more
+} ckpt_report_t;
+
+void checkpoint_report_free(ckpt_report_t *rep);
+
+// Verdict as a JSON object
+char *checkpoint_report_json(const ckpt_report_t *rep);
+
 // Restore a checkpoint into a model of the same design that has just been
-// reset and has not yet run.  Returns NULL on success or a malloc'd
-// message; after a failure the model must be discarded.
-char *checkpoint_restore(rt_model_t *m, jit_t *jit, const char *path);
+// reset and has not yet run.  With allow_changes the work library may
+// differ from the one the checkpoint came from and the report says what
+// that means.  Returns NULL on success or a malloc'd message; after a
+// failure the model must be discarded.
+char *checkpoint_restore(rt_model_t *m, jit_t *jit, const char *path,
+                         bool allow_changes, ckpt_report_t *rep);
 
 // Arrange for a checkpoint to be written the first time a time step at or
 // after the given time ends.  The result is reported through diagnostics

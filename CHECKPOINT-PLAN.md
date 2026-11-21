@@ -1,8 +1,7 @@
 # Plan: checkpoint et reprise de simulation
 
-Statut: phases 0, 1 et 2 **réalisées** (phase 2: voir `CHECKPOINT-DESIGN.md`,
-fichiers ouverts, procédures suspendues et access simples compris). Phases 3
-et 4 à faire.
+Statut: phases 0 à 3 **réalisées** (voir `CHECKPOINT-DESIGN.md`). Reste la
+phase 4 (élargir le périmètre) et le « mode invisible » de la phase 3.
 Remplace et détaille `PLAN.md` §1.
 
 ## 1. Les deux besoins, qui ne se résolvent pas de la même façon

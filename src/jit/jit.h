@@ -106,6 +106,25 @@ bool jit_get_framelay(jit_t *j, jit_handle_t handle, jit_framelay_t *out,
 bool jit_get_cpool(jit_t *j, jit_handle_t handle, const void **base,
                    size_t *size, bool compile);
 unsigned jit_handle_count(jit_t *j);
+
+// Which instructions of each function have run, for checkpoints.  Set the
+// flag before any function is compiled.
+extern bool jit_exec_tracking;
+
+typedef struct {
+   unsigned       nirs;
+   uint32_t      *ihash;      // Of each instruction, free with free()
+   const uint8_t *exec;       // NULL if not tracked
+   uint64_t       cpool_hash;
+   size_t         cpool_size;
+   bool           restart_top;
+   int            restart_state;
+   bool           has_next_tier;
+} jit_code_t;
+
+bool jit_get_code(jit_t *j, jit_handle_t handle, jit_code_t *out);
+void jit_set_exec(jit_t *j, jit_handle_t handle, const uint8_t *bits,
+                  unsigned n, bool all);
 void *jit_get_privdata(jit_t *j, jit_handle_t handle);
 void jit_set_privdata(jit_t *j, jit_handle_t handle, void *ptr);
 

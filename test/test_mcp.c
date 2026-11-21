@@ -3145,6 +3145,95 @@ START_TEST(test_sim_checkpoint_file)
 }
 END_TEST
 
+static const char late_src[] =
+   "entity late is end entity;\n"
+   "architecture a of late is\n"
+   "  signal x : integer := 0;\n"
+   "begin\n"
+   "  process begin\n"
+   "    wait for 100 ns; x <= 1;\n"
+   "    wait for 100 ns;\n"
+   "    if x = %d then report \"late: hit\"; end if;\n"
+   "    wait;\n"
+   "  end process;\n"
+   "end architecture;\n";
+
+static void rebuild_late(fixture_t *f, const char *text)
+{
+   write_file(f->root, "late.vhd", text, 0644);
+   const json_t *sc = structured(tool(f->mp, f->srv, &f->sink, "nvc_analyse",
+                                      "{\"files\":[\"counter.vhd\","
+                                      "\"late.vhd\"],\"std\":\"2008\"}"));
+   ck_assert(bool_field(sc, "ok"));
+   sc = structured(tool(f->mp, f->srv, &f->sink, "nvc_elaborate",
+                        "{\"top\":\"late\",\"std\":\"2008\"}"));
+   ck_assert(bool_field(sc, "ok"));
+}
+
+START_TEST(test_sim_restore_changed)
+{
+   fixture_t f;
+   char *v1 = xasprintf(late_src, 1);
+   const char *names[] = { "late.vhd" }, *sources[] = { v1 };
+   const char *tops[] = { "late" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   const json_t *sc = structured(tool(f.mp, f.srv, &f.sink, "nvc_sim_open",
+                                      "{\"top\":\"late\",\"std\":\"2008\","
+                                      "\"track_code\":true}"));
+   char id[40];
+   snprintf(id, sizeof(id), "%s", str_field(sc, "sim_id"));
+
+   sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"100 ns\"");
+   sc = structured(sim_tool(&f, "nvc_sim_checkpoint", id,
+                            "\"to_file\":\"late.ckpt\""));
+   ck_assert_int_eq(int_field(sc, "now_fs"), 100000000);
+   sim_tool(&f, "nvc_sim_close", id, "");
+
+   // Fix the code that has not run yet
+   char *v2 = xasprintf(late_src, 2);
+   rebuild_late(&f, v2);
+
+   const char *err = tool_error(tool(f.mp, f.srv, &f.sink, "nvc_sim_open",
+                                     "{\"top\":\"late\",\"std\":\"2008\","
+                                     "\"restore_from\":\"late.ckpt\"}"));
+   ck_assert_ptr_nonnull(strstr(err, "allow_changes")
+                         ?: strstr(err, "allow-changes"));
+
+   sc = structured(tool(f.mp, f.srv, &f.sink, "nvc_sim_open",
+                        "{\"top\":\"late\",\"std\":\"2008\","
+                        "\"restore_from\":\"late.ckpt\","
+                        "\"allow_changes\":true}"));
+   const json_t *verdict = json_get(sc, "restore_verdict");
+   ck_assert_ptr_nonnull(verdict);
+   ck_assert_str_eq(str_field(verdict, "verdict"), "exact");
+   ck_assert_int_eq(int_field(sc, "now_fs"), 100000000);
+   snprintf(id, sizeof(id), "%s", str_field(sc, "sim_id"));
+
+   sc = structured(sim_tool(&f, "nvc_sim_run", id, "\"duration\":\"200 ns\","
+                            "\"pause_on\":\"never\""));
+   ck_assert_int_eq(json_get(sc, "messages")->array.count, 0);   // x /= 2
+   sim_tool(&f, "nvc_sim_close", id, "");
+
+   // Changing code that had run cannot resume the process in it
+   char *v3 = xasprintf(late_src, 1);
+   char *p = strstr(v3, "wait for 100 ns; x <= 1");
+   ck_assert_ptr_nonnull(p);
+   p[strlen("wait for 100 ns; x <= ")] = '3';
+   rebuild_late(&f, v3);
+   err = tool_error(tool(f.mp, f.srv, &f.sink, "nvc_sim_open",
+                         "{\"top\":\"late\",\"std\":\"2008\","
+                         "\"restore_from\":\"late.ckpt\","
+                         "\"allow_changes\":true}"));
+   ck_assert_ptr_nonnull(strstr(err, "has changed"));
+
+   free(v1);
+   free(v2);
+   free(v3);
+   fixture_close(&f);
+}
+END_TEST
+
 START_TEST(test_sim_restore_errors)
 {
    fixture_t f;
@@ -3566,6 +3655,7 @@ Suite *get_mcp_tests(void)
    tcase_add_test(tc, test_sim_queries);
    tcase_add_test(tc, test_sim_checkpoint);
    tcase_add_test(tc, test_sim_checkpoint_file);
+   tcase_add_test(tc, test_sim_restore_changed);
    tcase_add_test(tc, test_sim_restore_files);
    tcase_add_test(tc, test_sim_restore_errors);
    tcase_add_test(tc, test_sim_restore_failed);

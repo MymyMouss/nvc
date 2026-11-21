@@ -55,7 +55,7 @@
 #include <unistd.h>
 
 #define CKPT_MAGIC   "NVCCKPT1"
-#define CKPT_VERSION 1
+#define CKPT_VERSION 2
 
 ////////////////////////////////////////////////////////////////////////////////
 // Output and input buffers
@@ -64,7 +64,8 @@ typedef struct {
    uint8_t  *d;
    size_t    n, cap;
    hash_t   *names;     // ident_t to index + 1
-   unsigned  nnames;
+   ident_t  *nlist;     // The names in index order
+   unsigned  nnames, nmax;
    char     *err;
 } wbuf_t;
 
@@ -110,6 +111,7 @@ static void w_init(wbuf_t *w)
 static void w_free(wbuf_t *w)
 {
    hash_free(w->names);
+   free(w->nlist);
    free(w->d);
    free(w->err);
 }
@@ -147,17 +149,41 @@ static void w_str(wbuf_t *w, const char *s)
    w_bytes(w, s, len);
 }
 
-// Names are written once and then referred to by index
-static void w_name(wbuf_t *w, ident_t id)
+// Names are collected in a table written before the rest, so a record
+// can be skipped without reading it
+static unsigned w_nameidx(wbuf_t *w, ident_t id)
 {
    uintptr_t idx = (uintptr_t)hash_get(w->names, id);
    if (idx != 0)
-      w_u32(w, idx - 1);
-   else {
-      hash_put(w->names, id, (void *)(uintptr_t)(w->nnames + 1));
-      w_u32(w, w->nnames++);
-      w_str(w, istr(id));
+      return idx - 1;
+
+   if (w->nnames == w->nmax) {
+      w->nmax = MAX(256, w->nmax * 2);
+      w->nlist = xrealloc_array(w->nlist, w->nmax, sizeof(ident_t));
    }
+
+   w->nlist[w->nnames] = id;
+   hash_put(w->names, id, (void *)(uintptr_t)(w->nnames + 1));
+   return w->nnames++;
+}
+
+static void w_name(wbuf_t *w, ident_t id)
+{
+   w_u32(w, w_nameidx(w, id));
+}
+
+// The body of the file prefixed by its table of names
+static uint8_t *w_finish(wbuf_t *w, size_t *len)
+{
+   wbuf_t t;
+   memset(&t, '\0', sizeof(t));
+   w_tag(&t, "NAMT");
+   w_u32(&t, w->nnames);
+   for (unsigned i = 0; i < w->nnames; i++)
+      w_str(&t, istr(w->nlist[i]));
+   w_bytes(&t, w->d, w->n);
+   *len = t.n;
+   return t.d;
 }
 
 // The empty string cannot be an identifier
@@ -175,6 +201,20 @@ static const char *name_str(ident_t id)
 static void w_cname(wbuf_t *w, const char *s)
 {
    w_name(w, *s ? ident_new(s) : empty_ident());
+}
+
+// A record is framed by its length so a reader that does not recognise it
+// can skip it
+static size_t w_rec_begin(wbuf_t *w)
+{
+   w_u32(w, 0);
+   return w->n;
+}
+
+static void w_rec_end(wbuf_t *w, size_t start)
+{
+   const uint32_t len = w->n - start;
+   memcpy(w->d + start - 4, &len, 4);
 }
 
 static bool r_ok(rbuf_t *r, size_t k)
@@ -239,24 +279,34 @@ static ident_t r_name(rbuf_t *r)
    const uint32_t idx = r_u32(r);
    if (r->err != NULL)
       return NULL;
-   else if (idx < r->nnames)
-      return r->names[idx];
-   else if (idx != r->nnames) {
+   else if (idx >= r->nnames) {
       r_fail(r, "bad name index in checkpoint file");
       return NULL;
    }
+   return r->names[idx];
+}
 
-   const uint32_t len = r_u32(r);
-   const uint8_t *s = r_bytes(r, len);
-   if (s == NULL)
-      return NULL;
+static bool r_names_load(rbuf_t *r)
+{
+   if (!r_tag(r, "NAMT"))
+      return false;
 
-   if (r->nnames == r->maxnames) {
-      r->maxnames = MAX(256, r->maxnames * 2);
-      r->names = xrealloc_array(r->names, r->maxnames, sizeof(ident_t));
+   const uint32_t n = r_u32(r);
+   if (r->err == NULL && n > (size_t)(r->end - r->p)) {
+      r_fail(r, "checkpoint file is corrupt");
+      return false;
    }
 
-   return r->names[r->nnames++] = ident_new_n((const char *)s, len);
+   r->names = xcalloc(MAX(n, 1) * sizeof(ident_t));
+   r->maxnames = n;
+   for (unsigned i = 0; i < n && r->err == NULL; i++) {
+      const uint32_t len = r_u32(r);
+      const uint8_t *str = r_bytes(r, len);
+      if (str != NULL)
+         r->names[r->nnames++] = ident_new_n((const char *)str, len);
+   }
+
+   return r->err == NULL;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -392,6 +442,84 @@ static ident_t var_key(const frame_t *f, unsigned nth)
 ////////////////////////////////////////////////////////////////////////////////
 // Index of the named objects in a model
 
+typedef enum {
+   U_SAME,       // Same code
+   U_COMPAT,     // Changed, but only code that had never run
+   U_APPROX,     // Changed code had run
+   U_REMOVED,    // No longer in the design
+} unit_class_t;
+
+typedef struct {
+   unit_class_t cls;
+   bool         old_restart, new_restart;
+   int          new_state;     // Resume state of the new code, if it restarts
+} unit_t;
+
+__attribute__((format(printf, 2, 3)))
+static void report_note(ckpt_report_t *rep, const char *fmt, ...)
+{
+   if (rep == NULL || rep->nnotes >= 50)
+      return;
+
+   va_list ap;
+   va_start(ap, fmt);
+   char *msg = NULL;
+   if (vasprintf(&msg, fmt, ap) < 0)
+      msg = xstrdup("?");
+   va_end(ap);
+
+   rep->notes = xrealloc_array(rep->notes, rep->nnotes + 1, sizeof(char *));
+   rep->notes[rep->nnotes++] = msg;
+}
+
+void checkpoint_report_free(ckpt_report_t *rep)
+{
+   for (unsigned i = 0; i < rep->nchanged; i++)
+      free(rep->changed[i]);
+   for (unsigned i = 0; i < rep->nnotes; i++)
+      free(rep->notes[i]);
+   free(rep->changed);
+   free(rep->executed);
+   free(rep->notes);
+   memset(rep, '\0', sizeof(*rep));
+}
+
+static void json_escape(text_buf_t *tb, const char *s)
+{
+   tb_append(tb, '"');
+   for (; *s; s++) {
+      if (*s == '"' || *s == '\\')
+         tb_append(tb, '\\');
+      if ((unsigned char)*s < 0x20)
+         tb_printf(tb, "\\u%04x", *s);
+      else
+         tb_append(tb, *s);
+   }
+   tb_append(tb, '"');
+}
+
+char *checkpoint_report_json(const ckpt_report_t *rep)
+{
+   LOCAL_TEXT_BUF tb = tb_new();
+   tb_printf(tb, "{\"verdict\":\"%s\",\"tracked\":%s,\"changed_units\":[",
+             rep->exact ? "exact" : "approximate",
+             rep->tracked ? "true" : "false");
+   for (unsigned i = 0; i < rep->nchanged; i++) {
+      tb_printf(tb, "%s{\"unit\":", i ? "," : "");
+      json_escape(tb, rep->changed[i]);
+      tb_printf(tb, ",\"executed_before_checkpoint\":%s}",
+                rep->executed[i] ? "true" : "false");
+   }
+   tb_cat(tb, "],\"reasons\":[");
+   for (unsigned i = 0; i < rep->nnotes; i++) {
+      if (i > 0)
+         tb_append(tb, ',');
+      json_escape(tb, rep->notes[i]);
+   }
+   tb_cat(tb, "]}");
+   return xstrdup(tb_get(tb));
+}
+
 typedef struct {
    char        *path;
    rt_signal_t *sig;
@@ -457,6 +585,9 @@ typedef struct {
    file_ckpt_t  *sfiles;      // Files named by a checkpoint being restored
    file_handle_t *sfh;        // Handle each was given in this model
    unsigned      nsfiles;
+   bool          allow;       // Restoring into a changed design
+   ckpt_report_t *rep;
+   shash_t      *units;       // Code of the checkpoint against this build
    char         *err;
 } index_t;
 
@@ -843,6 +974,14 @@ static void index_files(index_t *ix)
    }
 
    free(ents);
+}
+
+static const unit_t *unit_lookup(const index_t *ix, jit_handle_t h)
+{
+   // Without the option the code is known to be the same
+   if (!ix->allow || ix->units == NULL || h == JIT_HANDLE_INVALID)
+      return NULL;
+   return shash_get(ix->units, istr(jit_get_name(ix->jit, h)));
 }
 
 static const range_t *find_range(const index_t *ix, const void *ptr)
@@ -1562,6 +1701,8 @@ static bool save_frame_vars(index_t *ix, wbuf_t *w, const frame_t *f)
          continue;
 
       w_name(w, var_key(f, i));
+      w_u64(w, vt_hash(v->type, 0xcbf29ce484222325ULL));
+      const size_t rec = w_rec_begin(w);
 
       vctx_t c = {
          .ix = ix, .w = w,
@@ -1573,6 +1714,8 @@ static bool save_frame_vars(index_t *ix, wbuf_t *w, const frame_t *f)
       free((void *)c.unit);
       if (!ok)
          return false;
+
+      w_rec_end(w, rec);
    }
 
    return true;
@@ -1585,15 +1728,22 @@ static bool restore_frame_vars(index_t *ix, rbuf_t *r, const frame_t *f)
    if (r->err != NULL)
       return false;
 
-   if (hash != frame_layout_hash(f)) {
-      r_fail(r, "layout of %s %s (%s) has changed since the checkpoint",
-             frame_kind_name(f->kind), istr(f->name),
-             f->handle == JIT_HANDLE_INVALID ? "?"
-             : istr(jit_get_name(ix->jit, f->handle)));
-      return false;
+   const bool same_layout = (hash == frame_layout_hash(f));
+   if (!same_layout) {
+      if (!ix->allow) {
+         r_fail(r, "layout of %s %s (%s) has changed since the checkpoint",
+                frame_kind_name(f->kind), istr(f->name),
+                f->handle == JIT_HANDLE_INVALID ? "?"
+                : istr(jit_get_name(ix->jit, f->handle)));
+         return false;
+      }
+      ix->rep->layout_changed = true;
+      report_note(ix->rep, "variables of %s %s changed", frame_kind_name(f->kind),
+                  istr(f->name));
    }
 
    shash_t *byname = shash_new(64);
+   unsigned nfound = 0;
    for (unsigned i = 0; i < f->lay.nvars; i++) {
       if (f->lay.vars[i].name != NULL)
          shash_put(byname, istr(var_key(f, i)), (void *)(uintptr_t)(i + 1));
@@ -1602,20 +1752,36 @@ static bool restore_frame_vars(index_t *ix, rbuf_t *r, const frame_t *f)
    bool ok = true;
    for (unsigned i = 0; ok && i < count; i++) {
       ident_t key = r_name(r);
-      if (r->err != NULL) {
+      const uint64_t thash = r_u64(r);
+      const uint32_t len = r_u32(r);
+      if (r->err != NULL || !r_ok(r, len)) {
          ok = false;
          break;
       }
+
+      const uint8_t *end = r->p + len;
 
       uintptr_t idx = (uintptr_t)shash_get(byname, istr(key));
-      if (idx == 0) {
-         r_fail(r, "%s %s has no variable %s", frame_kind_name(f->kind),
-                istr(f->name), istr(key));
-         ok = false;
-         break;
+      const jit_var_t *v = idx ? &(f->lay.vars[idx - 1]) : NULL;
+
+      if (v == NULL || thash != vt_hash(v->type, 0xcbf29ce484222325ULL)) {
+         if (!ix->allow) {
+            r_fail(r, "%s %s has no variable %s", frame_kind_name(f->kind),
+                   istr(f->name), istr(key));
+            ok = false;
+            break;
+         }
+
+         // Removed or of a different type: nothing to restore it into
+         ix->rep->layout_changed = true;
+         report_note(ix->rep, "variable %s of %s %s not restored",
+                     istr(key), frame_kind_name(f->kind), istr(f->name));
+         r->p = end;
+         continue;
       }
 
-      const jit_var_t *v = &(f->lay.vars[idx - 1]);
+      nfound++;
+
       vctx_t c = {
          .ix = ix, .r = r,
          .unit = xasprintf("%s %s", frame_kind_name(f->kind), istr(f->name)),
@@ -1624,6 +1790,31 @@ static bool restore_frame_vars(index_t *ix, rbuf_t *r, const frame_t *f)
 
       ok = restore_value(&c, v->type, (uint8_t *)f->data + v->offset);
       free((void *)c.unit);
+
+      if (ok && r->p != end) {
+         r_fail(r, "variable %s of %s has an unexpected size", istr(key),
+                istr(f->name));
+         ok = false;
+      }
+   }
+
+   // Variables the checkpoint knows nothing about keep their initial values
+   if (ok && nfound < f->lay.nvars) {
+      unsigned nnamed = 0;
+      for (unsigned i = 0; i < f->lay.nvars; i++)
+         nnamed += (f->lay.vars[i].name != NULL);
+      if (nfound < nnamed) {
+         if (!ix->allow) {
+            r_fail(r, "%s %s has variables that are not in the checkpoint",
+                   frame_kind_name(f->kind), istr(f->name));
+            ok = false;
+         }
+         else {
+            ix->rep->layout_changed = true;
+            report_note(ix->rep, "%s %s has new variables",
+                        frame_kind_name(f->kind), istr(f->name));
+         }
+      }
    }
 
    shash_free(byname);
@@ -1809,12 +2000,14 @@ static bool save_signals(index_t *ix, wbuf_t *w)
    }
 
    w_tag(w, "SIGS");
+   w_u32(w, ix->nsigs);
 
    for (unsigned i = 0; i < ix->nsigs; i++) {
       rt_signal_t *s = ix->sigs[i].sig;
       const char *path = ix->sigs[i].path;
 
       w_cname(w, path);
+      const size_t sigrec = w_rec_begin(w);
       w_u32(w, s->shared.flags);
 
       // Signals whose events are cached are found at run time
@@ -1873,6 +2066,8 @@ static bool save_signals(index_t *ix, wbuf_t *w)
          if (!ok)
             return false;
       }
+
+      w_rec_end(w, sigrec);
    }
 
    return true;
@@ -1914,6 +2109,7 @@ static bool save_processes(index_t *ix, wbuf_t *w)
       rt_proc_t *p = ix->procs[i];
 
       w_name(w, p->name);
+      const size_t prec = w_rec_begin(w);
 
       if (p->wakeable.pending) {
          w_fail(w, "process %s is queued to run: not at a quiescent point",
@@ -1926,6 +2122,7 @@ static bool save_processes(index_t *ix, wbuf_t *w)
       void *frame = *mptr_get(p->privdata);
       if (frame == NULL) {
          w_u8(w, 0);
+         w_rec_end(w, prec);
          continue;
       }
 
@@ -1982,6 +2179,8 @@ static bool save_processes(index_t *ix, wbuf_t *w)
          if (!save_frame_vars(ix, w, chain[k]))
             return false;
       }
+
+      w_rec_end(w, prec);
    }
 
    return true;
@@ -2004,8 +2203,10 @@ static bool save_frames(index_t *ix, wbuf_t *w)
 
       w_u8(w, f->kind);
       w_name(w, f->name);
+      const size_t frec = w_rec_begin(w);
       if (!save_frame_vars(ix, w, f))
          return false;
+      w_rec_end(w, frec);
    }
 
    return true;
@@ -2259,6 +2460,230 @@ static char *serialise_model(index_t *ix, wbuf_t *w, bool check_quiet)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// What code has run
+//
+// After the state comes a description of every compiled unit: a hash of
+// each instruction (without source locations and with callees by name), the
+// instructions that had run, and whether it always resumes at its start.
+// A restore into changed code compares them to see what the change touches.
+
+typedef struct {
+   char     *name;
+   unsigned  nirs;
+   bool      restart;
+   uint64_t  cphash;
+   uint32_t *ihash;
+   uint8_t  *bits;      // One bit per instruction, or NULL if not known
+} oldunit_t;
+
+typedef struct {
+   bool       tracked;
+   oldunit_t *units;
+   unsigned   nunits;
+} exec_info_t;
+
+static void exec_free(exec_info_t *e)
+{
+   for (unsigned i = 0; i < e->nunits; i++) {
+      free(e->units[i].name);
+      free(e->units[i].ihash);
+      free(e->units[i].bits);
+   }
+   free(e->units);
+}
+
+static void save_exec(jit_t *jit, wbuf_t *t)
+{
+   const unsigned n = jit_handle_count(jit);
+
+   bool tracked = jit_exec_tracking;
+   unsigned count = 0;
+   jit_code_t *codes = xcalloc(MAX(n, 1) * sizeof(jit_code_t));
+   bool *have = xcalloc(MAX(n, 1));
+
+   for (jit_handle_t h = 0; h < n; h++) {
+      if (!(have[h] = jit_get_code(jit, h, &codes[h])))
+         continue;
+
+      count++;
+      if (codes[h].exec == NULL || codes[h].has_next_tier)
+         tracked = false;
+   }
+
+   w_u8(t, tracked);
+   w_u32(t, count);
+
+   for (jit_handle_t h = 0; h < n; h++) {
+      if (!have[h])
+         continue;
+
+      const jit_code_t *c = &codes[h];
+      w_str(t, istr(jit_get_name(jit, h)));
+      w_u32(t, c->nirs);
+      w_u8(t, c->restart_top);
+      w_u64(t, c->cpool_hash);
+      for (unsigned i = 0; i < c->nirs; i++)
+         w_u32(t, c->ihash[i]);
+      if (tracked) {
+         for (unsigned i = 0; i < c->nirs; i += 8) {
+            uint8_t b = 0;
+            for (unsigned k = 0; k < 8 && i + k < c->nirs; k++)
+               b |= (c->exec[i + k] ? 1 : 0) << k;
+            w_u8(t, b);
+         }
+      }
+
+      free(c->ihash);
+   }
+
+   free(codes);
+   free(have);
+}
+
+static bool parse_exec(const uint8_t *data, size_t len, exec_info_t *e)
+{
+   rbuf_t r = { .p = data, .end = data + len };
+
+   e->tracked = r_u8(&r);
+   const uint32_t count = r_u32(&r);
+   if (r.err != NULL || count > len) {
+      free(r.err);
+      return false;
+   }
+
+   e->units = xcalloc(MAX(count, 1) * sizeof(oldunit_t));
+   for (unsigned i = 0; i < count && r.err == NULL; i++) {
+      oldunit_t *u = &(e->units[i]);
+      const uint32_t nlen = r_u32(&r);
+      const uint8_t *nm = r_bytes(&r, nlen);
+      if (nm == NULL)
+         break;
+
+      u->name    = xstrndup((const char *)nm, nlen);
+      u->nirs    = r_u32(&r);
+      u->restart = r_u8(&r);
+      u->cphash  = r_u64(&r);
+      if (r.err != NULL || (size_t)u->nirs * 4 > (size_t)(r.end - r.p))
+         break;
+
+      u->ihash = xmalloc_array(MAX(u->nirs, 1), sizeof(uint32_t));
+      for (unsigned k = 0; k < u->nirs; k++)
+         u->ihash[k] = r_u32(&r);
+
+      if (e->tracked) {
+         const size_t nb = (u->nirs + 7) / 8;
+         const uint8_t *b = r_bytes(&r, nb);
+         if (b == NULL)
+            break;
+         u->bits = xmalloc(MAX(nb, 1));
+         memcpy(u->bits, b, nb);
+      }
+
+      e->nunits++;
+   }
+
+   const bool ok = r.err == NULL && e->nunits == count;
+   free(r.err);
+   return ok;
+}
+
+static bool bit_set(const uint8_t *bits, unsigned i)
+{
+   return (bits[i / 8] >> (i % 8)) & 1;
+}
+
+// Compare the code of the checkpoint with the code of this build unit by
+// unit, mark what has run in this build's copy, and classify each unit.
+// A unit that changed is harmless only if nothing at or after the first
+// instruction that differs had run: everything before it is the same code
+// and so did the same things.
+static void analyse_units(const exec_info_t *e, jit_t *jit, shash_t *units,
+                          ckpt_report_t *rep)
+{
+   rep->tracked = e->tracked;
+
+   for (unsigned i = 0; i < e->nunits; i++) {
+      const oldunit_t *u = &(e->units[i]);
+
+      unit_t *info = xcalloc(sizeof(unit_t));
+      info->old_restart = u->restart;
+      shash_put(units, u->name, info);
+
+      jit_handle_t h = jit_lazy_compile(jit, ident_new(u->name));
+      if (h != JIT_HANDLE_INVALID)
+         jit_compile(jit, ident_new(u->name));
+
+      jit_code_t c = {};
+      if (h == JIT_HANDLE_INVALID || !jit_get_code(jit, h, &c)) {
+         info->cls = U_REMOVED;
+
+         bool ran = !e->tracked;
+         for (unsigned k = 0; e->tracked && k < u->nirs; k++)
+            ran |= bit_set(u->bits, k);
+
+         if (ran || h != JIT_HANDLE_INVALID) {
+            // Gone or no longer compiles: callers changed too
+         }
+
+         rep->changed = xrealloc_array(rep->changed, rep->nchanged + 1,
+                                       sizeof(char *));
+         rep->executed = xrealloc_array(rep->executed, rep->nchanged + 1,
+                                        sizeof(bool));
+         rep->changed[rep->nchanged] = xstrdup(u->name);
+         rep->executed[rep->nchanged++] = ran;
+         if (ran)
+            info->cls = U_APPROX;
+         continue;
+      }
+
+      info->new_restart = c.restart_top;
+      info->new_state = c.restart_state;
+
+      bool same = c.nirs == u->nirs && c.cpool_hash == u->cphash
+         && memcmp(c.ihash, u->ihash, u->nirs * sizeof(uint32_t)) == 0;
+
+      if (same) {
+         info->cls = U_SAME;
+         jit_set_exec(jit, h, u->bits, u->nirs, !e->tracked);
+      }
+      else {
+         unsigned prefix = 0;
+         const unsigned lim = MIN(c.nirs, u->nirs);
+         while (prefix < lim && c.ihash[prefix] == u->ihash[prefix])
+            prefix++;
+
+         // Constants of the unit are shared by all its code so a change
+         // to them counts as a change from the start
+         if (c.cpool_hash != u->cphash)
+            prefix = 0;
+
+         if (getenv("NVC_CKPT_DEBUG"))
+            fprintf(stderr, "unit %s changed: nirs %u->%u prefix %u cpool %s\n",
+                    u->name, u->nirs, c.nirs, prefix,
+                    c.cpool_hash != u->cphash ? "differs" : "same");
+
+         bool ran = !e->tracked;
+         for (unsigned k = prefix; e->tracked && k < u->nirs; k++)
+            ran |= bit_set(u->bits, k);
+
+         info->cls = ran ? U_APPROX : U_COMPAT;
+
+         rep->changed = xrealloc_array(rep->changed, rep->nchanged + 1,
+                                       sizeof(char *));
+         rep->executed = xrealloc_array(rep->executed, rep->nchanged + 1,
+                                        sizeof(bool));
+         rep->changed[rep->nchanged] = xstrdup(u->name);
+         rep->executed[rep->nchanged++] = ran;
+
+         // Whatever ran in the old code says nothing about the new code
+         jit_set_exec(jit, h, NULL, 0, true);
+      }
+
+      free(c.ihash);
+   }
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // Restoring the model
 
 static void free_pending(void **pending)
@@ -2493,7 +2918,8 @@ static bool restore_layout(index_t *ix, rbuf_t *r)
       return false;
 
    const uint32_t nsigs = r_u32(r);
-   if (r->err == NULL && nsigs != ix->nsigs) {
+   if (r->err == NULL && nsigs != ix->nsigs
+       && !(ix->allow && nsigs < ix->nsigs)) {
       r_fail(r, "the checkpoint has %u signals but the model has %u",
              nsigs, ix->nsigs);
       return false;
@@ -2503,11 +2929,8 @@ static bool restore_layout(index_t *ix, rbuf_t *r)
    // apply the saved partition to the fresh signals.  Splitting one signal
    // can split others it is connected to so check the result afterwards.
    const uint8_t *mark = r->p;
-   const unsigned mark_names = r->nnames;
    for (int pass = 0; pass < 2; pass++) {
-      // Reading the section again redefines the names it introduced
       r->p = mark;
-      r->nnames = mark_names;
 
       for (unsigned i = 0; i < nsigs && r->err == NULL; i++) {
          ident_t path = r_name(r);
@@ -2568,14 +2991,21 @@ static bool restore_signals(index_t *ix, rbuf_t *r)
    if (!r_tag(r, "SIGS"))
       return false;
 
-   for (unsigned i = 0; i < ix->nsigs && r->err == NULL; i++) {
+   const uint32_t nsigs = r_u32(r);
+   hash_t *seen = hash_new(64);
+
+   for (unsigned i = 0; i < nsigs && r->err == NULL; i++) {
       ident_t path = r_name(r);
-      if (r->err != NULL)
-         return false;
+      const uint32_t reclen = r_u32(r);
+      if (r->err != NULL || !r_ok(r, reclen))
+         break;
+
+      const uint8_t *recend = r->p + reclen;
 
       const sigent_t *e = shash_get(ix->sigpath, istr(path));
       assert(e != NULL);   // Checked by the layout pass
       rt_signal_t *s = e->sig;
+      hash_put(seen, s, s);
       char *what = xasprintf("signal %s", istr(path));
 
       s->shared.flags = r_u32(r);
@@ -2639,9 +3069,34 @@ static bool restore_signals(index_t *ix, rbuf_t *r)
             break;
       }
 
+      if (r->err == NULL && r->p != recend)
+         r_fail(r, "%s: the saved state has an unexpected size", what);
+
       free(what);
    }
 
+   // Signals the checkpoint does not know about keep their initial values,
+   // which is only right if nothing drives them yet
+   for (unsigned i = 0; i < ix->nsigs && r->err == NULL; i++) {
+      rt_signal_t *s = ix->sigs[i].sig;
+      if (hash_get(seen, s) != NULL)
+         continue;
+
+      for (rt_nexus_t *n = &(s->nexus); n != NULL && n->signal == s;
+           n = n->chain) {
+         if (n->n_sources > 0 || n->pending != NULL) {
+            r_fail(r, "signal %s is new and has drivers or readers: its "
+                   "state cannot be derived from the checkpoint",
+                   ix->sigs[i].path);
+            break;
+         }
+      }
+
+      ix->rep->layout_changed = true;
+      report_note(ix->rep, "signal %s is new", ix->sigs[i].path);
+   }
+
+   hash_free(seen);
    return r->err == NULL;
 }
 
@@ -2792,6 +3247,10 @@ static bool restore_processes(index_t *ix, rbuf_t *r)
 
    for (unsigned i = 0; i < n && r->err == NULL; i++) {
       ident_t name = r_name(r);
+      const uint32_t reclen = r_u32(r);
+      if (r->err != NULL || !r_ok(r, reclen))
+         break;
+      const uint8_t *recend = r->p + reclen;
       const uint8_t delayed = r_u8(r);
       const uint8_t has_frame = r_u8(r);
       if (r->err != NULL)
@@ -2814,6 +3273,7 @@ static bool restore_processes(index_t *ix, rbuf_t *r)
                    "checkpoint", istr(name));
             break;
          }
+         r->p = recend;
          continue;
       }
       else if (frame == NULL) {
@@ -2823,7 +3283,28 @@ static bool restore_processes(index_t *ix, rbuf_t *r)
       }
 
       const uint32_t state = r_u32(r);
-      *(uint32_t *)((uint8_t *)frame + 2 * sizeof(void *)) = state;
+
+      // The code of a process that has changed and had already run cannot
+      // be resumed from the middle: that is only possible if it always
+      // starts again from the top
+      const unit_t *pu = unit_lookup(ix, p->closure.handle);
+      uint32_t resume = state;
+      if (pu != NULL && pu->cls == U_APPROX
+          && pu->old_restart && pu->new_restart && pu->new_state >= 0) {
+         // It starts again from the top whatever it was waiting for
+         resume = pu->new_state;
+         ix->rep->layout_changed = true;   // So not byte for byte comparable
+         report_note(ix->rep, "process %s resumes from its start", istr(name));
+      }
+      else if (pu != NULL && pu->cls == U_APPROX) {
+         r_fail(r, "process %s has changed and is suspended inside code that "
+                "has run (resume point %u), so it cannot be resumed; it "
+                "could only be restored if it always waited at its end",
+                istr(name), state);
+         break;
+      }
+
+      *(uint32_t *)((uint8_t *)frame + 2 * sizeof(void *)) = resume;
       *(void **)((uint8_t *)frame + sizeof(void *)) = NULL;
 
       char *key = frame_key(FRAME_PROCESS, name);
@@ -2858,6 +3339,14 @@ static bool restore_processes(index_t *ix, rbuf_t *r)
             break;
 
          jit_handle_t h = jit_lazy_compile(ix->jit, unit);
+         const unit_t *cu = h == JIT_HANDLE_INVALID ? NULL
+            : unit_lookup(ix, h);
+         if (cu != NULL && cu->cls != U_SAME && cu->cls != U_COMPAT) {
+            r_fail(r, "process %s is suspended in procedure %s which has "
+                   "changed and had already run", istr(name), istr(unit));
+            break;
+         }
+
          frame_t *cf = xcalloc(sizeof(frame_t));
          if (h == JIT_HANDLE_INVALID
              || !jit_get_framelay(ix->jit, h, &cf->lay, true)
@@ -2915,6 +3404,10 @@ static bool restore_processes(index_t *ix, rbuf_t *r)
          if (!restore_frame_vars(ix, r, chain[k]))
             break;
       }
+
+      if (r->err == NULL && r->p != recend)
+         r_fail(r, "process %s: the saved state has an unexpected size",
+                istr(name));
    }
 
    return r->err == NULL;
@@ -2932,8 +3425,10 @@ static bool restore_frames(index_t *ix, rbuf_t *r)
    for (unsigned i = 0; i < n && r->err == NULL; i++) {
       const uint8_t kind = r_u8(r);
       ident_t name = r_name(r);
-      if (r->err != NULL)
+      const uint32_t reclen = r_u32(r);
+      if (r->err != NULL || !r_ok(r, reclen))
          break;
+      const uint8_t *recend = r->p + reclen;
 
       char *key = frame_key(kind, name);
       const frame_t *f = shash_get(ix->framename, key);
@@ -2947,6 +3442,12 @@ static bool restore_frames(index_t *ix, rbuf_t *r)
 
       if (!restore_frame_vars(ix, r, f))
          break;
+
+      if (r->p != recend) {
+         r_fail(r, "%s %s: the saved state has an unexpected size",
+                frame_kind_name(f->kind), istr(name));
+         break;
+      }
    }
 
    return r->err == NULL;
@@ -3042,6 +3543,9 @@ typedef struct {
    char       *err;
    const uint8_t *payload;
    size_t      length;
+   bool        allow;
+   ckpt_report_t *rep;
+   exec_info_t *exec;
 } restore_arg_t;
 
 static void restore_model_cb(void *arg)
@@ -3072,6 +3576,9 @@ static void restore_model_cb(void *arg)
    if (r->err != NULL)
       goto fail;
 
+   shash_t *units = shash_new(256);
+   analyse_units(ra->exec, jit, units, ra->rep);
+
    init_packages(NULL, jit, r);
    if (r->err != NULL)
       goto fail;
@@ -3083,6 +3590,10 @@ static void restore_model_cb(void *arg)
       index_free(&ix);
       goto fail;
    }
+
+   ix.allow = ra->allow;
+   ix.rep   = ra->rep;
+   ix.units = units;
 
    for (unsigned i = 0; i < ix.nprocs; i++) {
       ix.procs[i]->wakeable.pending = false;
@@ -3110,6 +3621,15 @@ static void restore_model_cb(void *arg)
    }
 
    index_free(&ix);
+   {
+      hash_iter_t uit = HASH_BEGIN;
+      const char *ukey;
+      void *uval;
+      while (shash_iter(units, &uit, &ukey, &uval))
+         free(uval);
+      shash_free(units);
+   }
+
    if (!ok)
       goto fail;
 
@@ -3250,19 +3770,26 @@ void checkpoint_free_id(ckpt_id_t *id)
    free(id);
 }
 
-static char *compare_ids(const ckpt_id_t *file, const ckpt_id_t *now)
+static char *compare_ids(const ckpt_id_t *file, const ckpt_id_t *now,
+                         bool allow)
 {
    if (strcmp(file->version, now->version) != 0)
       return xasprintf("the checkpoint was written by %s but this is %s",
                        file->version, now->version);
    else if (file->exe != now->exe)
       return xstrdup("the checkpoint was written by a different build of nvc");
-   else if (file->lib != now->lib)
+   else if (file->lib != now->lib && !allow)
       return xstrdup("the work library has changed since the checkpoint "
-                     "was written");
-   else if (file->design != now->design)
+                     "was written: pass --allow-changes to restore into the "
+                     "changed design, which reports whether the result is "
+                     "exact or approximate");
+   else if (file->design != now->design && file->lib == now->lib)
       return xstrdup("the elaborated design is not the one the checkpoint "
                      "was written from");
+   else if (file->design != now->design && !allow)
+      return xstrdup("the elaborated design is not the one the checkpoint "
+                     "was written from: pass --allow-changes to restore "
+                     "into a changed design");
    return NULL;
 }
 
@@ -3306,6 +3833,13 @@ char *checkpoint_save(rt_model_t *m, jit_t *jit, const ckpt_id_t *id,
       return err;
    }
 
+   size_t blen;
+   uint8_t *body = w_finish(&w, &blen);
+
+   wbuf_t xt;
+   memset(&xt, '\0', sizeof(xt));
+   save_exec(jit, &xt);
+
    char *tmp = xasprintf("%s.tmp", path);
    FILE *f = fopen(tmp, "wb");
    if (f == NULL) {
@@ -3314,8 +3848,10 @@ char *checkpoint_save(rt_model_t *m, jit_t *jit, const ckpt_id_t *id,
    }
 
    const uint32_t version = CKPT_VERSION;
-   const uint64_t length = w.n;
-   const uint64_t hash = fnv_update(0xcbf29ce484222325ULL, w.d, w.n);
+   const uint64_t length = blen;
+   const uint64_t hash = fnv_update(0xcbf29ce484222325ULL, body, blen);
+   const uint64_t xlen = xt.n;
+   const uint64_t xhash = fnv_update(0xcbf29ce484222325ULL, xt.d, xt.n);
    const uint32_t vlen = strlen(id->version);
 
    bool ok = fwrite(CKPT_MAGIC, 8, 1, f) == 1
@@ -3327,7 +3863,10 @@ char *checkpoint_save(rt_model_t *m, jit_t *jit, const ckpt_id_t *id,
       && fwrite(&id->design, 8, 1, f) == 1
       && fwrite(&length, 8, 1, f) == 1
       && fwrite(&hash, 8, 1, f) == 1
-      && fwrite(w.d, w.n, 1, f) == 1;
+      && fwrite(body, blen, 1, f) == 1
+      && fwrite(&xlen, 8, 1, f) == 1
+      && fwrite(&xhash, 8, 1, f) == 1
+      && fwrite(xt.d, xt.n, 1, f) == 1;
 
    ok = (fclose(f) == 0) && ok;
 
@@ -3338,12 +3877,19 @@ char *checkpoint_save(rt_model_t *m, jit_t *jit, const ckpt_id_t *id,
 
  out:
    free(tmp);
+   free(body);
+   free(xt.d);
    w_free(&w);
    return err;
 }
 
-char *checkpoint_restore(rt_model_t *m, jit_t *jit, const char *path)
+char *checkpoint_restore(rt_model_t *m, jit_t *jit, const char *path,
+                         bool allow, ckpt_report_t *rep)
 {
+   ckpt_report_t local = {};
+   if (rep == NULL)
+      rep = &local;
+
    FILE *f = fopen(path, "rb");
    if (f == NULL)
       return xasprintf("cannot open %s: %s", path, strerror(errno));
@@ -3379,12 +3925,26 @@ char *checkpoint_restore(rt_model_t *m, jit_t *jit, const char *path)
    const uint64_t length = r_u64(&r);
    const uint64_t hash = r_u64(&r);
 
-   if (r.err == NULL && (uint64_t)(r.end - r.p) != length)
+   if (r.err == NULL && length > (uint64_t)(r.end - r.p))
       r_fail(&r, "checkpoint file is truncated");
 
-   if (r.err == NULL
-       && fnv_update(0xcbf29ce484222325ULL, r.p, length) != hash)
-      r_fail(&r, "checkpoint file is corrupt (checksum mismatch)");
+   exec_info_t exec = {};
+   const uint8_t *payload = r.p;
+
+   if (r.err == NULL) {
+      if (fnv_update(0xcbf29ce484222325ULL, payload, length) != hash)
+         r_fail(&r, "checkpoint file is corrupt (checksum mismatch)");
+
+      rbuf_t t = { .p = payload + length, .end = r.end };
+      const uint64_t xlen = r_u64(&t);
+      const uint64_t xhash = r_u64(&t);
+      const uint8_t *xb = r_bytes(&t, xlen);
+      if (t.err != NULL || xb == NULL
+          || fnv_update(0xcbf29ce484222325ULL, xb, xlen) != xhash
+          || !parse_exec(xb, xlen, &exec))
+         r_fail(&r, "checkpoint file is corrupt (code description)");
+      free(t.err);
+   }
 
    if (r.err != NULL) {
       err = xasprintf("%s: %s", path, r.err);
@@ -3394,57 +3954,99 @@ char *checkpoint_restore(rt_model_t *m, jit_t *jit, const char *path)
    }
 
    ckpt_id_t *now = checkpoint_identify(m, jit);
-   err = compare_ids(&fid, now);
+   err = compare_ids(&fid, now, allow);
+   const bool design_same = fid.design == now->design;
    free(now);
    if (err != NULL) {
       free(data);
+      exec_free(&exec);
       return err;
    }
 
-   const uint8_t *payload = r.p;
+   rep->changed_design = !design_same;
+
+   r.end = payload + length;
+   if (!r_names_load(&r)) {
+      err = xasprintf("%s: %s", path, r.err);
+      goto out;
+   }
 
    restore_arg_t ra = {
       .m = m, .jit = jit, .r = &r, .payload = payload, .length = length,
+      .allow = allow, .rep = rep, .exec = &exec,
    };
    call_with_model(m, restore_model_cb, &ra);
-
-   free(r.names);
 
    if (ra.err != NULL) {
       err = xasprintf("%s: %s", path, ra.err);
       free(ra.err);
-      free(r.err);
-      free(data);
-      return err;
+      goto out;
    }
+
+   // The verdict: exact only if every unit that changed had not run the
+   // part that changed, nothing about the layout of the state differs and
+   // the design is the same apart from that code
+   unsigned nran = 0;
+   for (unsigned i = 0; i < rep->nchanged; i++) {
+      if (rep->executed[i]) {
+         nran++;
+         report_note(rep, "unit %s changed and had already run",
+                     rep->changed[i]);
+      }
+   }
+
+   if (rep->nchanged > 0 && !exec.tracked)
+      report_note(rep, "the checkpoint does not record which code had run");
+   if (!design_same)
+      report_note(rep, "the elaborated design is not the same");
+
+   rep->exact = design_same && !rep->layout_changed && nran == 0
+      && (rep->nchanged == 0 || exec.tracked);
 
    // Serialise the restored model again: it must come out identical to
-   // the file, otherwise something was not restored faithfully
-   index_t ix;
-   index_build(&ix, m, jit);
-   wbuf_t w;
-   w_init(&w);
-   err = serialise_model(&ix, &w, false);
-   index_free(&ix);
+   // the file, otherwise something was not restored faithfully.  When
+   // variables or signals were added or dropped the two are expected to
+   // differ and only what was matched has been checked.
+   if (rep->layout_changed)
+      report_note(rep, "state of added or dropped variables or signals "
+                  "is not covered by the verification of the restore");
+   else {
+      index_t ix;
+      index_build(&ix, m, jit);
+      wbuf_t w;
+      w_init(&w);
+      err = serialise_model(&ix, &w, false);
+      index_free(&ix);
 
-   if (err != NULL) {
-      char *e2 = xasprintf("restored state cannot be verified: %s", err);
-      free(err);
-      err = e2;
-   }
-   else if (w.n != length || memcmp(w.d, payload, length) != 0) {
-      size_t off = 0;
-      while (off < w.n && off < length && w.d[off] == payload[off])
-         off++;
-      err = xasprintf("restore verification failed: the restored state "
-                      "differs from the checkpoint at byte %zu in section %s "
-                      "(saved %zu bytes, restored %zu)", off,
-                      section_before(payload, off), (size_t)length, w.n);
+      size_t wlen = 0;
+      uint8_t *wbody = err ? NULL : w_finish(&w, &wlen);
+
+      if (err != NULL) {
+         char *e2 = xasprintf("restored state cannot be verified: %s", err);
+         free(err);
+         err = e2;
+      }
+      else if (wlen != length || memcmp(wbody, payload, length) != 0) {
+         size_t off = 0;
+         while (off < wlen && off < length && wbody[off] == payload[off])
+            off++;
+         err = xasprintf("restore verification failed: the restored state "
+                         "differs from the checkpoint at byte %zu in section "
+                         "%s (saved %zu bytes, restored %zu)", off,
+                         section_before(payload, off), (size_t)length, wlen);
+      }
+
+      free(wbody);
+      w_free(&w);
    }
 
-   w_free(&w);
+   rep->tracked = exec.tracked;
+
+ out:
+   free(r.names);
    free(r.err);
    free(data);
+   exec_free(&exec);
    return err;
 }
 

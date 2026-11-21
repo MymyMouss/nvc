@@ -184,6 +184,7 @@ typedef struct {
    off_t         ckpt_log_size;    // Size of the output log at the checkpoint
    char         *dropped_wave;     // File recording not carried into a copy
    ckpt_id_t    *ckpt_id;          // Identity of the design for saved files
+   char         *verdict;          // JSON verdict of a restore into changes
 } worker_t;
 
 static void files_check(worker_t *w, bool force);
@@ -2394,6 +2395,11 @@ static void send_ready(worker_t *w, bool restored)
    write_messages(w, &jw);
    write_output(w, &jw);
 
+   if (w->verdict != NULL) {
+      jw_key(&jw, "restore_verdict");
+      jw_raw(&jw, w->verdict);
+   }
+
    if (restored) {
       // The supervisor did not start this process, so it needs the pid
       jw_key(&jw, "pid");
@@ -2791,7 +2797,8 @@ static void op_checkpoint_file(worker_t *w, const json_t *req)
 // Entry point
 
 int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
-                    const char *files_dir, const char *restore_file)
+                    const char *files_dir, const char *restore_file,
+                    bool allow_changes)
 {
    worker_t w = {
       .model       = m,
@@ -2821,9 +2828,15 @@ int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
    w.ckpt_id = checkpoint_identify(m, jit);
 
    if (restore_file != NULL) {
-      char *err = checkpoint_restore(m, jit, restore_file);
+      ckpt_report_t rep = {};
+      char *err = checkpoint_restore(m, jit, restore_file, allow_changes,
+                                     &rep);
       if (err != NULL)
          fatal("cannot restore checkpoint: %s", err);
+
+      if (allow_changes)
+         w.verdict = checkpoint_report_json(&rep);
+      checkpoint_report_free(&rep);
    }
 
    rt_scope_t *root = find_scope(m, tree_stmt(top, 0));

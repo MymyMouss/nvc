@@ -565,6 +565,32 @@ sources by the same build of nvc, which is checked, and the restored
 state is verified before the simulation resumes.  Text printed during
 initialisation is printed again.  Files named relative to the current
 directory are looked up there, so run from the same directory.
+.\" --allow-changes
+.It Fl \-allow-changes
+With
+.Fl \-restore ,
+accept a checkpoint written from a design whose source has since changed.
+Variables and signals are matched by name and the units whose code differs
+are listed.  The result is labelled
+.Cm exact
+only if no changed unit had run any of the changed part before the
+checkpoint, and
+.Cm approximate
+otherwise, in which case the simulation continues as if the fix had been
+applied at that time and should be validated by running the changed design
+from the start.  A process that is suspended in code that changed and had
+run cannot be resumed unless it always waits at its end, and the restore is
+refused.  Added or removed processes and drivers, and signals of a different
+size, are refused.  The checkpoint must have been written with code tracking,
+which
+.Fl \-checkpoint
+turns on and which slows the simulation by about a third.
+.\" --verdict
+.It Fl \-verdict Ns = Ns Ar FILE
+With
+.Fl \-allow-changes ,
+write the verdict, the changed units and whether each had run, as JSON to
+.Ar FILE .
 .\" --stop-time
 .It Fl \-stop-time Ns = Ns Ar T
 Stop the simulation after the given time has elapsed.  Format of

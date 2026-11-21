@@ -342,6 +342,9 @@ typedef struct _jit_func {
    unsigned        nregs;
    unsigned        nvars;
    unsigned        ukind;    // mir_unit_kind_t
+   bool            restart_top;   // Every wait resumes at the start
+   int             restart_state; // The state of a wait, which does
+   uint8_t        *exec;     // Instructions run so far, if tracking
    unsigned        hdrsz;    // Frame header size
    unsigned        cpoolsz;
    jit_handle_t    handle;

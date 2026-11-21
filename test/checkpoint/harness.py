@@ -451,9 +451,235 @@ def check(d, nvc, lib, fstdump, keep, timeout, quantile=0.5):
             shutil.rmtree(work, ignore_errors=True)
 
 
+# --------------------------------------------------------------------------
+# Restoring into changed code
+
+WRITTEN_RE = re.compile(rb"checkpoint \S+ written at (\d+)(fs|ps|ns|us|ms|sec)")
+
+
+def elaborate(d, base, work, env, timeout):
+    rc, out, err, _ = run(base + ["-a"] + d.files + d.aflags
+                          + ["-e", d.top, "-O%d" % d.olevel]
+                          + ["-g%s=%s" % g for g in d.gens], work, env, timeout)
+    return rc == 0
+
+
+def check_fix(before, after, nvc, lib, fstdump, keep, timeout, quantile=0.5):
+    """Checkpoint `before`, restore into `after` and compare with `after`
+    run from time zero.  The verdict is the one nvc printed."""
+    work = tempfile.mkdtemp(prefix="ckfix-")
+    wb, wa = os.path.join(work, "b"), os.path.join(work, "a")
+    os.makedirs(wb)
+    os.makedirs(wa)
+    env = dict(os.environ)
+    env["NVC_LIBPATH"] = lib
+    env["NVC_IMP_LIB"] = lib
+    env["LANG"] = "en_US.UTF-8"
+    res = {"name": after.name, "status": None, "detail": "", "verdict": None}
+    try:
+        base = [nvc, "--std=" + after.std]
+
+        def runin(d, dirname, extra, stop):
+            cmd = base + ["-r"]
+            if stop:
+                cmd.append("--stop-time=" + stop)
+            cmd += extra + [d.top]
+            return run(cmd, dirname, env, timeout)
+
+        if not elaborate(before, base, wb, env, timeout) \
+                or not elaborate(after, base, wa, env, timeout):
+            raise NA("analysis or elaboration failed")
+
+        b_rc, b_out, b_err, _ = runin(before, wb, ["--wave=b.fst"], before.stop)
+        if b_rc is None or not os.path.exists(os.path.join(wb, "b.fst")):
+            raise NA("the design before the fix did not run")
+        dump = subprocess.run([fstdump, "b.fst"], cwd=wb, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL).stdout.decode(
+                                  "utf-8", "replace")
+        times = sorted(t for t in parse_dump(dump) if t > 0)
+        if len(times) < 2:
+            raise NA("no simulated time elapses")
+        t = times[int((len(times) - 1) * quantile)]
+        res["time_fs"] = t
+
+        ck = os.path.join(wb, "state.ckpt")
+        a_rc, a_out, a_err, _ = runin(
+            before, wb, ["--checkpoint=%s@%dfs" % (ck, t), "--wave=c.fst"],
+            "%dfs" % t)
+        m = WRITTEN_RE.search(a_err)
+        if not os.path.exists(ck) or m is None:
+            res["status"] = "refused"
+            mm = re.search(rb"cannot write checkpoint [^\n]*? at [^:]*: ([^\n]*)",
+                           a_err)
+            res["detail"] = mm.group(1).decode() if mm else "no checkpoint"
+            return res
+        tc = int(m.group(1)) * UNITS[m.group(2)]
+
+        # The fixed design from time zero is the reference
+        s_rc, s_out, s_err, _ = runin(after, wa, ["--wave=s.fst"], after.stop)
+        if s_rc is None or not os.path.exists(os.path.join(wa, "s.fst")):
+            raise NA("the design after the fix did not run")
+        p_rc, p_out, p_err, _ = runin(after, wa, ["--wave=p.fst"], "%dfs" % tc)
+        s_err, s_out = norm(s_err), norm(s_out)
+        p_err, p_out = norm(p_err), norm(p_out)
+        sdump = subprocess.run([fstdump, "s.fst"], cwd=wa, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL).stdout.decode(
+                                   "utf-8", "replace")
+        straight = parse_dump(sdump)
+
+        verdict = os.path.join(wa, "verdict.json")
+        r_rc, r_out, r_err, _ = runin(
+            after, wa, ["--restore=" + ck, "--allow-changes",
+                        "--verdict=" + verdict, "--wave=r.fst"], after.stop)
+        if r_rc is None:
+            res["status"] = "different"
+            res["detail"] = "restored run timed out"
+            return res
+        if b"cannot restore checkpoint" in r_err:
+            mm = re.search(rb"cannot restore checkpoint: ([^\n]*)", r_err)
+            res["status"] = "refused"
+            res["detail"] = mm.group(1).decode() if mm else "?"
+            return res
+
+        v = json.load(open(verdict))
+        res["verdict"] = v["verdict"]
+        res["changed"] = len(v["changed_units"])
+        res["ran"] = sum(1 for u in v["changed_units"]
+                         if u["executed_before_checkpoint"])
+
+        r_err, r_out = norm(r_err), norm(r_out)
+        problems = []
+        if r_rc != s_rc:
+            problems.append("exit status %s, reference %s" % (r_rc, s_rc))
+        if not s_out.startswith(p_out):
+            problems.append("reference output is not a prefix")
+        elif r_out != s_out[len(p_out):]:
+            problems.append("stdout differs")
+        why = stderr_diff(s_err, p_err, r_err)
+        if why:
+            problems.append(why)
+        if not os.path.exists(os.path.join(wa, "r.fst")):
+            problems.append("no waveform from the restored run")
+        else:
+            rdump = subprocess.run([fstdump, "r.fst"], cwd=wa,
+                                   stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL).stdout.decode(
+                                       "utf-8", "replace")
+            problems += waveform_diff(straight, parse_dump(rdump), tc)
+
+        res["status"] = "different" if problems else "identical"
+        res["detail"] = "; ".join(problems[:3])
+        return res
+    except NA as e:
+        res["status"] = "n/a"
+        res["detail"] = str(e)
+        return res
+    finally:
+        if keep:
+            res["dir"] = work
+        else:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def write_sources(root, files):
+    os.makedirs(root, exist_ok=True)
+    out = []
+    for name, text in files:
+        path = os.path.join(root, name + ".vhd")
+        with open(path, "w") as f:
+            f.write(text)
+        out.append(path)
+    return out
+
+
+def bench_pairs(tmp):
+    """(before, after) for every bug of test/mcp/bench/bench.py"""
+    sys.path.insert(0, os.path.join(ROOT, "test", "mcp", "bench"))
+    import bench
+    pairs = []
+    for bug in list(bench.BUGS) + list(bench.SOC_BUGS):
+        d = []
+        for buggy in (True, False):
+            root = os.path.join(tmp, bug, "before" if buggy else "after")
+            if bug in bench.SOC_BUGS:
+                files = write_sources(root, bench.soc_sources(bug, buggy))
+                top, stop = "tb_soc", bench.SOC_STOP
+            else:
+                design, src, tb, tbsrc = bench.sources(bug, buggy)
+                files = write_sources(root, [(design, src), (tb, tbsrc)])
+                top, stop = tb, bench.BUGS[bug][3]
+            dd = Design(bug, files, top, std="2008", stop=stop)
+            d.append(dd)
+        pairs.append((d[0], d[1]))
+    return pairs
+
+
+def own_pairs():
+    """Pairs in test/checkpoint/pairs/NAME/{before,after}.  Each directory
+    holds the files in alphabetical order and a `pair.txt` giving the top
+    unit, the stop time and the standard on separate `key = value` lines."""
+    base = os.path.join(HERE, "pairs")
+    pairs = []
+    if not os.path.isdir(base):
+        return pairs
+    for name in sorted(os.listdir(base)):
+        cfg = {"std": "2008", "stop": None}
+        for line in open(os.path.join(base, name, "pair.txt")):
+            if "=" in line:
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip()
+        ds = []
+        for side in ("before", "after"):
+            dirn = os.path.join(base, name, side)
+            files = [os.path.join(dirn, f) for f in sorted(os.listdir(dirn))
+                     if f.endswith(".vhd")]
+            ds.append(Design(name, files, cfg["top"], std=cfg["std"],
+                             stop=cfg["stop"]))
+        pairs.append((ds[0], ds[1]))
+    return pairs
+
+
+def fix_main(args, nvc, lib, fstdump):
+    tmp = tempfile.mkdtemp(prefix="ckpairs-")
+    pairs = own_pairs()
+    if args.pairs in ("bench", "all"):
+        pairs = bench_pairs(tmp) + pairs
+    if args.names:
+        pairs = [p for p in pairs if p[0].name in args.names]
+
+    table = collections.Counter()
+    results = []
+    for q in [float(x) for x in args.at.split(",")]:
+        for before, after in pairs:
+            r = check_fix(before, after, nvc, lib, fstdump, args.keep,
+                          args.timeout, q)
+            r["name"] = "%s@%g" % (before.name, q)
+            results.append(r)
+            table[(r["verdict"] or r["status"], r["status"])] += 1
+            if args.verbose or r["status"] == "different":
+                print("%-28s %-12s %-10s %s" % (r["name"], r["verdict"] or "-",
+                                                r["status"], r["detail"][:140]),
+                      flush=True)
+
+    print("\nverdict x result (changed designs, restore from the design "
+          "before the fix):")
+    for verdict in ("exact", "approximate", "refused", "n/a"):
+        row = {k[1]: v for k, v in table.items() if k[0] == verdict}
+        if row:
+            print("  %-12s %s" % (verdict, ", ".join(
+                "%s %d" % (k, v) for k, v in sorted(row.items()))))
+    if args.json:
+        json.dump(results, open(args.json, "w"), indent=1)
+    bad = table[("exact", "different")]
+    print("exact and different: %d" % bad)
+    return 1 if bad else 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="nvc checkpoint validation harness (see the comment at the top of the file)")
-    ap.add_argument("mode", choices=["regress", "bench", "design"])
+    ap.add_argument("mode", choices=["regress", "bench", "design", "fix"])
+    ap.add_argument("--pairs", default="all", choices=["bench", "own", "all"],
+                    help="for the fix mode: which pairs of designs")
     ap.add_argument("names", nargs="*")
     ap.add_argument("--nvc", default="bin/nvc")
     ap.add_argument("--lib", default="lib")
@@ -473,6 +699,9 @@ def main():
     nvc = os.path.abspath(args.nvc)
     lib = os.path.abspath(args.lib)
     fstdump = args.fstdump or os.path.join(os.path.dirname(nvc), "fstdump")
+
+    if args.mode == "fix":
+        return fix_main(args, nvc, lib, fstdump)
 
     if args.mode == "regress":
         designs = regress_designs(set(args.names))

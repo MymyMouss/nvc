@@ -183,6 +183,7 @@ static void jit_free_func(jit_func_t *f)
 {
    mptr_free(f->jit->mspace, &(f->privdata));
    free(f->irbuf);
+   free(f->exec);
    for (unsigned i = 0; f->linktab != NULL && i < f->nvars; i++)
       jit_free_vtype(f->linktab[i].type);
    free(f->linktab);
@@ -452,6 +453,100 @@ bool jit_get_cpool(jit_t *j, jit_handle_t handle, const void **base,
    *base = f->cpool;
    *size = f->cpoolsz;
    return true;
+}
+
+bool jit_exec_tracking = false;
+
+static uint64_t code_mix(uint64_t h, uint64_t v)
+{
+   return (h ^ v) * 0x100000001b3ULL;
+}
+
+static uint64_t code_value(jit_t *j, uint64_t h, const jit_value_t *v)
+{
+   h = code_mix(h, v->kind);
+
+   // The displacement is only meaningful in an address
+   if (v->kind == JIT_ADDR_REG || v->kind == JIT_ADDR_ABS
+       || v->kind == JIT_ADDR_CPOOL)
+      h = code_mix(h, (uint32_t)v->disp);
+
+   switch (v->kind) {
+   case JIT_VALUE_REG: case JIT_ADDR_REG:
+      return code_mix(h, v->reg);
+   case JIT_VALUE_INT64: case JIT_ADDR_ABS: case JIT_ADDR_CPOOL:
+      return code_mix(h, v->int64);
+   case JIT_VALUE_DOUBLE:
+      {
+         uint64_t bits;
+         memcpy(&bits, &v->dval, sizeof(bits));
+         return code_mix(h, bits);
+      }
+   case JIT_VALUE_LABEL:
+      return code_mix(h, v->label);
+   case JIT_VALUE_EXIT:
+      return code_mix(h, v->exit);
+   case JIT_VALUE_HANDLE:
+      {
+         // Handle numbers depend on the order of compilation
+         if (v->handle == JIT_HANDLE_INVALID || v->handle < 0
+             || v->handle >= j->next_handle)
+            return code_mix(h, 0xfffff);
+
+         const char *name = istr(jit_get_name(j, v->handle));
+         for (; *name; name++)
+            h = code_mix(h, (uint8_t)*name);
+         return h;
+      }
+   default:
+      return h;   // Source locations and loci only affect messages
+   }
+}
+
+bool jit_get_code(jit_t *j, jit_handle_t handle, jit_code_t *out)
+{
+   jit_func_t *f = jit_get_func(j, handle);
+   if (load_acquire(&(f->state)) != JIT_FUNC_READY || f->irbuf == NULL)
+      return false;
+
+   out->nirs = f->nirs;
+   out->exec = f->exec;
+   out->restart_top = f->restart_top;
+   out->restart_state = f->restart_state;
+   out->has_next_tier = f->next_tier != NULL;
+   out->ihash = xmalloc_array(MAX(f->nirs, 1), sizeof(uint32_t));
+
+   for (unsigned i = 0; i < f->nirs; i++) {
+      const jit_ir_t *ir = &(f->irbuf[i]);
+      uint64_t h = 0xcbf29ce484222325ULL;
+      h = code_mix(h, ir->op);
+      if (ir->op != J_DEBUG) {
+         h = code_mix(h, ir->size);
+         h = code_mix(h, ir->cc);
+         h = code_mix(h, ir->result);
+         h = code_value(j, h, &(ir->arg1));
+         h = code_value(j, h, &(ir->arg2));
+      }
+      out->ihash[i] = (uint32_t)(h ^ (h >> 32));
+   }
+
+   uint64_t ch = 0xcbf29ce484222325ULL;
+   for (unsigned i = 0; i < f->cpoolsz; i++)
+      ch = code_mix(ch, f->cpool[i]);
+   out->cpool_hash = ch;
+   out->cpool_size = f->cpoolsz;
+   return true;
+}
+
+void jit_set_exec(jit_t *j, jit_handle_t handle, const uint8_t *bits,
+                  unsigned n, bool all)
+{
+   jit_func_t *f = jit_get_func(j, handle);
+   if (f->exec == NULL)
+      return;
+
+   for (unsigned i = 0; i < f->nirs; i++)
+      f->exec[i] = all || (i < n && bits[i]) ? 1 : 0;
 }
 
 unsigned jit_handle_count(jit_t *j)

@@ -264,3 +264,127 @@ applicable, 792 accepted and identical, 546 refused, 0 different.  Refusals:
 PSL, Verilog, `'active`, forcing, heap arrays holding pointers, a few
 access values to linked objects.  SoC checkpoint at 200 us: 225,600 bytes,
 save 2-3 ms, restore 25 ms (identity hashing and verification included).
+
+## 10. Phase 3: restoring into a changed design
+
+`nvc -r --restore=FILE --allow-changes [--verdict=FILE]`.  Without the
+option a changed work library is refused and the message names the option.
+The nvc executable must still be the same.
+
+### 10.1 What is compared: the unit
+
+The unit of comparison is a compiled JIT function, found by name: a process,
+an instance, a package, a subprogram.  Its fingerprint is not taken from the
+source or the tree but from the code generated for it:
+
+* a hash of each instruction (opcode, size, condition, registers, immediate
+  operands, displacement only in addresses, labels as instruction numbers),
+  with callees replaced by their names, because handle numbers depend on the
+  order of compilation, and with source locations, loci and `J_DEBUG`
+  ignored, because they only change messages;
+* a hash of the unit's constant pool, which is zero-filled now so that
+  padding does not carry stale memory (this was the cause of spurious
+  differences);
+* whether every wait of a process resumes at its start (`restart_top`).
+
+Because it is per function, editing one process leaves the fingerprints of
+the others as they were, and moving unrelated code changes only line numbers,
+which are ignored.  The file stores the hashes of every unit that had been
+compiled when it was written, in a block after the state that is not part of
+the state checksum or of the verification.
+
+### 10.2 What replaces the block number
+
+Nothing replaces it in general.  The resume state of a process is the block
+number it will resume at.  It is kept as it is when the process code is
+unchanged, or changed only after every instruction that had run (10.3):
+then the jump table at the start of the function is among the unchanged
+instructions, so the number means the same thing.  When the changed process
+has run changed code, the number is not trusted: the process is restored
+only if both versions always resume at their start (a sensitivity list or a
+single wait at the end), in which case the state number of the new code's
+wait is used, and otherwise the restore is refused.  A procedure frame is
+restored only if its unit is unchanged or changed in code that had not run.
+Mapping the waits of a changed process onto each other was not attempted.
+
+### 10.3 When changed code counts as not run
+
+The interpreter marks each instruction when it is fetched (only when
+`--checkpoint` or `--restore` is given, or the MCP worker is asked to
+`track_code`).  The marks of every unit are saved.  For a unit whose code
+differs, let p be the length of the common prefix of the instruction hashes.
+The unit counts as changed-but-not-run if the saved marks show that nothing
+at or after instruction p had run; everything before p is the same code and
+did the same thing.  A different constant pool counts as a difference at
+instruction 0.  A unit that is in the checkpoint but not in the design, or
+that cannot be compiled, counts as changed, and as run if any instruction
+had.  A unit that had not been compiled when the checkpoint was written
+cannot have run so changes to it are free.  Calls are accounted for by the
+callee's own marks, so a function already called is not harmless.
+
+Because the declarations, initial values, signal and port declarations,
+generics, concurrent structure and everything evaluated at elaboration or
+reset live in the instance, process and package initialisation code, which
+always has run, any change to them is a change to code that had run.
+
+After a restore the marks of unchanged units are carried over and every
+changed unit is marked as entirely run, so a later checkpoint of the restored
+simulation cannot under-report.  A checkpoint that did not track code, or
+that was made with a tiered (compiled) JIT, says so and every change is then
+approximate.
+
+### 10.4 The verdict
+
+`exact` only if all of: the checkpoint tracked the code (or nothing
+changed), no unit that changed had run the changed part, no variable,
+signal or frame layout differs, and the elaborated design (signals,
+processes, instance and process frame layouts) hashes the same.  Otherwise
+`approximate`.  The verdict is printed as a note (exact) or a warning
+(approximate, saying to validate by running the fixed design from zero), is
+written as JSON by `--verdict=FILE`, and is returned by the MCP tool.
+"Approximate" may be reported for a restore that is in fact identical; the
+tests assert only that "exact" is never wrong.
+
+Known reasons for over-reporting: a change anywhere before code that runs
+every cycle (a clocked process: the code after the change has run), a
+changed string or aggregate constant in the unit, and any change in
+initialisation.  So exact results are mostly late phases of testbenches and
+checkers.
+
+### 10.5 Matching rules
+
+* Variables of a frame by name where the type hash is equal; others keep
+  their initial value (added) or are dropped (removed or changed type).
+* Signals by path.  A different size refuses.  A signal that is new keeps
+  its initial value and must have no driver or reader yet, otherwise the
+  restore is refused; a signal that is gone refuses.
+* Processes, triggers, drivers and port connections must be the same set:
+  an added or removed process, or a driver that appears or disappears,
+  refuses the restore (a pending transaction or a registration has no
+  meaning without its owner).
+* Packages by name; a package gone refuses.
+
+### 10.6 What is no longer verified
+
+The byte-for-byte comparison of section 1 still runs when nothing about
+the layout of state differs (the common case of a fix inside code), and
+there it also covers every restored variable of changed units.  When
+variables or signals were added or dropped, or a process resumed from its
+start instead of its saved point, the comparison is not applicable and is
+not done: what was matched by name is not re-read.  This is reported in the
+verdict reasons.
+
+### 10.7 Measured
+
+See the final report: the table of verdicts by outcome from
+`test/checkpoint/harness.py fix`, and the cost of code tracking, which
+was 0.57 s to 0.77 s (35%) on the SoC testbench with the debug interpreter.
+
+### 10.8 Gaps
+
+* The hash is 32 bits per instruction: a collision could lengthen the common
+  prefix wrongly (probability about 2^-32 per compared instruction).
+* Tracking relies on the interpreter; native tiers (LLVM) are untested and a
+  checkpoint made with them is marked as not tracked.
+* Messages of the output before the checkpoint were printed by the old code
+  and are not part of the comparison.

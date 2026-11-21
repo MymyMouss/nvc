@@ -996,6 +996,19 @@ opérations échouent avec un message qui nomme l'objet hors périmètre (PSL,
 Verilog, signaux forcés, ...); elles ne sont pas permises pendant un run en
 arrière-plan (le worker n'est alors pas entre deux pas de temps).
 
+### 8.13 Reprise après correctif (phase 3)
+
+`nvc_sim_open` accepte `restore_from` avec `allow_changes`: le worker est
+lancé avec `--restore-from=F --allow-changes` et renvoie `restore_verdict`
+(exact ou approximate, unités modifiées, lesquelles avaient déjà tourné)
+dans l'événement `ready`. Pour qu'un fichier puisse recevoir un verdict
+« exact », la simulation d'origine doit avoir été ouverte avec `track_code`
+(le suivi des instructions exécutées coûte environ 35 % sur l'interpréteur
+de debug); sinon tout changement est approximate. Après une reprise
+approximate, l'agent doit relancer le design corrigé depuis zéro pour
+valider (c'est dit dans la description de l'outil). Voir
+`CHECKPOINT-DESIGN.md` section 10.
+
 ## Références
 
 - Spécification MCP 2026-07-28, changements:

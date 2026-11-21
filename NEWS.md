@@ -9,7 +9,11 @@
   of nvc, and a save that cannot be exact (for example PSL properties or
   forced signals) fails with a message naming the object.  A restore is
   checked by saving the restored state again and comparing it with the
-  file.
+  file.  `--restore=FILE --allow-changes` restores into a design whose
+  source was changed (for example after fixing a bug) and says whether the
+  result is exact, because the changed code had not run any of the changed
+  part before the checkpoint, or only approximate (as if the fix had been
+  applied at that time); `--verdict=FILE` writes it as JSON.
 - Added an experimental Model Context Protocol server, started with
   `nvc --mcp`, that lets AI agents drive nvc.  Its tools compile and
   elaborate designs (`nvc_analyse`, `nvc_elaborate`), list source files

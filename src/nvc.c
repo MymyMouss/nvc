@@ -971,9 +971,13 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       { "shuffle",       no_argument,       0, 'H' },
       { "checkpoint",    required_argument, 0, 'C' },
       { "restore",       required_argument, 0, 'R' },
+      { "allow-changes", no_argument,       0, 'A' },
+      { "verdict",       required_argument, 0, 'V' },
       { 0, 0, 0, 0 }
    };
 
+   bool            allow_changes = false;
+   const char     *verdict_file = NULL;
    const char     *ckpt_file = NULL;
    uint64_t        ckpt_time = 0;
    const char     *restore_file = NULL;
@@ -1086,10 +1090,18 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
                      "FILE@TIME such as state.ckpt@1ms");
             ckpt_file = xstrndup(optarg, at - optarg);
             ckpt_time = parse_time(at + 1);
+            jit_exec_tracking = true;
          }
          break;
       case 'R':
          restore_file = optarg;
+         jit_exec_tracking = true;
+         break;
+      case 'A':
+         allow_changes = true;
+         break;
+      case 'V':
+         verdict_file = optarg;
          break;
       case 'H':
          warnf("the $bold$--shuffle$$ option is intended for debug use only "
@@ -1205,7 +1217,9 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
 
    if (restore_file != NULL) {
       const uint64_t t0 = get_timestamp_us();
-      char *err = checkpoint_restore(state->model, state->jit, restore_file);
+      ckpt_report_t rep = {};
+      char *err = checkpoint_restore(state->model, state->jit, restore_file,
+                                     allow_changes, &rep);
       if (err != NULL)
          fatal("cannot restore checkpoint: %s", err);
 
@@ -1214,6 +1228,36 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
                              sizeof(tmbuf));
       notef("restored checkpoint %s at %s (%.1f ms)", restore_file, tmbuf,
             (get_timestamp_us() - t0) / 1000.0);
+
+      if (allow_changes) {
+         LOCAL_TEXT_BUF tb = tb_new();
+         unsigned nran = 0;
+         for (unsigned i = 0; i < rep.nchanged; i++)
+            nran += rep.executed[i];
+         tb_printf(tb, "restore verdict: %s (%u changed units, %u had "
+                   "already run", rep.exact ? "EXACT" : "APPROXIMATE",
+                   rep.nchanged, nran);
+         for (unsigned i = 0; i < rep.nnotes && i < 6; i++)
+            tb_printf(tb, "; %s", rep.notes[i]);
+         tb_append(tb, ')');
+         if (rep.exact)
+            notef("%s", tb_get(tb));
+         else
+            warnf("%s: validate the fix by running the changed design from "
+                  "time zero", tb_get(tb));
+
+         if (verdict_file != NULL) {
+            char *json = checkpoint_report_json(&rep);
+            FILE *vf = fopen(verdict_file, "w");
+            if (vf == NULL)
+               fatal_errno("%s", verdict_file);
+            fprintf(vf, "%s\n", json);
+            fclose(vf);
+            free(json);
+         }
+      }
+
+      checkpoint_report_free(&rep);
    }
 
    if (dumper != NULL)
@@ -1746,12 +1790,15 @@ static int mcp_worker_cmd(int argc, char **argv, cmd_state_t *state)
       { "fd", required_argument, 0, 'f' },
       { "files-dir", required_argument, 0, 'd' },
       { "restore-from", required_argument, 0, 'R' },
+      { "allow-changes", no_argument, 0, 'A' },
+      { "track-code", no_argument, 0, 'T' },
       { 0, 0, 0, 0 }
    };
 
    const int next_cmd = scan_cmd(2, argc, argv);
    int c, index = 0, ctl_fd = -1;
    const char *files_dir = NULL, *restore_from = NULL;
+   bool allow_changes = false;
    const char *spec = ":";
    while ((c = getopt_long(next_cmd, argv, spec, long_options, &index)) != -1) {
       switch (c) {
@@ -1764,6 +1811,13 @@ static int mcp_worker_cmd(int argc, char **argv, cmd_state_t *state)
          break;
       case 'R':
          restore_from = optarg;
+         jit_exec_tracking = true;
+         break;
+      case 'A':
+         allow_changes = true;
+         break;
+      case 'T':
+         jit_exec_tracking = true;
          break;
       case '?': bad_option("mcp-worker", argv);
       case ':': missing_argument("mcp-worker", argv);
@@ -1773,6 +1827,8 @@ static int mcp_worker_cmd(int argc, char **argv, cmd_state_t *state)
 
    if (ctl_fd < 0)
       fatal("the $bold$--mcp-worker$$ command requires $bold$--fd$$");
+
+
 
    set_top_level(argv, next_cmd, state);
 
@@ -1804,7 +1860,7 @@ static int mcp_worker_cmd(int argc, char **argv, cmd_state_t *state)
    state->vpi = vpi_context_new();
 
    const int rc = mcp_worker_main(state->model, top, state->jit, ctl_fd,
-                                  files_dir, restore_from);
+                                  files_dir, restore_from, allow_changes);
 
    vhpi_context_free(state->vhpi);
    state->vhpi = NULL;

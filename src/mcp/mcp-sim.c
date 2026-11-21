@@ -849,6 +849,14 @@ static const char open_input[] = MCP_JSON({
          "maximum": 300000,
          "description": "Time allowed to load the design. Defaults to 60000."
       },
+      "allow_changes": {
+         "type": "boolean",
+         "description": "With restore_from: allow the design to differ from the one the state file was written from, for example after fixing a bug. The result carries restore_verdict: exact only if the changed code had not run any of the changed part before the state was saved, otherwise approximate (the run is only as if the fix had been applied at that time): validate an approximate resume by running the fixed design from time 0. Refused, with the reason, when the state cannot be mapped onto the changed code."
+      },
+      "track_code": {
+        "type": "boolean",
+        "description": "Record which code has run, so that a state file saved from this simulation can later be restored into a fixed design with an exact verdict. Slows the simulation down (about 35%). Implied by restore_from."
+      },
       "restore_from": {
          "type": "string",
          "minLength": 1,
@@ -1005,8 +1013,12 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
    int ngargs;
    const char *const *gargs = mcp_call_global_argv(call, &ngargs);
 
-   const char **argv = xcalloc_array(ngargs + 10, sizeof(char *));
+   const char **argv = xcalloc_array(ngargs + 12, sizeof(char *));
    size_t argc = 0;
+
+   bool allow_changes = false, track_code = false;
+   json_as_bool(json_get(args, "allow_changes"), &allow_changes);
+   json_as_bool(json_get(args, "track_code"), &track_code);
 
    char *restore_opt = restore_path ? xasprintf("--restore-from=%s",
                                                 restore_path) : NULL;
@@ -1057,6 +1069,10 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
    argv[argc++] = files_opt;
    if (restore_opt != NULL)
       argv[argc++] = restore_opt;
+   if (allow_changes && restore_opt != NULL)
+      argv[argc++] = "--allow-changes";
+   if (track_code)
+      argv[argc++] = "--track-code";
    argv[argc++] = top;
    argv[argc] = NULL;
 
@@ -2913,7 +2929,11 @@ static const mcp_tool_t sim_tools[] = {
          "anything the design reported while initialising.  With "
          "restore_from the simulation starts from a state file written by "
          "nvc_sim_checkpoint with to_file, at the time it was saved, "
-         "instead of at time 0; the design must be the same.",
+         "instead of at time 0; the design must be the same unless "
+         "allow_changes is given, which restores into a fixed design and "
+         "returns restore_verdict (exact or approximate, with the changed "
+         "units and which of them had already run).  After an approximate "
+         "restore run the fixed design from time 0 to validate the fix.",
       .input_schema  = open_input,
       .output_schema = open_output,
       .example       = open_example,

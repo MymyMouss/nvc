@@ -1064,9 +1064,14 @@ static jit_value_t irgen_get_context(jit_irgen_t *g)
 static size_t irgen_append_cpool(jit_irgen_t *g, size_t sz, int align)
 {
    if (g->cpoolptr + sz + align - 1 > g->func->cpoolsz) {
+      const size_t oldsz = g->func->cpoolsz;
       g->func->cpoolsz = MAX(128, MAX((g->func->cpoolsz * 3) / 2,
                                       g->cpoolptr + sz + align - 1));
       g->func->cpool = xrealloc(g->func->cpool, g->func->cpoolsz);
+
+      // Padding in constants must not hold stale memory: a checkpoint
+      // compares the constants of a unit
+      memset(g->func->cpool + oldsz, '\0', g->func->cpoolsz - oldsz);
    }
 
    const size_t result = ALIGN_UP(g->cpoolptr, align);
@@ -5446,7 +5451,7 @@ static void irgen_context_struct(jit_irgen_t *g)
    if (kind == MIR_UNIT_PROCEDURE) {
       jit_value_t stamp =
          jit_addr_from_value(g->statereg, 2 * sizeof(void *) + sizeof(int32_t));
-      j_store(g, JIT_SZ_32, jit_value_from_int64(g->func->handle), stamp);
+      j_store(g, JIT_SZ_32, jit_value_from_handle(g->func->handle), stamp);
 
       // The pointer to a nested suspended procedure is only written when
       // one suspends: clear it so it can be told apart from garbage
@@ -5595,6 +5600,11 @@ static void irgen_analyse(jit_irgen_t *g)
       }
    }
 
+   // A process whose every wait resumes at the start can be restored
+   // from a checkpoint made by different code: it needs no resume point
+   bool top_only = (kind == MIR_UNIT_PROCESS);
+   int restart_state = -1;
+
    const int nblocks = mir_count_blocks(g->mu);
    for (int i = 0; i < nblocks; i++) {
       mir_block_t b = mir_get_block(g->mu, i);
@@ -5605,21 +5615,23 @@ static void irgen_analyse(jit_irgen_t *g)
          const mir_op_t op = mir_get_op(g->mu, n);
          if (j == nops - 1 && op == MIR_OP_WAIT) {
             mir_block_t target = mir_cast_block(mir_get_arg(g->mu, n, 0));
+            if (restart_state < 0)
+               restart_state = target.id;
             if (target.id != 1) {
                // This a kludge: remove it when MIR optimises better
                if (mir_count_nodes(g->mu, target) != 1)
-                  g->stateless = false;
+                  g->stateless = top_only = false;
                else {
                   mir_value_t n0 = mir_get_node(g->mu, target, 0);
                   if (mir_get_op(g->mu, n0) != MIR_OP_JUMP)
-                     g->stateless = false;
+                     g->stateless = top_only = false;
                   else if (mir_cast_block(mir_get_arg(g->mu, n0, 0)).id != 1)
-                     g->stateless = false;
+                     g->stateless = top_only = false;
                }
             }
          }
          else if (j == nops - 1 && op == MIR_OP_PCALL)
-            g->stateless = false;
+            g->stateless = top_only = false;
          else if (op == MIR_OP_CONTEXT_UPREF) {
             const int hops = irgen_get_const(g, n, 0);
             if (hops == 0) {
@@ -5629,6 +5641,9 @@ static void irgen_analyse(jit_irgen_t *g)
          }
       }
    }
+
+   g->func->restart_top = top_only;
+   g->func->restart_state = restart_state;
 }
 
 static void irgen_instance_entry(jit_irgen_t *g)
@@ -5915,6 +5930,9 @@ void jit_irgen(jit_func_t *f, mir_unit_t *mu)
       jit_do_dce(f);
       jit_delete_nops(f);
    }
+
+   if (jit_exec_tracking)
+      f->exec = xcalloc(MAX(f->nirs, 1));
 
    // Function can be executed immediately after this store
    store_release(&(f->state), JIT_FUNC_READY);

@@ -55,7 +55,13 @@ static const char instructions[] =
    "nvc_wave_table; ask when a condition holds with nvc_wave_find "
    "instead of working times out from lists of changes.  The "
    "first wrong value is the cause, not the point where an assertion "
-   "notices it.";
+   "notices it.  After fixing the source, a long simulation can resume "
+   "from a state saved before the failure: nvc_sim_checkpoint with "
+   "to_file (open the simulation with track_code to allow an exact "
+   "verdict), then nvc_sim_open with restore_from and allow_changes.  "
+   "The reply says whether the resume is exact or only approximate; "
+   "after an approximate resume always run the fixed design from time 0 "
+   "to confirm the fix.";
 
 typedef struct {
    char   *line;
