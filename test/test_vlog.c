@@ -16,18 +16,20 @@
 //
 
 #include "test_util.h"
-#include "phase.h"
 #include "common.h"
 #include "ident.h"
 #include "lib.h"
 #include "object.h"
 #include "option.h"
+#include "phase.h"
 #include "prim.h"
+#include "rt/model.h"
 #include "scan.h"
 #include "test_mir.h"
 #include "vlog/vlog-node.h"
 #include "vlog/vlog-number.h"
 #include "vlog/vlog-phase.h"
+#include "vpi/vpi-model.h"
 
 #include <inttypes.h>
 
@@ -46,6 +48,16 @@ static vlog_node_t do_parse_check(vlog_kind_t kind)
    vlog_node_t v = do_parse_only(kind);
    ck_assert_int_eq(error_count(), base_errors);
    vlog_check(v);
+   return v;
+}
+
+static vlog_node_t do_parse_check_fold(vlog_kind_t kind)
+{
+   const int base_errors = error_count();
+   vlog_node_t v = do_parse_check(kind);
+   ck_assert_int_eq(error_count(), base_errors);
+   vlog_simp(v);
+   vlog_fold(v, get_mir(), get_jit());
    return v;
 }
 
@@ -207,9 +219,9 @@ START_TEST(test_parse1)
    vlog_node_t m = vlog_parse();
    fail_if(m == NULL);
    fail_unless(vlog_kind(m) == V_MODULE);
-   ck_assert_int_eq(vlog_stmts(m), 43);
+   ck_assert_int_eq(vlog_stmts(m), 45);
    ck_assert_int_eq(vlog_ports(m), 0);
-   ck_assert_int_eq(vlog_decls(m), 38);
+   ck_assert_int_eq(vlog_decls(m), 39);
 
    vlog_node_t x = vlog_decl(m, 0);
    fail_unless(vlog_kind(x) == V_NET_DECL);
@@ -230,7 +242,7 @@ START_TEST(test_parse1)
    fail_unless(vlog_stmts(s1) == 1);
 
    vlog_node_t s1s0 = vlog_stmt(s1, 0);
-   fail_unless(vlog_kind(s1s0) == V_BLOCK);
+   fail_unless(vlog_kind(s1s0) == V_SEQ_BLOCK);
    fail_unless(vlog_ident(s1s0) == ident_new("foo"));
 
    vlog_node_t s1s0s0 = vlog_stmt(s1s0, 0);
@@ -319,7 +331,7 @@ START_TEST(test_parse1)
    vlog_node_t s9 = vlog_stmt(m, 9);
    fail_unless(vlog_kind(s9) == V_INITIAL);
    vlog_node_t s9b = vlog_stmt(s9, 0);
-   fail_unless(vlog_kind(s9b) == V_BLOCK);
+   fail_unless(vlog_kind(s9b) == V_SEQ_BLOCK);
    fail_unless(vlog_kind(vlog_stmt(s9b, 0)) == V_WHILE);
    fail_unless(vlog_kind(vlog_stmt(s9b, 1)) == V_REPEAT);
    fail_unless(vlog_kind(vlog_stmt(s9b, 2)) == V_DO_WHILE);
@@ -409,23 +421,24 @@ START_TEST(test_number2)
       int64_t     ival;
       const char *string;
    } cases[] = {
-      { "1'b1",          1,   1,           "1'b1"           },
-      { "5'b100",        5,   4,           "5'd4"           },
-      { "1",             32,  1,           "1"              },
-      { "42",            32,  42,          "42"             },
-      { "251251",        32,  251251,      "251251"         },
-      { "'hffffFFff",    32,  -1,          "-1"             },
+      { "1'b1",          1,   1,           "1'b1"      },
+      { "5'b100",        5,   4,           "5'd4"      },
+      { "1",             32,  1,           "1"         },
+      { "42",            32,  42,          "42"        },
+      { "251251",        32,  251251,      "251251"    },
+      { "'shffffFFff",   32,  -1,          "-1"        },
       { "33'h100000000", 33,  0x100000000,
-        "33'b100000000000000000000000000000000"             },
-      { "64'b0",         64,  0,           "64'b0"          },
-      { "64'b101",       64,  5,           "64'b101"        },
-      { "8'b00_01",      8,   1,           "8'd1"           },
-      { "128'bx",        128, 0,           "128'bx"         },
-      { "4'h12",         4,   2,           "4'd2"           },
-      { "1'b110",        1,   0,           "1'b0"           },
-      { "1_000",         32,  1000,        "1000"           },
-      { "6'o02",         6,   2,           "6'd2"           },
-      { "4'o_1",         4,   1,           "4'd1",          }
+        "33'b100000000000000000000000000000000"        },
+      { "64'b0",         64,  0,           "64'b0"     },
+      { "64'b101",       64,  5,           "64'b101"   },
+      { "8'b00_01",      8,   1,           "8'd1"      },
+      { "128'bx",        128, 0,           "128'bx"    },
+      { "4'h12",         4,   2,           "4'd2"      },
+      { "1'b110",        1,   0,           "1'b0"      },
+      { "1_000",         32,  1000,        "1000"      },
+      { "6'o02",         6,   2,           "6'd2"      },
+      { "4'o_1",         4,   1,           "4'd1"      },
+      { "2_0'b0",        20,  0,           "20'd0"     },
    };
 
    const error_t expect[] = {
@@ -505,21 +518,15 @@ START_TEST(test_timescale1)
    input_from_file(TESTDIR "/vlog/timescale1.v");
 
    const error_t expect[] = {
-      {  2, "invalid time unit name 'hello'" },
-      {  3, "invalid order of magnitude in `timescale directive" },
-      {  4, "unexpected real while parsing timescale compiler directive, "
-         "expecting unsigned number" },
+      {  2, "invalid order of magnitude in `timescale directive" },
+      {  3, "unexpected real while parsing timescale compiler directive, "
+         "expecting one of unsigned number or time literal" },
       { -1, NULL }
    };
    expect_errors(expect);
 
    vlog_node_t m = vlog_parse();
-   fail_if(m == NULL);
-   fail_unless(vlog_kind(m) == V_MODULE);
-
-   vlog_check(m);
-
-   fail_unless(vlog_parse() == NULL);
+   fail_unless(m == NULL);
 
    check_expected_errors();
 }
@@ -558,7 +565,6 @@ START_TEST(test_pp2)
       {  7, "unexpected comment while parsing ifdef condition" },
       {  9, "unexpected comment while parsing ifdef condition" },
       { 13, "unexpected comment while parsing ifdef condition" },
-      { 15, "unexpected text while parsing text macro name" },
       { 21, "unexpected end of file while parsing conditional compilation" },
       { -1, NULL }
    };
@@ -680,6 +686,7 @@ START_TEST(test_enum1)
 
    const error_t expect[] = {
       {  6, "'a' is not a data type" },
+      { 20, "'x' has no method named 'invalid'" },
       { -1, NULL }
    };
    expect_errors(expect);
@@ -699,11 +706,12 @@ START_TEST(test_enum2)
 
    const error_t expect[] = {
       {  8, "cannot reference variable 'zz' in constant expression" },
+      { 10, "enum names 'aa' and 'bb' both have value 1" },
       { -1, NULL }
    };
    expect_errors(expect);
 
-   do_parse_check(V_MODULE);
+   do_parse_check_fold(V_MODULE);
 
    fail_unless(vlog_parse() == NULL);
 
@@ -833,11 +841,7 @@ START_TEST(test_concat1)
    };
    expect_errors(expect);
 
-   vlog_node_t m = vlog_parse();
-   fail_if(m == NULL);
-   fail_unless(vlog_kind(m) == V_MODULE);
-
-   vlog_check(m);
+   do_parse_check_fold(V_MODULE);
 
    fail_unless(vlog_parse() == NULL);
 
@@ -906,11 +910,12 @@ START_TEST(test_const1)
 
    const error_t expect[] = {
       {  4, "cannot reference net 'w1' in constant expression" },
+      { 11, "cannot call system function '$time' in constant expression" },
       { -1, NULL }
    };
    expect_errors(expect);
 
-   do_parse_check(V_MODULE);
+   do_parse_check_fold(V_MODULE);
 
    fail_unless(vlog_parse() == NULL);
 
@@ -1019,6 +1024,7 @@ START_TEST(test_generate1)
 
    vlog_node_t m1 = do_parse_only(V_MODULE);
    vlog_check(m1);
+   vlog_fold(m1, get_mir(), get_jit());
 
    fail_unless(vlog_parse() == NULL);
 
@@ -1273,25 +1279,6 @@ START_TEST(test_href1)
    input_from_file(TESTDIR "/vlog/href1.v");
 
    const error_t expect[] = {
-      {  6, "no visible declaration for 'xx'" },
-      { 13, "no visible declaration for 'yy'" },
-      { -1, NULL }
-   };
-   expect_errors(expect);
-
-   do_parse_only(V_MODULE);
-
-   fail_unless(vlog_parse() == NULL);
-
-   check_expected_errors();
-}
-END_TEST
-
-START_TEST(test_href2)
-{
-   input_from_file(TESTDIR "/vlog/href2.v");
-
-   const error_t expect[] = {
       {  5, "prefix of hierarchical identifier is not an instance" },
       { -1, NULL }
    };
@@ -1429,10 +1416,11 @@ START_TEST(test_simp1)
 {
    input_from_file(TESTDIR "/vlog/simp1.v");
 
-   vlog_node_t m = do_parse_check(V_MODULE);
-   vlog_simp(m);
+   vpi_context_new();
 
-   const int64_t expect[] = { 5, 1, 7, 1, 2, 2, -4, 6, -2, -4 };
+   vlog_node_t m = do_parse_check_fold(V_MODULE);
+
+   const int64_t expect[] = { 5, 1, 7, 1, 2, 2, -4, 6, -2, -4, 4, 3 };
 
    ck_assert_int_eq(ARRAY_LEN(expect), vlog_decls(m));
 
@@ -1502,7 +1490,7 @@ START_TEST(test_lower1)
       ck_assert_ptr_nonnull(mu);
 
       static const mir_match_t bb0[] = {
-         { MIR_OP_VAR_UPREF },
+         { MIR_OP_VAR_UPREF, ENUM(1), UPREF("x") },
          { MIR_OP_LOAD },
          { MIR_OP_LEVEL_TRIGGER },
          { MIR_OP_STORE, VAR("trigger") },
@@ -1520,9 +1508,9 @@ START_TEST(test_lower1)
       static const mir_match_t bb2[] = {
          { MIR_OP_LOAD, VAR("trigger") },
          { MIR_OP_CLEAR_EVENT },
-         { MIR_OP_VAR_UPREF },
+         { MIR_OP_VAR_UPREF, ENUM(1), UPREF("r") },
          { MIR_OP_LOAD },
-         { MIR_OP_VAR_UPREF },
+         { MIR_OP_VAR_UPREF, ENUM(1), UPREF("x") },
          { MIR_OP_LOAD },
          { MIR_OP_RESOLVED },
          { MIR_OP_LOAD },
@@ -1576,7 +1564,7 @@ START_TEST(test_pp8)
    input_from_file(TESTDIR "/vlog/pp8.v");
 
    const error_t expect[] = {
-      {  7, "macro 'add' requires exactly 2 arguments" },
+      {  7, "macro 'add' is missing argument 'y' with no default value" },
       {  8, "macro 'baz' undefined" },
       { 10, "macro 'foo' requires exactly 1 arguments" },
       { -1, NULL }
@@ -1657,7 +1645,7 @@ START_TEST(test_const2)
    };
    expect_errors(expect);
 
-   do_parse_check(V_MODULE);
+   do_parse_check_fold(V_MODULE);
 
    fail_unless(vlog_parse() == NULL);
 
@@ -1724,12 +1712,15 @@ START_TEST(test_simp2)
 {
    input_from_file(TESTDIR "/vlog/simp2.v");
 
-   vlog_node_t m = do_parse_check(V_MODULE);
-   vlog_simp(m);
+   vlog_node_t m = do_parse_check_fold(V_MODULE);
 
    vlog_node_t p1 = vlog_decl(m, 1);
    ck_assert_vlog_kind(p1, V_LOCALPARAM);
-   ck_assert_vlog_kind(vlog_value(p1), V_COND_EXPR);
+   ck_assert_vlog_kind(vlog_value(p1), V_NUMBER);
+
+   number_t p1n = vlog_number(vlog_value(p1));
+   ck_assert_int_eq(number_width(p1n), 32);
+   ck_assert(!number_is_defined(p1n));
 
    vlog_node_t p2 = vlog_decl(m, 2);
    ck_assert_vlog_kind(p2, V_LOCALPARAM);
@@ -1766,9 +1757,9 @@ START_TEST(test_lower2)
       ck_assert_ptr_nonnull(mu);
 
       static const mir_match_t bb1[] = {
-         { MIR_OP_VAR_UPREF },
+         { MIR_OP_VAR_UPREF, ENUM(1), UPREF("y1") },
          { MIR_OP_LOAD },
-         { MIR_OP_VAR_UPREF },
+         { MIR_OP_VAR_UPREF, ENUM(1), UPREF("x") },
          { MIR_OP_LOAD },
          { MIR_OP_RESOLVED },
          { MIR_OP_ARRAY_REF, NODE(_), CONST(3) },
@@ -1785,9 +1776,9 @@ START_TEST(test_lower2)
       ck_assert_ptr_nonnull(mu);
 
       static const mir_match_t bb1[] = {
-         { MIR_OP_VAR_UPREF },
+         { MIR_OP_VAR_UPREF, ENUM(1), UPREF("y2") },
          { MIR_OP_LOAD },
-         { MIR_OP_VAR_UPREF },
+         { MIR_OP_VAR_UPREF, ENUM(1), UPREF("x") },
          { MIR_OP_LOAD },
          { MIR_OP_RESOLVED },
          { MIR_OP_ARRAY_REF, NODE(_), CONST(5) },
@@ -1818,12 +1809,12 @@ START_TEST(test_lower3)
    ck_assert_ptr_nonnull(mu);
 
    static const mir_match_t bb1[] = {
-      { MIR_OP_VAR_UPREF },
+      { MIR_OP_VAR_UPREF, ENUM(1), UPREF("sum") },
       { MIR_OP_LOAD },
       { MIR_OP_CONST_VEC },
       { MIR_OP_UNPACK },
       { MIR_OP_DEPOSIT_SIGNAL, NODE(_), CONST(32) },
-      { MIR_OP_VAR_UPREF },
+      { MIR_OP_VAR_UPREF, ENUM(1), UPREF("idx") },
       { MIR_OP_LOAD },
       { MIR_OP_CONST_VEC },
       { MIR_OP_UNPACK },
@@ -1887,6 +1878,398 @@ START_TEST(test_force1)
 }
 END_TEST
 
+START_TEST(test_constfunc1)
+{
+   input_from_file(TESTDIR "/vlog/constfunc1.v");
+
+   const error_t expect[] = {
+      { 16, "cannot reference variable 'i' in constant expression" },
+      { 22, "cannot call non-constant user function 'get_i' in constant "
+        "expression" },
+      { 25, "cannot reference variable 'i' in constant expression" },
+      { -1, NULL }
+   };
+   expect_errors(expect);
+
+   vpi_context_new();
+
+   do_parse_check_fold(V_MODULE);
+
+   fail_unless(vlog_parse() == NULL);
+
+   check_expected_errors();
+}
+END_TEST
+
+START_TEST(test_pp12)
+{
+   input_from_file(TESTDIR "/vlog/pp12.v");
+
+   LOCAL_TEXT_BUF tb = tb_new();
+   vlog_preprocess(tb, false);
+
+   ck_assert_str_eq(
+      tb_get(tb),
+      "\n"
+      "bit_out = data[1];\n");
+
+   fail_if_errors();
+}
+END_TEST
+
+START_TEST(test_pp13)
+{
+   add_include_dir(TESTDIR "/vlog");
+
+   input_from_file(TESTDIR "/vlog/pp13.v");
+
+   LOCAL_TEXT_BUF tb = tb_new();
+   vlog_preprocess(tb, false);
+
+   ck_assert_str_eq(tb_get(tb), "\n\n\n\n8\n");
+
+   fail_if_errors();
+}
+END_TEST
+
+START_TEST(test_pp14)
+{
+   input_from_file(TESTDIR "/vlog/pp14.v");
+
+   const error_t expect[] = {
+      { 15, "macro 'MACRO1' is missing argument 'c' with no default value" },
+      { 16, "macro 'MACRO2' requires exactly 3 arguments, 4 were given" },
+      { 17, "macro 'MACRO3' requires arguments" },
+      { -1, NULL }
+   };
+   expect_errors(expect);
+
+   LOCAL_TEXT_BUF tb = tb_new();
+   vlog_preprocess(tb, false);
+
+   ck_assert_str_eq(
+      tb_get(tb),
+      "\n"
+      "$display(5,,2,,3 );\n"
+      "$display(1 ,,\"B\",,3 );\n"
+      "$display(5,,2,,);\n"
+      "\n"
+      "\n"
+      "$display(1,,,,3);\n"
+      "$display(5,,2,,\"C\");\n"
+      "$display(5,,2,,\"C\");\n"
+      "\n"
+      "\n"
+      "$display(1 ,,0,,\"C\");\n"
+      "$display(5,,0,,\"C\");\n"
+      "\n"
+      "$display(1 ,,\"B\",,c);       // ILLEGAL: b and c omitted, no default for c\n"
+      "$display(5,,,,3); // ILLEGAL: more argument than declared\n"
+      "$display(a,,b,,c);             // ILLEGAL: parentheses required\n");
+
+   check_expected_errors();
+}
+
+START_TEST(test_href2)
+{
+   input_from_file(TESTDIR "/vlog/href2.v");
+
+   vlog_node_t m1 = do_parse_check(V_MODULE);
+   vlog_check(m1);
+
+   vlog_node_t m2 = do_parse_check(V_MODULE);
+   vlog_check(m2);
+
+   jit_t *j = get_jit();
+   rt_model_t *m = model_new(j, NULL);
+   mir_context_t *mc = get_mir();
+   unit_registry_t *ur = get_registry();
+
+   object_t *top[2] = { vlog_to_object(m1), vlog_to_object(m2) };
+
+   tree_t e = elab(top, ARRAY_LEN(top), j, ur, mc, NULL, NULL, m);
+   ck_assert_ptr_nonnull(e);
+
+   model_free(m);
+
+   fail_if_errors();
+}
+END_TEST
+
+START_TEST(test_href3)
+{
+   input_from_file(TESTDIR "/vlog/href3.v");
+
+   const error_t expect[] = {
+      {  7, "name 'xxx' not found in 'u1'" },
+      {  0, "'u1' is an instance of WORK.SUB1" },
+      {  8, "cannot find 'glbl' in hierarchical identifier" },
+      { -1, NULL }
+   };
+   expect_errors(expect);
+
+   run_elab();
+
+   check_expected_errors();
+}
+END_TEST
+
+START_TEST(test_constfunc2)
+{
+   input_from_file(TESTDIR "/vlog/constfunc2.v");
+
+   vlog_node_t m = do_parse_check_fold(V_MODULE);
+
+   vlog_node_t p1 = vlog_decl(m, 1);
+   ck_assert_vlog_kind(p1, V_LOCALPARAM);
+   ck_assert_vlog_kind(vlog_value(p1), V_NUMBER);
+
+   number_t p1n = vlog_number(vlog_value(p1));
+   ck_assert_int_eq(number_width(p1n), 4);
+   ck_assert(number_is_defined(p1n));
+   ck_assert_int_eq(number_integer(p1n), 10);
+
+   vlog_node_t p3 = vlog_decl(m, 3);
+   ck_assert_vlog_kind(p3, V_LOCALPARAM);
+   ck_assert_vlog_kind(vlog_value(p3), V_USER_FCALL);  // Cannot fold now
+
+   fail_unless(vlog_parse() == NULL);
+
+   fail_if_errors();
+}
+END_TEST
+
+START_TEST(test_disable1)
+{
+   input_from_file(TESTDIR "/vlog/disable1.v");
+
+   const error_t expect[] = {
+      {  6, "no visible label 'bar'" },
+      {  7, "cannot disable 'x'" },
+      { -1, NULL }
+   };
+   expect_errors(expect);
+
+   do_parse_only(V_MODULE);
+
+   check_expected_errors();
+}
+END_TEST
+
+START_TEST(test_issue1596)
+{
+   input_from_file(TESTDIR "/vlog/issue1596.v");
+
+   const error_t expect[] = {
+      { 10, "unexpected identifier while parsing module or generate item" },
+      { -1, NULL }
+   };
+   expect_errors(expect);
+
+   do_parse_only(V_MODULE);
+
+   check_expected_errors();
+}
+END_TEST
+
+START_TEST(test_issue1678)
+{
+   input_from_file(TESTDIR "/vlog/issue1678.v");
+
+   do_parse_check(V_MODULE);
+
+   fail_unless(vlog_parse() == NULL);
+
+   fail_if_errors();
+}
+END_TEST
+
+START_TEST(test_pp15)
+{
+   input_from_file(TESTDIR "/vlog/pp15.v");
+
+   LOCAL_TEXT_BUF tb = tb_new();
+   vlog_preprocess(tb, false);
+
+   ck_assert_str_eq(
+      tb_get(tb),
+      "\n"
+      "\n"
+      "module pp15;\n"
+      "  wire [1:0] in;\n"
+      "  wire [1:0] out;\n"
+      "\n"
+      "  assign out = {in[0], in[1]};\n"
+      "endmodule\n");
+
+   fail_if_errors();
+}
+END_TEST
+
+START_TEST(test_prop1)
+{
+   input_from_file(TESTDIR "/vlog/prop1.sv");
+
+   const error_t expect[] = {
+      { -1, NULL }
+   };
+   expect_errors(expect);
+
+   do_parse_check(V_MODULE);
+
+   check_expected_errors();
+}
+END_TEST
+
+START_TEST(test_pattern1)
+{
+   input_from_file(TESTDIR "/vlog/pattern1.sv");
+
+   const error_t expect[] = {
+      { 11, "struct or union has no field 'bogus'" },
+      { 12, "cannot use structure pattern key with this data type" },
+      { -1, NULL }
+   };
+   expect_errors(expect);
+
+   do_parse_only(V_MODULE);
+
+   check_expected_errors();
+}
+END_TEST
+
+START_TEST(test_pp16)
+{
+   input_from_file(TESTDIR "/vlog/pp16.v");
+
+   const error_t expect[] = {
+      { 17, "unexpected module while parsing statement item" },
+      { -1, NULL }
+   };
+   expect_errors(expect);
+
+   LOCAL_TEXT_BUF tb = tb_new();
+   vlog_preprocess(tb, true);
+
+   file_ref_t file_ref = loc_file_ref(TESTDIR "/vlog/pp16.v", NULL);
+   input_from_buffer(tb_get(tb), tb_len(tb), file_ref, SOURCE_VERILOG);
+
+   do_parse_only(V_MODULE);
+
+   fail_unless(vlog_parse() == NULL);
+
+   check_expected_errors();
+}
+END_TEST
+
+START_TEST(test_pp17)
+{
+   input_from_file(TESTDIR "/vlog/pp17.v");
+
+   LOCAL_TEXT_BUF tb = tb_new();
+   vlog_preprocess(tb, false);
+
+   ck_assert_str_eq(
+      tb_get(tb),
+      "\n"
+      "\n"
+      "\n"
+      "\n"
+      "module pp17;\n"
+      "endmodule\n");
+
+   fail_if_errors();
+}
+END_TEST
+
+START_TEST(test_number3)
+{
+   uint64_t a, b;
+
+   number_t u5 = number_new("5'b10101", NULL);
+   number_word(u5, 0, &a, &b);
+   ck_assert_uint_eq(a, UINT64_C(0x15));
+   ck_assert_uint_eq(b, 0);
+   number_word(u5, 1, &a, &b);
+   ck_assert_uint_eq(a, 0);
+   ck_assert_uint_eq(b, 0);
+
+   number_t s5 = number_new("5'sb10101", NULL);
+   number_word(s5, 0, &a, &b);
+   ck_assert_uint_eq(a, UINT64_C(0xfffffffffffffff5));
+   ck_assert_uint_eq(b, 0);
+   number_word(s5, 100, &a, &b);
+   ck_assert_uint_eq(a, UINT64_MAX);
+   ck_assert_uint_eq(b, 0);
+
+   number_t sx5 = number_new("5'sbx0101", NULL);
+   number_word(sx5, 0, &a, &b);
+   ck_assert_uint_eq(a, UINT64_C(0xfffffffffffffff5));
+   ck_assert_uint_eq(b, UINT64_C(0xfffffffffffffff0));
+   number_word(sx5, 1, &a, &b);
+   ck_assert_uint_eq(a, UINT64_MAX);
+   ck_assert_uint_eq(b, UINT64_MAX);
+
+   number_t sz5 = number_new("5'sbz0101", NULL);
+   number_word(sz5, 0, &a, &b);
+   ck_assert_uint_eq(a, UINT64_C(0x5));
+   ck_assert_uint_eq(b, UINT64_C(0xfffffffffffffff0));
+   number_word(sz5, 1, &a, &b);
+   ck_assert_uint_eq(a, 0);
+   ck_assert_uint_eq(b, UINT64_MAX);
+
+   number_t s68 = number_new("68'sh8_0123456789abcdef", NULL);
+   number_word(s68, 0, &a, &b);
+   ck_assert_uint_eq(a, UINT64_C(0x0123456789abcdef));
+   ck_assert_uint_eq(b, 0);
+   number_word(s68, 1, &a, &b);
+   ck_assert_uint_eq(a, UINT64_C(0xfffffffffffffff8));
+   ck_assert_uint_eq(b, 0);
+   number_word(s68, 2, &a, &b);
+   ck_assert_uint_eq(a, UINT64_MAX);
+   ck_assert_uint_eq(b, 0);
+}
+END_TEST
+
+START_TEST(test_pp18)
+{
+   input_from_file(TESTDIR "/vlog/pp18.v");
+
+   LOCAL_TEXT_BUF tb = tb_new();
+   vlog_preprocess(tb, false);
+
+   ck_assert_str_eq(
+      tb_get(tb),
+      "\n"
+      "\n"
+      "\n"
+      "\n"
+      "\n"
+      "\n"
+      "\n"
+      "\n"
+      "\n"
+      "\n"
+      "\n"
+      "\n"
+      "\n"
+      "\n"
+      "\n"
+      "module pp18;\n"
+      "  wire [3:0] i;\n"
+      "  wire [7:0] o = \n"
+      "    /* verilator lint_off WIDTH */ \n"
+      "    ((8) == (4) ? i : {{((8) - (4)){1'b0}}, i}) \n"
+      "    /* verilator lint_on WIDTH */;\n"
+      "  wire [3:0] p = 1 /* a block comment */ + 1;\n"
+      "  wire [3:0] q = 1 /* a block\n"
+      "comment */ + 2;\n"
+      "endmodule\n");
+
+   fail_if_errors();
+}
+END_TEST
+
 Suite *get_vlog_tests(void)
 {
    Suite *s = suite_create("vlog");
@@ -1936,7 +2319,6 @@ Suite *get_vlog_tests(void)
    tcase_add_test(tc, test_pp6);
    tcase_add_test(tc, test_label1);
    tcase_add_test(tc, test_href1);
-   tcase_add_test(tc, test_href2);
    tcase_add_test(tc, test_package1);
    tcase_add_test(tc, test_class1);
    tcase_add_test(tc, test_class2);
@@ -1956,6 +2338,23 @@ Suite *get_vlog_tests(void)
    tcase_add_test(tc, test_lower2);
    tcase_add_test(tc, test_lower3);
    tcase_add_test(tc, test_force1);
+   tcase_add_test(tc, test_constfunc1);
+   tcase_add_test(tc, test_pp12);
+   tcase_add_test(tc, test_pp13);
+   tcase_add_test(tc, test_pp14);
+   tcase_add_test(tc, test_href2);
+   tcase_add_test(tc, test_href3);
+   tcase_add_test(tc, test_constfunc2);
+   tcase_add_test(tc, test_disable1);
+   tcase_add_test(tc, test_issue1596);
+   tcase_add_test(tc, test_issue1678);
+   tcase_add_test(tc, test_pp15);
+   tcase_add_test(tc, test_prop1);
+   tcase_add_test(tc, test_pattern1);
+   tcase_add_test(tc, test_pp16);
+   tcase_add_test(tc, test_pp17);
+   tcase_add_test(tc, test_number3);
+   tcase_add_test(tc, test_pp18);
    suite_add_tcase(s, tc);
 
    return s;

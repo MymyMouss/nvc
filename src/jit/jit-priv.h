@@ -125,6 +125,7 @@ typedef enum {
    JIT_EXIT_EXPONENT_FAIL,
    JIT_EXIT_REPORT,
    JIT_EXIT_ASSERT_FAIL,
+   JIT_EXIT_TCHECK,
    JIT_EXIT_RANGE_FAIL,
    JIT_EXIT_FUNC_WAIT,
    JIT_EXIT_INIT_SIGNAL,
@@ -145,8 +146,10 @@ typedef enum {
    JIT_EXIT_LAST_EVENT,
    JIT_EXIT_LAST_ACTIVE,
    JIT_EXIT_DISCONNECT,
-   JIT_EXIT_FORCE,
-   JIT_EXIT_RELEASE,
+   JIT_EXIT_SCHED_FORCE,
+   JIT_EXIT_SCHED_RELEASE,
+   JIT_EXIT_FORCE_SIGNAL,
+   JIT_EXIT_RELEASE_SIGNAL,
    JIT_EXIT_PUSH_SCOPE,
    JIT_EXIT_POP_SCOPE,
    JIT_EXIT_DRIVING,
@@ -177,6 +180,7 @@ typedef enum {
    JIT_EXIT_SCHED_INACTIVE,
    JIT_EXIT_GET_COUNTERS,
    JIT_EXIT_SCHED_ACTIVE,
+   JIT_EXIT_SCHED_ZERO,
 } jit_exit_t;
 
 typedef uint16_t jit_reg_t;
@@ -235,9 +239,12 @@ typedef enum {
    JIT_VEC_SGE,
    JIT_VEC_AND1,
    JIT_VEC_OR1,
+   JIT_VEC_XOR1,
    JIT_VEC_TERNARY,
    JIT_VEC_EXP,
    JIT_VEC_DEFINED,
+   JIT_VEC_NEGATE,
+   JIT_VEC_EXTRACT,
 } jit_vec_op_t;
 
 typedef uint32_t jit_label_t;
@@ -319,10 +326,7 @@ typedef enum {
    JIT_FUNC_ERROR,
 } func_state_t;
 
-typedef struct {
-   ident_t  name;
-   unsigned offset;
-} link_tab_t;
+typedef jit_var_t link_tab_t;
 
 typedef struct _jit_func {
    jit_entry_fn_t  entry;    // Must be first
@@ -337,6 +341,13 @@ typedef struct _jit_func {
    unsigned        nirs;
    unsigned        nregs;
    unsigned        nvars;
+   unsigned        ukind;    // mir_unit_kind_t
+   bool            restart_top;   // Every wait resumes at the start
+   int             restart_state; // The state of a wait, which does
+   uint32_t       *resume;   // The states the jump table accepts
+   unsigned        nresume;
+   uint8_t        *exec;     // Instructions run so far, if tracking
+   unsigned        hdrsz;    // Frame header size
    unsigned        cpoolsz;
    jit_handle_t    handle;
    unsigned        hotness;
@@ -458,7 +469,7 @@ void code_blob_print_ir(code_blob_t *blob, jit_ir_t *ir);
 #endif
 
 void jit_bind_foreign(jit_func_t *f, const uint8_t *spec, size_t length,
-                      tree_t where);
+                      tree_t where, tree_t region);
 void jit_do_syscall(vlog_node_t where, jit_anchor_t *caller, jit_scalar_t *args,
                     tlab_t *tlab);
 
@@ -471,5 +482,22 @@ DLLEXPORT void __nvc_unpack(jit_scalar_t aval, jit_scalar_t bval,
                             jit_scalar_t *args);
 DLLEXPORT void *__nvc_mspace_alloc(uintptr_t size, jit_anchor_t *anchor);
 DLLEXPORT void _debug_out(intptr_t val, int32_t reg);
+
+void fast_sched_waveform(jit_anchor_t *anchor, sig_shared_t *shared,
+                         int32_t offset, int32_t count, jit_scalar_t value,
+                         int64_t after, int64_t reject, bool scalar);
+void fast_sched_waveform_s0(jit_anchor_t *anchor, sig_shared_t *shared,
+                            int32_t offset, jit_scalar_t value);
+void fast_sched_waveform_0(jit_anchor_t *anchor, sig_shared_t *shared,
+                           int32_t offset, int32_t count, jit_scalar_t value);
+void fast_drive_signal(jit_anchor_t *anchor, sig_shared_t *shared,
+                       int32_t offset, int32_t count);
+void fast_sched_event(jit_anchor_t *anchor, sig_shared_t *shared,
+                      int32_t offset, int32_t count);
+void fast_length_fail(jit_anchor_t *anchor, int64_t left, int64_t right,
+                      int32_t dim, tree_t where);
+void fast_index_fail(jit_anchor_t *anchor, int64_t value, int64_t left,
+                     int64_t right, int8_t dir, tree_t where, tree_t hint);
+void fast_sched_process(jit_anchor_t *anchor, int64_t after);
 
 #endif  // _JIT_PRIV_H

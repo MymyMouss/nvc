@@ -66,6 +66,7 @@ typedef struct _jit_dll {
 } jit_dll_t;
 
 static jit_dll_t *dlls;
+static unsigned   external_dlls;
 
 ffi_uarray_t ffi_wrap(void *ptr, int64_t left, int64_t right)
 {
@@ -110,9 +111,7 @@ static jit_dll_t *ffi_load_exe(void)
 
    char *libc_path = xmalloc(MAX_PATH);
    if (!GetModuleFileName(libc_handle, libc_path, MAX_PATH))
-      fatal("failed to get C runtime library path: %s", last_os_error());
-
-   DEBUG_ONLY(debugf("C runtime library: %s", libc_path));
+      fatal_win32("GetModuleFileName");
 
    jit_dll_t *libc = xcalloc(sizeof(jit_dll_t));
    libc->next   = dlls;
@@ -180,6 +179,8 @@ jit_dll_t *ffi_load_dll(const char *path)
          tb_rewind(tb);
          get_lib_dir(tb);
          tb_cat(tb, DIR_SEP);
+         tb_cat(tb, "plugins");
+         tb_cat(tb, DIR_SEP);
          tb_cat(tb, path);
          tb_cat(tb, "." DLL_EXT);
 
@@ -200,6 +201,7 @@ jit_dll_t *ffi_load_dll(const char *path)
 
          tb_rewind(tb);
          get_lib_dir(tb);
+         tb_cat(tb, DIR_SEP "plugins");
          diag_hint(d, NULL, "searched built-in plugin directory %s",
                    tb_get(tb));
 
@@ -225,7 +227,7 @@ jit_dll_t *ffi_load_dll(const char *path)
 #ifdef __MINGW32__
    HMODULE handle = LoadLibrary(abs);
    if (handle == NULL)
-      fatal_errno("failed to load %s", abs);
+      fatal_win32("failed to load %s", abs);
 #else
    void *handle = dlopen(abs, RTLD_LAZY);
    if (handle == NULL)
@@ -239,10 +241,17 @@ jit_dll_t *ffi_load_dll(const char *path)
    dll->handle = handle;
    dll->path   = abs;
 
+   external_dlls++;
+
    jit_dll_t **where;
    for (where = &dlls; *where != NULL; where = &((*where)->next));
 
    return (*where = dll);
+}
+
+bool ffi_external_dll_loaded(void)
+{
+   return external_dlls > 0;
 }
 
 void ffi_unload_dll(jit_dll_t *dll)
@@ -398,8 +407,8 @@ static ffi_type *ghdl_ffi_result_type(type_t type)
       break;
    }
 
-   jit_msg(NULL, DIAG_FATAL, "cannot return type %s using GHDL "
-           "VHPIDIRECT calling convention", type_pp(type));
+   jit_msg(NULL, DIAG_FATAL, "cannot return type %pT using GHDL "
+           "VHPIDIRECT calling convention", type);
    return &ffi_type_void;
 }
 
@@ -458,8 +467,8 @@ static void ghdl_ffi_add_arg(ghdl_ffi_t *gffi, ffi_type **types, tree_t p)
       break;
    }
 
-   jit_msg(NULL, DIAG_FATAL, "cannot pass type %s using GHDL "
-           "VHPIDIRECT calling convention", type_pp(type));
+   jit_msg(NULL, DIAG_FATAL, "cannot pass type %pT using GHDL "
+           "VHPIDIRECT calling convention", type);
 }
 
 static void *ffi_prepare_ghdl(tree_t decl, const char *symbol)
@@ -507,13 +516,13 @@ static void *ffi_prepare_ghdl(tree_t decl, const char *symbol)
 
    if (ffi_prep_cif(&(gffi->cif), FFI_DEFAULT_ABI, gffi->nforeign,
                     ret, types) != FFI_OK)
-      fatal("ffi_prep_cif failed for %s", type_pp(type));
+      fatal("ffi_prep_cif failed for %pT", type);
 
    return gffi;
 }
 
 void jit_bind_foreign(jit_func_t *f, const uint8_t *spec, size_t length,
-                      tree_t where)
+                      tree_t where, tree_t region)
 {
    char *tmp LOCAL = null_terminate(spec, length), *p = strtok(tmp, " ");
    if (strcmp(p, "VHPIDIRECT") == 0 || strcmp(p, "GHDL") == 0) {
@@ -538,7 +547,7 @@ void jit_bind_foreign(jit_func_t *f, const uint8_t *spec, size_t length,
       if (model == NULL)
          jit_msg(NULL, DIAG_FATAL, "missing model name");
 
-      vhpiHandleT handle = vhpi_bind_foreign(obj_lib, model, where);
+      vhpiHandleT handle = vhpi_bind_foreign(obj_lib, model, where, region);
       if (handle == NULL)
          jit_msg(NULL, DIAG_FATAL, "foreign subprogram %s/%s not registered",
                  obj_lib, model);

@@ -1,5 +1,5 @@
 //
-//  Copyright (C) 2024 Nick Gasson
+//  Copyright (C) 2024-2026 Nick Gasson
 //
 //  This program is free software: you can redistribute it and/or modify
 //  it under the terms of the GNU General Public License as published by
@@ -76,10 +76,20 @@ bool vlog_get_const(vlog_node_t v, int64_t *value)
    case V_CONCAT:
       if (vlog_params(v) == 1 && !vlog_has_value(v))
          return vlog_get_const(vlog_param(v, 0), value);
-      // Fall through
+      else
+         return false;
    default:
-      fatal_at(vlog_loc(v), "expression is not constant");
+      return false;
    }
+}
+
+int64_t vlog_must_be_const(vlog_node_t v)
+{
+   int64_t value;
+   if (vlog_get_const(v, &value))
+      return value;
+
+   fatal_at(vlog_loc(v), "expression is not constant");
 }
 
 bool vlog_is_const(vlog_node_t v)
@@ -127,6 +137,7 @@ unsigned vlog_size(vlog_node_t v)
    case V_NET_DECL:
    case V_PORT_DECL:
    case V_TF_PORT_DECL:
+   case V_LOCAL_DECL:
       {
          unsigned size = 1;
 
@@ -138,6 +149,7 @@ unsigned vlog_size(vlog_node_t v)
       }
    case V_PARAM_DECL:
       // TODO: this should have unpacked dimensions as above
+   case V_FUNC_DECL:
    case V_LOCALPARAM:
       return 1;  // No unpacked dimensions
    case V_PART_SELECT:
@@ -208,7 +220,6 @@ unsigned vlog_width(vlog_node_t v)
    case V_NULL:
       return 0;  // Undefined
    case V_REF:
-   case V_HIER_REF:
    case V_MEMBER_REF:
    case V_USER_FCALL:
       return vlog_width(vlog_ref(v));
@@ -222,7 +233,13 @@ unsigned vlog_width(vlog_node_t v)
    case V_GENVAR_DECL:
    case V_ENUM_NAME:
    case V_ENUM_DECL:
+   case V_LOCAL_DECL:
       return vlog_size(vlog_type(v));
+   case V_HIER_REF:
+      if (vlog_has_ref(v))
+         return vlog_width(vlog_ref(v));
+      else
+         fatal_at(vlog_loc(v), "unbound hierarchical reference");
    case V_BIT_SELECT:
       {
          vlog_node_t value = vlog_value(v);
@@ -256,6 +273,8 @@ unsigned vlog_width(vlog_node_t v)
       }
    case V_COND_EXPR:
       return MAX(vlog_width(vlog_left(v)), vlog_width(vlog_right(v)));
+   case V_MIN_TYP_MAX:
+      return vlog_width(vlog_value(v));
    case V_UNARY:
       switch (vlog_subkind(v)) {
       case V_UNARY_BITNEG:
@@ -308,7 +327,23 @@ unsigned vlog_width(vlog_node_t v)
          CANNOT_HANDLE(v);
       }
    case V_SYS_FCALL:
-      return 32;  // TODO: call VPI
+      switch (vlog_subkind(v)) {
+      case V_SYSTF_UNSIGNED:
+      case V_SYSTF_SIGNED:
+         return vlog_width(vlog_param(v, 0));
+      default:
+         return 32;  // TODO: call VPI
+      }
+   case V_CAST:
+      {
+         assert(vlog_subkind(v) == V_CAST_WIDTH);
+
+         int64_t width;
+         if (vlog_get_const(vlog_left(v), &width))
+            return width;
+         else
+            return 0;  // Undefined
+      }
    default:
       CANNOT_HANDLE(v);
    }
@@ -319,13 +354,17 @@ bool vlog_is_signed(vlog_node_t v)
    switch (vlog_kind(v)) {
    case V_NUMBER:
       return number_signed(vlog_number(v));
+   case V_REAL:
+      return true;
    case V_VAR_DECL:
    case V_NET_DECL:
    case V_PORT_DECL:
    case V_TF_PORT_DECL:
    case V_FUNC_DECL:
    case V_LOCALPARAM:
-      return !!(vlog_flags(vlog_type(v)) & VLOG_F_SIGNED);
+   case V_LOCAL_DECL:
+   case V_GENVAR_DECL:
+      return vlog_is_signed(vlog_type(v));
    case V_REF:
    case V_MEMBER_REF:
       return vlog_has_ref(v) && vlog_is_signed(vlog_ref(v));
@@ -335,7 +374,35 @@ bool vlog_is_signed(vlog_node_t v)
    case V_UNARY:
       return vlog_is_signed(vlog_value(v));
    case V_BINARY:
+      switch (vlog_subkind(v)) {
+      case V_BINARY_SHIFT_LL:
+      case V_BINARY_SHIFT_RL:
+      case V_BINARY_SHIFT_LA:
+      case V_BINARY_SHIFT_RA:
+      case V_BINARY_EXP:
+         return vlog_is_signed(vlog_left(v));
+      default:
+         return vlog_is_signed(vlog_left(v)) && vlog_is_signed(vlog_right(v));
+      }
+   case V_COND_EXPR:
       return vlog_is_signed(vlog_left(v)) && vlog_is_signed(vlog_right(v));
+   case V_SYS_FCALL:
+      switch (vlog_subkind(v)) {
+      case V_SYSTF_SIGNED:   return true;
+      case V_SYSTF_UNSIGNED: return false;
+      default:               return false;
+      }
+   case V_MIN_TYP_MAX:
+      return vlog_is_signed(vlog_value(v));
+   case V_DATA_TYPE:
+      switch (vlog_subkind(v)) {
+      case DT_REAL:
+      case DT_REALTIME:
+      case DT_SHORTREAL:
+         return true;   // Operand is converted to real as a signed value
+      default:
+         return !!(vlog_flags(v) & VLOG_F_SIGNED);
+      }
    default:
       return false;
    }
@@ -390,11 +457,15 @@ bool is_implicit_data_type(vlog_node_t v)
 vlog_node_t vlog_longest_static_prefix(vlog_node_t v)
 {
    switch (vlog_kind(v)) {
-   case V_REF:
    case V_HIER_REF:
+      if (!vlog_has_ref(v))
+         return v;
+      // Fall-through
+   case V_REF:
       switch (vlog_kind(vlog_ref(v))) {
       case V_PARAM_DECL:
       case V_LOCALPARAM:
+      case V_LOCAL_DECL:
          return NULL;
       default:
          return v;
@@ -530,6 +601,7 @@ vlog_node_t vlog_get_type(vlog_node_t v)
    case V_TYPE_DECL:
    case V_CLASS_NEW:
    case V_DYNAMIC_NEW:
+   case V_LOCAL_DECL:
       return vlog_get_type(vlog_type(v));
    case V_REF:
    case V_MEMBER_REF:
@@ -541,6 +613,7 @@ vlog_node_t vlog_get_type(vlog_node_t v)
    case V_MOD_INST:
       return NULL;
    case V_NULL:
+   case V_PATTERN_EXPR:
       if (vlog_has_type(v))
          return vlog_type(v);
       else
@@ -561,6 +634,8 @@ vlog_node_t vlog_get_dim(vlog_node_t v, int n)
          switch (vlog_kind(decl)) {
          case V_NET_DECL:
          case V_VAR_DECL:
+         case V_PORT_DECL:
+         case V_LOCAL_DECL:
             {
                const int nunpacked = vlog_ranges(decl);
                assert(n <= vlog_ranges(dt) + nunpacked);
@@ -579,4 +654,34 @@ vlog_node_t vlog_get_dim(vlog_node_t v, int n)
    default:
       CANNOT_HANDLE(v);
    }
+}
+
+tree_t vlog_walk_mod_refs(vlog_node_t v, tree_t where)
+{
+   assert(vlog_kind(v) == V_MOD_REF);
+
+   if (vlog_has_value(v)) {
+      if ((where = vlog_walk_mod_refs(vlog_value(v), where)) == NULL)
+         return NULL;
+   }
+   else if (!vlog_has_ref(v)) {
+      where = tree_container(where);
+      assert(tree_kind(where) == T_ELAB);
+   }
+   else {
+      assert(vlog_kind(vlog_ref(v)) == V_MOD_INST);
+      assert(tree_kind(where) == T_BLOCK);
+   }
+
+   ident_t id = vlog_ident(v);
+
+   const int nstmts = tree_stmts(where);
+   for (int i = 0; i < nstmts; i++) {
+      tree_t s = tree_stmt(where, i);
+      if (tree_kind(s) == T_BLOCK && tree_ident(s) == id)
+         return s;
+   }
+
+   error_at(vlog_loc(v), "cannot find %pQ in hierarchical identifier", id);
+   return NULL;
 }

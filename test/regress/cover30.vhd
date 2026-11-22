@@ -1,64 +1,44 @@
--- Package compiled into other_lib in the shell driver.  Although its
--- name matches the +package *_pkg pattern, the -hierarchy other_lib.*
--- rule in cover30.spec excludes it from the coverage report.
-package util_pkg is
-    function clamp(x, lo, hi : integer) return integer;
-end package;
+library ieee;
+use ieee.std_logic_1164.all;
 
-package body util_pkg is
+entity cover30_sub is
+    port (
+        clk_in  : in  std_logic;
+        clk_out : out std_logic
+    );
+end entity;
 
-    function clamp(x, lo, hi : integer) return integer is
-    begin
-        if x < lo then
-            return lo;
-        elsif x > hi then
-            return hi;
-        else
-            return x;
-        end if;
-    end function;
+architecture rtl of cover30_sub is
+begin
+    clk_out <= clk_in;
+end architecture;
 
-end package body;
-
--------------------------------------------------------------------------------
-
--- Package compiled into the work library: should be covered
--- (+package *_pkg).
-package math_pkg is
-    function abs_diff(a, b : integer) return integer;
-end package;
-
-package body math_pkg is
-
-    function abs_diff(a, b : integer) return integer is
-    begin
-        if a >= b then
-            return a - b;
-        else
-            return b - a;
-        end if;
-    end function;
-
-end package body;
-
--------------------------------------------------------------------------------
-
-library other_lib;
-use other_lib.util_pkg.all;
-
-use work.math_pkg.all;
+library ieee;
+use ieee.std_logic_1164.all;
 
 entity cover30 is
-end cover30;
+end entity;
 
 architecture test of cover30 is
+    signal clk : std_logic := '0';
 begin
+
+    -- Port map requires a runtime signal connection rather than being
+    -- eligible for direct nexus aliasing, which is what previously
+    -- triggered the toggle coverage callback to run before the port
+    -- was wired up to its driver
+    i_sub : entity work.cover30_sub
+        port map (
+            clk_in  => clk,
+            clk_out => open
+        );
+
+    clk <= not clk after 5 ns;
+
     process
-        variable v : integer;
     begin
-        v := abs_diff(10, 3);
-        v := clamp(v, 0, 5);
-        assert v = 5;
-        wait;
+        wait for 25 ns;
+        std.env.finish;
     end process;
+
 end architecture;

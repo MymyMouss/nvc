@@ -1,0 +1,3 @@
+top = t
+stop = 500ns
+std = 2008

@@ -18,6 +18,7 @@ bin_unit_test_SOURCES = \
 	test/test_util.h \
 	test/unit_test.c \
 	test/test_ident.c \
+	test/test_checkmap.c \
 	test/test_lower.c \
 	test/test_parse.c \
 	test/test_lib.c \
@@ -39,7 +40,8 @@ bin_unit_test_SOURCES = \
 	test/test_vlog.c \
 	test/test_mir.h \
 	test/test_mir.c \
-	test/test_cover.c
+	test/test_cover.c \
+	test/test_mcp.c
 
 if ARCH_X86_64
 bin_unit_test_SOURCES += test/test_native.c
@@ -52,6 +54,7 @@ endif
 bin_unit_test_LDADD = \
 	lib/libnvc.a \
 	lib/libthirdparty.a \
+	$(zlib_LIBS) \
 	$(check_LIBS) \
 	$(libdw_LIBS) \
 	$(libffi_LIBS) \

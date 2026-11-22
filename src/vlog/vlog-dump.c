@@ -18,6 +18,7 @@
 #include "util.h"
 #include "common.h"
 #include "object.h"
+#include "printf.h"
 #include "ident.h"
 #include "vlog/vlog-node.h"
 #include "vlog/vlog-number.h"
@@ -51,7 +52,7 @@ static void vlog_dump_address(vlog_node_t v)
 
    char *LOCAL fmt = xasprintf("$!#%d${%%p:%s}$$", color,
                                vlog_kind_str(vlog_kind(v)));
-   color_printf(fmt, v);
+   nvc_printf(fmt, v);
 #endif
 }
 
@@ -98,8 +99,10 @@ static void vlog_dump_module(vlog_node_t v, int indent)
    }
 
    const int nstmts = vlog_stmts(v);
-   for (int i = 0; i < nstmts; i++)
+   for (int i = 0; i < nstmts; i++) {
+      tab(indent + 2);
       vlog_dump(vlog_stmt(v, i), indent + 2);
+   }
 
    print_syntax("#endmodule // %s\n\n", istr(vlog_ident2(v)));
 }
@@ -189,7 +192,7 @@ static void vlog_dump_port_decl(vlog_node_t v, int indent)
    }
 
    vlog_node_t dt = vlog_type(v);
-   if (!is_implicit_data_type(dt)) {
+   if (!is_implicit_data_type(dt) || vlog_ranges(dt) > 0) {
       print_syntax(" ");
       vlog_dump(dt, 0);
    }
@@ -204,9 +207,11 @@ static void vlog_dump_dimensions(vlog_node_t v, int indent)
    for (; dim < ndims; dim++) {
       vlog_node_t d = vlog_range(v, dim);
       print_syntax(" [");
-      vlog_dump(vlog_left(d), indent);
-      print_syntax(":");
-      vlog_dump(vlog_right(d), indent);
+      if (vlog_subkind(d) != V_DIM_UNSIZED) {
+         vlog_dump(vlog_left(d), indent);
+         print_syntax(":");
+         vlog_dump(vlog_right(d), indent);
+      }
       print_syntax("]");
    }
 }
@@ -216,12 +221,22 @@ static void vlog_dump_net_decl(vlog_node_t v, int indent)
    vlog_dump_address(v);
 
    switch (vlog_subkind(v)) {
-   case V_NET_WIRE: print_syntax("#wire "); break;
+   case V_NET_WIRE:  print_syntax("#wire "); break;
+   case V_NET_UWIRE: print_syntax("#uwire "); break;
+   case V_NET_TRI:   print_syntax("#tri "); break;
+   case V_NET_TRI0:  print_syntax("#tri0 "); break;
+   case V_NET_TRI1:  print_syntax("#tri1 "); break;
    }
 
    vlog_dump(vlog_type(v), indent);
    print_syntax(" %s", istr(vlog_ident(v)));
    vlog_dump_dimensions(v, indent);
+
+   if (vlog_has_value(v)) {
+      print_syntax(" = ");
+      vlog_dump(vlog_value(v), indent);
+   }
+
    print_syntax(";\n");
 }
 
@@ -241,10 +256,19 @@ static void vlog_dump_var_decl(vlog_node_t v, int indent)
    print_syntax(";\n");
 }
 
+static void vlog_dump_genvar_decl(vlog_node_t v, int indent)
+{
+   vlog_dump_address(v);
+
+   print_syntax("#genvar ");
+   vlog_dump(vlog_type(v), indent);
+   print_syntax(" %s", istr(vlog_ident(v)));
+
+   print_syntax(";\n");
+}
+
 static void vlog_dump_always(vlog_node_t v, int indent)
 {
-   tab(indent);
-
    switch (vlog_subkind(v)) {
    case V_ALWAYS_FF:    print_syntax("#always_ff "); break;
    case V_ALWAYS_COMB:  print_syntax("#always_comb "); break;
@@ -258,8 +282,6 @@ static void vlog_dump_always(vlog_node_t v, int indent)
 
 static void vlog_dump_initial(vlog_node_t v, int indent)
 {
-   tab(indent);
-
    print_syntax("#initial ");
    vlog_dump(vlog_stmt(v, 0), indent);
    print_syntax("\n");
@@ -267,8 +289,6 @@ static void vlog_dump_initial(vlog_node_t v, int indent)
 
 static void vlog_dump_final(vlog_node_t v, int indent)
 {
-   tab(indent);
-
    print_syntax("#final ");
    vlog_dump(vlog_stmt(v, 0), indent);
    print_syntax("\n");
@@ -358,7 +378,6 @@ static void vlog_dump_bassign(vlog_node_t v, int indent)
 
 static void vlog_dump_assign(vlog_node_t v, int indent)
 {
-   tab(indent);
    print_syntax("#assign ");
    vlog_dump(vlog_target(v), 0);
    print_syntax(" = ");
@@ -482,6 +501,8 @@ static void vlog_dump_binary(vlog_node_t v)
    case V_BINARY_DIVIDE:   print_syntax(" / "); break;
    case V_BINARY_LT:       print_syntax(" < "); break;
    case V_BINARY_GT:       print_syntax(" > "); break;
+   case V_BINARY_LEQ:      print_syntax(" <= "); break;
+   case V_BINARY_GEQ:      print_syntax(" >= "); break;
    case V_BINARY_SHIFT_LL: print_syntax(" << "); break;
    case V_BINARY_SHIFT_RL: print_syntax(" >> "); break;
    case V_BINARY_SHIFT_LA: print_syntax(" <<< "); break;
@@ -515,8 +536,14 @@ static void vlog_dump_postfix(vlog_node_t v)
 static void vlog_dump_dynamic_new(vlog_node_t v)
 {
    print_syntax("new [");
-   vlog_dump(vlog_value(v), 0);
+   vlog_dump(vlog_left(v), 0);
    print_syntax("]");
+
+   if (vlog_has_value(v)) {
+      print_syntax(" (");
+      vlog_dump(vlog_value(v), 0);
+      print_syntax(")");
+   }
 }
 
 static void vlog_dump_prefix(vlog_node_t v)
@@ -550,8 +577,6 @@ static void vlog_dump_delay_control(vlog_node_t v, int indent)
 
 static void vlog_dump_gate_inst(vlog_node_t v, int indent)
 {
-   tab(indent);
-
    switch (vlog_subkind(v)) {
    case V_GATE_PULLUP: print_syntax("#pullup "); break;
    case V_GATE_PULLDOWN: print_syntax("#pulldown "); break;
@@ -590,8 +615,6 @@ static void vlog_dump_mod_inst(vlog_node_t v, int indent)
 
 static void vlog_dump_inst_list(vlog_node_t v, int indent)
 {
-   tab(indent);
-
    print_syntax("%s ", istr(vlog_ident(v)));
 
    const int nparams = vlog_params(v);
@@ -760,6 +783,12 @@ static void vlog_dump_for_loop(vlog_node_t v, int indent)
    vlog_dump_stmt_or_null(v, indent);
 }
 
+static void vlog_dump_for_generate(vlog_node_t v, int indent)
+{
+   vlog_dump_for_loop(v, indent);
+   print_syntax("\n");
+}
+
 static void vlog_dump_case(vlog_node_t v, int indent)
 {
    static const char *suffix[] = { "", "x", "z" };
@@ -861,12 +890,24 @@ static void vlog_dump_ref(vlog_node_t v, int indent)
    print_syntax("%s", istr(vlog_ident(v)));
 }
 
+static void vlog_dump_mod_ref(vlog_node_t v, int indent)
+{
+   if (vlog_has_value(v)) {
+      vlog_dump(vlog_value(v), 0);
+      print_syntax(".");
+   }
+
+   print_syntax("%pi", vlog_ident(v));
+}
+
 static void vlog_dump_hier_ref(vlog_node_t v, int indent)
 {
    if (vlog_has_ref(v))
       vlog_dump_address(vlog_ref(v));
 
-   print_syntax("%s.%s", istr(vlog_ident2(v)), istr(vlog_ident(v)));
+   vlog_dump(vlog_value(v), 0);
+
+   print_syntax(".%s", istr(vlog_ident(v)));
 }
 
 static void vlog_dump_task_decl(vlog_node_t v, int indent)
@@ -888,7 +929,15 @@ static void vlog_dump_task_decl(vlog_node_t v, int indent)
 
 static void vlog_dump_func_decl(vlog_node_t v, int indent)
 {
-   print_syntax("#function %s;", istr(vlog_ident(v)));
+   print_syntax("#function");
+
+   vlog_node_t dt = vlog_type(v);
+   if (!is_implicit_data_type(dt) || vlog_ranges(dt) > 0) {
+      print_syntax(" ");
+      vlog_dump(dt, 0);
+   }
+
+   print_syntax(" %s;", istr(vlog_ident(v)));
 
    if (vlog_has_ident2(v))
       print_syntax(" -- %s.%s", istr(vlog_ident2(v)), istr(vlog_ident(v)));
@@ -978,6 +1027,84 @@ static void vlog_dump_port_map(vlog_node_t v)
    print_syntax(" to %pi\n", vlog_ident(vlog_ref(v)));
 }
 
+static void vlog_dump_type_decl(vlog_node_t v, int indent)
+{
+   print_syntax("#typedef ");
+   vlog_dump(vlog_type(v), indent);
+   print_syntax(" %pi;\n", vlog_ident(v));
+}
+
+static void vlog_dump_specify(vlog_node_t v, int indent)
+{
+   print_syntax("#specify\n");
+   int n_stmts = vlog_stmts(v);
+
+   for (int i = 0; i < n_stmts; i++) {
+      tab(indent + 2);
+      vlog_dump(vlog_stmt(v, i), indent + 2);
+   }
+
+   tab(indent);
+   print_syntax("#endspecify\n");
+}
+
+static void vlog_dump_tcheck(vlog_node_t v)
+{
+   vlog_tcheck_kind_t tkind = vlog_subkind(v);
+
+   switch (tkind) {
+   case V_TCHECK_SETUP:
+      print_syntax("$setup(");
+      break;
+   case V_TCHECK_HOLD:
+      print_syntax("$hold(");
+      break;
+   default:
+      should_not_reach_here();
+   }
+
+   int n_params = vlog_params(v);
+   for (int i = 0; i < n_params; i++) {
+      vlog_dump(vlog_param(v, i), 0);
+      if (i < n_params - 1)
+         print_syntax(", ");
+   }
+
+   print_syntax(");\n");
+}
+
+static void vlog_dump_tcheck_event(vlog_node_t v)
+{
+   vlog_node_t ev = vlog_param(v, 0);
+   vlog_node_t sig = ev;
+
+   if (vlog_kind(ev) == V_EVENT) {
+      v_event_kind_t kind = vlog_subkind(ev);
+
+      switch (kind) {
+      case V_EVENT_EDGE:
+         print_syntax("#edge ");
+         break;
+      case V_EVENT_NEGEDGE:
+         print_syntax("#negedge ");
+         break;
+      case V_EVENT_POSEDGE:
+         print_syntax("#posedge ");
+         break;
+      default:
+         break;
+      }
+      sig = vlog_value(ev);
+   }
+
+   vlog_dump(sig, 0);
+
+   if (vlog_params(v) > 1) {
+      print_syntax(" &&& ");
+      vlog_dump(vlog_param(v, 1), 0);
+   }
+}
+
 void vlog_dump(vlog_node_t v, int indent)
 {
    switch (vlog_kind(v)) {
@@ -993,6 +1120,9 @@ void vlog_dump(vlog_node_t v, int indent)
    case V_REF:
       vlog_dump_ref(v, indent);
       break;
+   case V_MOD_REF:
+      vlog_dump_mod_ref(v, indent);
+      break;
    case V_HIER_REF:
       vlog_dump_hier_ref(v, indent);
       break;
@@ -1004,7 +1134,11 @@ void vlog_dump(vlog_node_t v, int indent)
       vlog_dump_net_decl(v, indent);
       break;
    case V_VAR_DECL:
+   case V_LOCAL_DECL:
       vlog_dump_var_decl(v, indent);
+      break;
+   case V_GENVAR_DECL:
+      vlog_dump_genvar_decl(v, indent);
       break;
    case V_ALWAYS:
       vlog_dump_always(v, indent);
@@ -1033,7 +1167,8 @@ void vlog_dump(vlog_node_t v, int indent)
    case V_ASSIGN:
       vlog_dump_assign(v, indent);
       break;
-   case V_BLOCK:
+   case V_SEQ_BLOCK:
+   case V_GEN_BLOCK:
       vlog_dump_block(v, indent);
       break;
    case V_SYS_TCALL:
@@ -1117,6 +1252,9 @@ void vlog_dump(vlog_node_t v, int indent)
    case V_FOR_LOOP:
       vlog_dump_for_loop(v, indent);
       break;
+   case V_FOR_GENERATE:
+      vlog_dump_for_generate(v, indent);
+      break;
    case V_FOR_INIT:
       vlog_dump_for_init(v, indent);
       break;
@@ -1166,6 +1304,18 @@ void vlog_dump(vlog_node_t v, int indent)
       break;
    case V_PORT_MAP:
       vlog_dump_port_map(v);
+      break;
+   case V_TYPE_DECL:
+      vlog_dump_type_decl(v, indent);
+      break;
+   case V_SPECIFY:
+      vlog_dump_specify(v, indent);
+      break;
+   case V_TCHECK:
+      vlog_dump_tcheck(v);
+      break;
+   case V_TCHECK_EVENT:
+      vlog_dump_tcheck_event(v);
       break;
    default:
       print_syntax("\n");

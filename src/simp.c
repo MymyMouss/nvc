@@ -120,6 +120,8 @@ static tree_t simp_call_args(tree_t t)
 
                if (name_kind == T_RECORD_REF)
                   tree_set_name(a, make_ref(tree_ref(name)));
+               else if (name_kind == T_ARRAY_SLICE)
+                  tree_set_name(a, tree_value(name));
                else
                   tree_set_name(a, tree_value(tree_param(name, 0)));
 
@@ -1476,18 +1478,16 @@ static tree_t simp_literal(tree_t t)
          if (dval != 0) {
             const double result = round(dval * base);
             if (result < (double)INT64_MIN || result > (double)INT64_MAX)
-               error_at(tree_loc(t), "physical literal %g %s exceeds "
-                        "range of type %s", dval, istr(tree_ident(decl)),
-                        type_pp(type));
+               error_at(tree_loc(t), "physical literal %g %pI exceeds "
+                        "range of type %pT", dval, tree_ident(decl), type);
             else
                tree_set_ival(t, (int64_t)result);
          }
          else {
             int64_t ival = tree_ival(t), result;
             if (__builtin_mul_overflow(ival, base, &result))
-               error_at(tree_loc(t), "physical literal %"PRIi64" %s exceeds "
-                        "range of type %s", ival, istr(tree_ident(decl)),
-                        type_pp(type));
+               error_at(tree_loc(t), "physical literal %"PRIi64" %pI exceeds "
+                        "range of type %pT", ival, tree_ident(decl), type);
             else
                tree_set_ival(t, result);
          }
@@ -1599,6 +1599,24 @@ static tree_t simp_aggregate(tree_t t)
       if (sub != NULL)
          tree_set_type(t, sub);
    }
+
+   return t;
+}
+
+static tree_t simp_const_decl(tree_t t, simp_ctx_t *ctx)
+{
+   if (!(tree_flags(t) & TREE_F_LOCALLY_STATIC))
+      return t;
+
+   tree_t value = tree_value(t);
+   if (!type_is_scalar(tree_type(value)))
+      return t;
+   else if (!eval_possible(value, ctx->registry, ctx->mir))
+      return t;
+
+   tree_t new = eval_try_fold(ctx->jit, value, ctx->registry, NULL, NULL);
+   if (new != t)
+      tree_set_value(t, new);
 
    return t;
 }
@@ -1810,6 +1828,8 @@ static tree_t simp_tree_local(tree_t t, void *_ctx)
       return t;
    case T_AGGREGATE:
       return simp_aggregate(t);
+   case T_CONST_DECL:
+      return simp_const_decl(t, ctx);
    default:
       return t;
    }

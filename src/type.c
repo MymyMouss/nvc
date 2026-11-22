@@ -20,6 +20,7 @@
 #include "util.h"
 #include "common.h"
 #include "object.h"
+#include "printf.h"
 #include "hash.h"
 
 #include <assert.h>
@@ -557,22 +558,7 @@ void type_set_designated(type_t t, type_t d)
    object_write_barrier(&(t->object), &(d->object));
 }
 
-void type_signature(type_t t, text_buf_t *tb)
-{
-   assert(t->object.kind == T_SIGNATURE);
-
-   tb_printf(tb, "[");
-   const int nparams = type_params(t);
-   for (int i = 0; i < nparams; i++)
-      tb_printf(tb, "%s%s", (i == 0 ? "" : ", "),
-                type_pp(type_param(t, i)));
-   type_t r = type_result_or_null(t);
-   if (r != NULL)
-      tb_printf(tb, "%sreturn %s", nparams > 0 ? " " : "", type_pp(r));
-   tb_printf(tb, "]");
-}
-
-const char *type_pp2(type_t t, type_t other)
+const char *type_pp(type_t t)
 {
    assert(t != NULL);
 
@@ -583,19 +569,13 @@ const char *type_pp2(type_t t, type_t other)
          if (cache == NULL)
             cache = hash_new(64);
 
-         text_buf_t *tb = hash_get(cache, t);
-         if (tb == NULL) {
-            tb = tb_new();
-            hash_put(cache, t, tb);
-
-            if (type_has_ident(t)) {
-               tb_istr(tb, type_ident(t));
-               tb_append(tb, ' ');
-            }
-            type_signature(t, tb);
+         char *str = hash_get(cache, t);
+         if (str == NULL) {
+            str = nvc_asprintf("%pT", t);
+            hash_put(cache, t, str);
          }
 
-         return tb_get(tb);
+         return str;
       }
 
    case T_GENERIC:
@@ -607,27 +587,9 @@ const char *type_pp2(type_t t, type_t other)
       {
          const char *full1 = istr(type_ident(t));
          const char *dot1  = strrchr(full1, '.');
-         const char *tail1 = dot1 ? dot1 + 1 : full1;
-
-         if (other == NULL)
-            return tail1;
-
-         item_t *item = lookup_item(&type_object, other, I_IDENT);
-         if (item->ident == NULL)
-            return tail1;
-
-         const char *full2 = istr(item->ident);
-         const char *dot2  = strrchr(full2, '.');
-         const char *tail2 = dot2 ? dot2 + 1 : full2;
-
-         return strcmp(tail1, tail2) ? tail1 : full1;
+         return dot1 ? dot1 + 1 : full1;
       }
    }
-}
-
-const char *type_pp(type_t t)
-{
-   return type_pp2(t, NULL);
 }
 
 type_kind_t type_base_kind(type_t t)
@@ -977,7 +939,7 @@ unsigned type_width(type_t type)
       return w * elem_w;
    }
    else {
-      type_is_scalar(type);
+      assert(type_is_scalar(type));
       return 1;
    }
 }
@@ -1040,26 +1002,21 @@ int type_bit_width(type_t type)
    case T_INTEGER:
    case T_PHYSICAL:
       {
-         tree_t r = range_of(type, 0);
-         return bits_for_range(assume_int(tree_left(r)),
-                               assume_int(tree_right(r)));
+         int64_t low, high;
+         range_bounds(range_of(type, 0), &low, &high);
+         return bits_for_range(low, high);
       }
-
    case T_REAL:
        // All real types are doubles at the moment
        return 64;
-
    case T_SUBTYPE:
       return type_bit_width(type_base(type));
-
    case T_ENUM:
       return bits_for_range(0, type_enum_literals(type) - 1);
-
    case T_ARRAY:
       return type_bit_width(type_elem(type));
-
    default:
-      fatal_trace("unhandled type %s in type_bit_width", type_pp(type));
+      fatal_trace("unhandled type %pT in type_bit_width", type);
    }
 }
 

@@ -20,6 +20,7 @@
 
 #include "prim.h"
 #include "array.h"
+#include "cov/cov-api.h"
 #include "mir/mir-unit.h"
 
 typedef int32_t vcode_reg_t;
@@ -46,20 +47,21 @@ typedef struct _lower_unit {
    var_list_t       free_temps;
    vcode_unit_t     vunit;
    cover_data_t    *cover;
-   cover_scope_t   *cscope;
+   cover_obj_t      cscope;
    bool             finished;
    lower_mode_t     mode;
    unsigned         deferred;
 } lower_unit_t;
 
 unit_registry_t *unit_registry_new(mir_context_t *mc);
-void unit_registry_set_cover(unit_registry_t *ur, cover_data_t *cover);
 void unit_registry_free(unit_registry_t *ur);
+void unit_registry_set_cover(unit_registry_t *ur, cover_data_t *cover);
 vcode_unit_t unit_registry_get(unit_registry_t *ur, ident_t ident);
 void unit_registry_put(unit_registry_t *ur, lower_unit_t *lu);
 void unit_registry_defer(unit_registry_t *ur, ident_t ident,
                          lower_unit_t *parent, emit_fn_t emit_fn,
-                         lower_fn_t fn, object_t *object);
+                         lower_fn_t fn, cover_data_t *cover,
+                         object_t *object);
 void unit_registry_defer2(unit_registry_t *ur, ident_t name,
                           lower_unit_t *parent, mir_unit_kind_t kind,
                           mir_lower_fn_t fn, object_t *object);
@@ -82,7 +84,7 @@ vcode_type_t lower_type(type_t type);
 vcode_stamp_t lower_bounds(type_t type);
 
 lower_unit_t *lower_instance(unit_registry_t *ur, lower_unit_t *parent,
-                             cover_data_t *cover, cover_scope_t *cs,
+                             cover_data_t *cover, cover_obj_t cscope,
                              tree_t block);
 vcode_unit_t lower_global_thunk(unit_registry_t *registry, tree_t t);
 vcode_unit_t lower_thunk_in_context(unit_registry_t *registry, tree_t t,

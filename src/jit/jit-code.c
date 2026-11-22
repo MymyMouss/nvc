@@ -26,6 +26,7 @@
 #include "thread.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,6 +70,47 @@
 
 #ifndef SHT_X86_64_UNWIND
 #define SHT_X86_64_UNWIND 0x70000001
+#endif
+
+#ifndef R_PPC64_REL24
+#define R_PPC64_REL24 10
+#endif
+
+#ifndef R_PPC64_REL32
+#define R_PPC64_REL32 26
+#endif
+
+#ifndef R_PPC64_ADDR64
+#define R_PPC64_ADDR64 38
+#endif
+
+#ifndef R_PPC64_TOC16_LO
+#define R_PPC64_TOC16_LO 48
+#endif
+
+#ifndef R_PPC64_TOC16_HA
+#define R_PPC64_TOC16_HA 50
+#endif
+
+#ifndef R_PPC64_TOC16_DS
+#define R_PPC64_TOC16_DS 63
+#endif
+
+#ifndef R_PPC64_TOC16_LO_DS
+#define R_PPC64_TOC16_LO_DS 64
+#endif
+
+#ifndef R_PPC64_REL16_LO
+#define R_PPC64_REL16_LO 250
+#endif
+
+#ifndef R_PPC64_REL16_HA
+#define R_PPC64_REL16_HA 252
+#endif
+
+#ifndef PPC64_LOCAL_ENTRY_OFFSET
+#define PPC64_LOCAL_ENTRY_OFFSET(other) \
+   (((1 << (((other) & 0xe0) >> 5)) >> 2) << 2)
 #endif
 
 #ifndef IMAGE_REL_ARM64_BRANCH26
@@ -270,6 +312,14 @@ code_cache_t *code_cache_new(void)
 #elif defined ARCH_ARM64
    if (cs_open(CS_ARCH_ARM64, CS_MODE_ARM, &(code->capstone)) != CS_ERR_OK)
       fatal_trace("failed to init capstone for Arm64");
+#elif defined ARCH_PPC64 && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+   if (cs_open(CS_ARCH_PPC, CS_MODE_64 | CS_MODE_BIG_ENDIAN,
+               &(code->capstone)) != CS_ERR_OK)
+      fatal_trace("failed to init capstone for PowerPC64");
+#elif defined ARCH_PPC64
+   if (cs_open(CS_ARCH_PPC, CS_MODE_64 | CS_MODE_LITTLE_ENDIAN,
+               &(code->capstone)) != CS_ERR_OK)
+      fatal_trace("failed to init capstone for PowerPC64");
 #else
 #error Cannot configure capstone for this architecture
 #endif
@@ -281,21 +331,25 @@ code_cache_t *code_cache_new(void)
    shash_t *s = shash_new(32);
 
    extern void __nvc_putpriv(jit_handle_t, void *);
-   extern void __nvc_sched_waveform(jit_anchor_t *, jit_scalar_t *, tlab_t *);
-   extern void __nvc_sched_process(jit_anchor_t *, jit_scalar_t *, tlab_t *);
    extern void __nvc_test_event(jit_anchor_t *, jit_scalar_t *, tlab_t *);
    extern void __nvc_last_event(jit_anchor_t *, jit_scalar_t *, tlab_t *);
 
-   shash_put(s, "__nvc_sched_waveform", &__nvc_sched_waveform);
-   shash_put(s, "__nvc_sched_process", &__nvc_sched_process);
-   shash_put(s, "__nvc_test_event", &__nvc_test_event);
-   shash_put(s, "__nvc_last_event", &__nvc_last_event);
-   shash_put(s, "__nvc_mspace_alloc", &__nvc_mspace_alloc);
-   shash_put(s, "__nvc_putpriv", &__nvc_putpriv);
-   shash_put(s, "__nvc_do_exit", &__nvc_do_exit);
-   shash_put(s, "__nvc_pack", &__nvc_pack);
-   shash_put(s, "__nvc_unpack", &__nvc_unpack);
-   shash_put(s, "__nvc_vec4op", &__nvc_vec4op);
+   shash_put(s, "nvc.sched_waveform", &fast_sched_waveform);
+   shash_put(s, "nvc.sched_waveform_s0", &fast_sched_waveform_s0);
+   shash_put(s, "nvc.sched_waveform_0", &fast_sched_waveform_0);
+   shash_put(s, "nvc.sched_process", &fast_sched_process);
+   shash_put(s, "nvc.test_event", &__nvc_test_event);
+   shash_put(s, "nvc.last_event", &__nvc_last_event);
+   shash_put(s, "nvc.mspace_alloc", &__nvc_mspace_alloc);
+   shash_put(s, "nvc.putpriv", &__nvc_putpriv);
+   shash_put(s, "nvc.do_exit", &__nvc_do_exit);
+   shash_put(s, "nvc.pack", &__nvc_pack);
+   shash_put(s, "nvc.unpack", &__nvc_unpack);
+   shash_put(s, "nvc.vec4op", &__nvc_vec4op);
+   shash_put(s, "nvc.drive_signal", &fast_drive_signal);
+   shash_put(s, "nvc.sched_event", &fast_sched_event);
+   shash_put(s, "nvc.length_fail", &fast_length_fail);
+   shash_put(s, "nvc.index_fail", &fast_index_fail);
    shash_put(s, "memmove", &memmove);
    shash_put(s, "memcpy", &memcpy);
    shash_put(s, "memset", &memset);
@@ -441,7 +495,7 @@ static void code_disassemble(code_span_t *span, uintptr_t mark,
             col = printf("\n%15s -%-16s", "", hex1 + 16) - 1;
       }
       else {
-#ifdef ARCH_ARM64
+#if defined ARCH_ARM64 || defined ARCH_PPC64
          col = printf("%-12" PRIx64 " %-16.08x %s 0x%08x", (uint64_t)ptr,
                       *(uint32_t *)ptr, ".word", *(uint32_t *)ptr);
          ptr += 4;
@@ -492,7 +546,7 @@ static void code_write_perf_map(code_span_t *span)
    if (span->owner->perfmap == NULL) {
       char *fname LOCAL = xasprintf("/tmp/perf-%d.map", getpid());
       if ((span->owner->perfmap = fopen(fname, "w")) == NULL) {
-         warnf("cannot create %s: %s", fname, last_os_error());
+         warnf("cannot create %s: %s", fname, strerror(errno));
          opt_set_int(OPT_PERF_MAP, 0);
          return;
       }
@@ -852,19 +906,33 @@ static void *code_emit_trampoline(code_blob_t *blob, void *dest)
       0x00, 0x02, 0x1f, 0xd6,   // BR X16
       __IMM64((uintptr_t)dest)
    };
+#elif defined ARCH_PPC64
+   // ELFv2 call stub: save the caller's TOC pointer then jump to the
+   // destination with R12 set to its global entry point
+   const uint64_t addr = (uintptr_t)dest;
+   const uint32_t veneer[] = {
+      0xf8410018,                              // STD R2, 24(R1)
+      0x3d800000 | ((addr >> 48) & 0xffff),    // LIS R12, addr@highest
+      0x618c0000 | ((addr >> 32) & 0xffff),    // ORI R12, R12, addr@higher
+      0x798c07c6,                              // SLDI R12, R12, 32
+      0x658c0000 | ((addr >> 16) & 0xffff),    // ORIS R12, R12, addr@h
+      0x618c0000 | (addr & 0xffff),            // ORI R12, R12, addr@l
+      0x7d8903a6,                              // MTCTR R12
+      0x4e800420,                              // BCTR
+   };
 #else
    should_not_reach_here();
 #endif
 
    void *prev = memmem(blob->veneers, blob->wptr - blob->veneers,
-                       veneer, ARRAY_LEN(veneer));
+                       veneer, sizeof(veneer));
    if (prev != NULL)
       return prev;
    else {
       DEBUG_ONLY(code_blob_printf(blob, "Trampoline for %p", dest));
 
       void *addr = blob->wptr;
-      code_blob_emit(blob, veneer, ARRAY_LEN(veneer));
+      code_blob_emit(blob, (const uint8_t *)veneer, sizeof(veneer));
       return addr;
    }
 }
@@ -1011,7 +1079,7 @@ static void code_load_pe(code_blob_t *blob, const void *data, size_t size)
 
          // TODO: we should also call RtlDeleteFunctionTable at some point
          if (!RtlAddFunctionTable(load_addr[i], count, base))
-            fatal_trace("RtlAddFunctionTable failed: %s", last_os_error());
+            fatal_win32("RtlAddFunctionTable");
       }
    }
 
@@ -1206,6 +1274,12 @@ static void code_load_elf(code_blob_t *blob, const void *data, size_t size)
 
    void **load_addr LOCAL = xcalloc_array(ehdr->e_shnum, sizeof(void *));
 
+#ifdef ARCH_PPC64
+   // The TOC pointer is biased by 0x8000 so that the whole range of a
+   // signed 16-bit offset can be used from it
+   void *toc = blob->span->base + 0x8000;
+#endif
+
    for (int i = 0; i < ehdr->e_shnum; i++) {
       const Elf64_Shdr *shdr = data + ehdr->e_shoff + i * ehdr->e_shentsize;
 
@@ -1215,6 +1289,10 @@ static void code_load_elf(code_blob_t *blob, const void *data, size_t size)
             code_blob_align(blob, shdr->sh_addralign);
             load_addr[i] = blob->wptr;
             DEBUG_ONLY(code_blob_printf(blob, "%s", strtab + shdr->sh_name));
+#ifdef ARCH_PPC64
+            if (strcmp(strtab + shdr->sh_name, ".toc") == 0)
+               toc = blob->wptr + 0x8000;
+#endif
             code_blob_emit(blob, data + shdr->sh_offset, shdr->sh_size);
          }
          break;
@@ -1287,10 +1365,14 @@ static void code_load_elf(code_blob_t *blob, const void *data, size_t size)
          switch (ELF64_ST_TYPE(sym->st_info)) {
          case STT_NOTYPE:
          case STT_FUNC:
-            if (sym->st_shndx == 0)
-               ptr = shash_get(external, strtab + sym->st_name);
-            else
+            if (sym->st_shndx != 0)
                ptr = load_addr[sym->st_shndx] + sym->st_value;
+#ifdef ARCH_PPC64
+            else if (strcmp(strtab + sym->st_name, ".TOC.") == 0)
+               ptr = toc;
+#endif
+            else
+               ptr = shash_get(external, strtab + sym->st_name);
             break;
          case STT_SECTION:
             ptr = load_addr[sym->st_shndx];
@@ -1368,6 +1450,104 @@ static void code_load_elf(code_blob_t *blob, const void *data, size_t size)
             *(uint32_t *)patch |=
                ((((uintptr_t)ptr + r->r_addend) >> 48) & 0xffff) << 5;
             break;
+#ifdef ARCH_PPC64
+         case R_PPC64_ADDR64:
+            debug_reloc(blob, patch, "R_PPC64_ADDR64 %s",
+                        strtab + sym->st_name);
+            *(uint64_t *)patch = (uint64_t)ptr + r->r_addend;
+            break;
+         case R_PPC64_REL32:
+            {
+               const ptrdiff_t pcrel = ptr + r->r_addend - patch;
+               debug_reloc(blob, patch, "R_PPC64_REL32 %s PC%+"PRIiPTR,
+                           strtab + sym->st_name, pcrel);
+               assert(pcrel >= INT32_MIN && pcrel <= INT32_MAX);
+               *(uint32_t *)patch = pcrel;
+            }
+            break;
+         case R_PPC64_REL24:
+            {
+               void *target;
+               if (sym->st_shndx == 0) {
+                  // Calls outside this object go through a stub that
+                  // saves the TOC pointer and the NOP following the
+                  // call is replaced with a load that restores it
+                  target = code_emit_trampoline(blob, ptr);
+
+                  uint32_t *next = (uint32_t *)patch + 1;
+                  if (*next != 0x60000000)
+                     fatal_trace("expected NOP after call to %s",
+                                 strtab + sym->st_name);
+                  *next = 0xe8410018;   // LD R2, 24(R1)
+               }
+               else
+                  target = ptr + PPC64_LOCAL_ENTRY_OFFSET(sym->st_other);
+
+               const ptrdiff_t pcrel = target + r->r_addend - patch;
+               debug_reloc(blob, patch, "R_PPC64_REL24 %s PC%+"PRIiPTR,
+                           strtab + sym->st_name, pcrel);
+               assert(pcrel >= -(1 << 25) && pcrel < (1 << 25));
+               assert((pcrel & 3) == 0);
+               *(uint32_t *)patch &= ~0x03fffffc;
+               *(uint32_t *)patch |= pcrel & 0x03fffffc;
+            }
+            break;
+         case R_PPC64_TOC16_HA:
+            {
+               const ptrdiff_t off = ptr + r->r_addend - toc;
+               debug_reloc(blob, patch, "R_PPC64_TOC16_HA %s TOC%+"PRIiPTR,
+                           strtab + sym->st_name, off);
+               assert(off >= INT32_MIN && off <= INT32_MAX);
+               *(uint16_t *)patch = (off + 0x8000) >> 16;
+            }
+            break;
+         case R_PPC64_TOC16_LO:
+            {
+               const ptrdiff_t off = ptr + r->r_addend - toc;
+               debug_reloc(blob, patch, "R_PPC64_TOC16_LO %s TOC%+"PRIiPTR,
+                           strtab + sym->st_name, off);
+               *(uint16_t *)patch = off & 0xffff;
+            }
+            break;
+         case R_PPC64_TOC16_DS:
+            {
+               const ptrdiff_t off = ptr + r->r_addend - toc;
+               debug_reloc(blob, patch, "R_PPC64_TOC16_DS %s TOC%+"PRIiPTR,
+                           strtab + sym->st_name, off);
+               assert(off >= INT16_MIN && off <= INT16_MAX);
+               assert((off & 3) == 0);
+               *(uint16_t *)patch &= 0x3;
+               *(uint16_t *)patch |= off & 0xfffc;
+            }
+            break;
+         case R_PPC64_TOC16_LO_DS:
+            {
+               const ptrdiff_t off = ptr + r->r_addend - toc;
+               debug_reloc(blob, patch, "R_PPC64_TOC16_LO_DS %s TOC%+"PRIiPTR,
+                           strtab + sym->st_name, off);
+               assert((off & 3) == 0);
+               *(uint16_t *)patch &= 0x3;
+               *(uint16_t *)patch |= off & 0xfffc;
+            }
+            break;
+         case R_PPC64_REL16_HA:
+            {
+               const ptrdiff_t pcrel = ptr + r->r_addend - patch;
+               debug_reloc(blob, patch, "R_PPC64_REL16_HA %s PC%+"PRIiPTR,
+                           strtab + sym->st_name, pcrel);
+               assert(pcrel >= INT32_MIN && pcrel <= INT32_MAX);
+               *(uint16_t *)patch = (pcrel + 0x8000) >> 16;
+            }
+            break;
+         case R_PPC64_REL16_LO:
+            {
+               const ptrdiff_t pcrel = ptr + r->r_addend - patch;
+               debug_reloc(blob, patch, "R_PPC64_REL16_LO %s PC%+"PRIiPTR,
+                           strtab + sym->st_name, pcrel);
+               *(uint16_t *)patch = pcrel & 0xffff;
+            }
+            break;
+#endif
          default:
             blob->span->size = blob->wptr - blob->span->base;
             code_disassemble(blob->span, (uintptr_t)patch, NULL);

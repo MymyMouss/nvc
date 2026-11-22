@@ -19,7 +19,7 @@
 #define _RT_MODEL_H
 
 #include "prim.h"
-#include "rt/rt.h"
+#include "rt/defs.h"
 
 typedef enum {
    WATCH_EVENT,
@@ -44,6 +44,16 @@ void model_free(rt_model_t *m);
 void model_reset(rt_model_t *m);
 void model_run(rt_model_t *m, uint64_t stop_time);
 bool model_step(rt_model_t *m);
+
+// Piecewise alternative to model_run: call model_start once, then
+// model_run_cycles as many times as needed, then model_end
+void model_start(rt_model_t *m);
+bool model_run_cycles(rt_model_t *m, uint64_t stop_time, unsigned max_cycles,
+                      const bool *halt);
+void model_end(rt_model_t *m);
+bool model_is_terminated(rt_model_t *m);   // Stopped by an error or abort
+bool model_is_finished(rt_model_t *m);     // No events remain
+bool model_at_step_end(rt_model_t *m);     // Between time steps: can be saved
 bool model_can_create_delta(rt_model_t *m);
 int64_t model_now(rt_model_t *m, unsigned *deltas);
 int64_t model_next_time(rt_model_t *m);
@@ -57,8 +67,8 @@ void watch_free(rt_model_t *m, rt_watch_t *w);
 
 void model_set_phase_cb(rt_model_t *m, model_phase_t phase, rt_event_fn_t fn,
                         void *user);
-rt_watch_t *model_set_event_cb(rt_model_t *m, rt_signal_t *s, int offset,
-                               int count, rt_watch_t *w);
+void model_set_event_cb(rt_model_t *m, rt_signal_t *s, int offset, int count,
+                        rt_watch_t *w);
 void model_set_timeout_cb(rt_model_t *m, uint64_t when, rt_event_fn_t fn,
                           void *user);
 
@@ -87,14 +97,24 @@ const void *signal_last_value(rt_signal_t *s);
 uint8_t signal_size(rt_signal_t *s);
 uint32_t signal_width(rt_signal_t *s);
 size_t signal_expand(rt_signal_t *s, uint64_t *buf, size_t max);
+void sched_force(rt_model_t *m, rt_signal_t *s, const void *values,
+                 int offset, size_t count);
+void sched_release(rt_model_t *m, rt_signal_t *s, int offset, size_t count);
 void force_signal(rt_model_t *m, rt_signal_t *s, const void *values,
                   int offset, size_t count);
-void release_signal(rt_model_t *m, rt_signal_t *s, int offset, size_t count);
+void release_signal(rt_model_t *m, rt_signal_t *s, int offset, size_t count,
+                    release_mode_t mode);
 void deposit_signal(rt_model_t *m, rt_signal_t *s, const void *values,
                     int offset, size_t count);
 void sched_deposit(rt_model_t *m, rt_signal_t *s, const void *values,
                    int offset, size_t count, int64_t after, bool nonblock);
 rt_watch_t *find_watch(rt_nexus_t *n, sig_event_fn_t fn);
 void get_forcing_value(rt_signal_t *s, uint8_t *value);
+
+void _std_standard_init(void);
+void _std_env_init(void);
+void _std_reflection_init(void);
+void _file_io_init(void);
+void _nvc_sim_pkg_init(void);
 
 #endif  // _RT_MODEL_H

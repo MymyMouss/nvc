@@ -59,6 +59,10 @@ void vhpi16_startup(void);
 void vhpi17_startup(void);
 void vhpi18_startup(void);
 void vhpi19_startup(void);
+void vhpi21_startup(void);
+void vhpi23_startup(void);
+void vhpi24_startup(void);
+void vhpi25_startup(void);
 void issue744_startup(void);
 void issue762_startup(void);
 void issue978_startup(void);
@@ -76,5 +80,9 @@ void issue1428_startup(void);
 void issue1463_startup(void);
 void issue1473_startup(void);
 void issue1505_startup(void);
+void issue1579_startup(void);
+void vhpi26_startup(void);
+void issue1616_startup(void);
+void issue1621_startup(void);
 
 #endif  // _VHPI_TEST_H

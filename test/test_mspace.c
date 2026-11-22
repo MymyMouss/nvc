@@ -1,5 +1,5 @@
 //
-//  Copyright (C) 2022  Nick Gasson
+//  Copyright (C) 2022-2026  Nick Gasson
 //
 //  This program is free software: you can redistribute it and/or modify
 //  it under the terms of the GNU General Public License as published by
@@ -16,13 +16,15 @@
 //
 
 #include "test_util.h"
+#include "jit/jit.h"
+#include "option.h"
 #include "rt/mspace.h"
 
 #include <stdlib.h>
 
 START_TEST(test_sanity)
 {
-   mspace_t *m = mspace_new(1024);
+   mspace_t *m = mspace_new(1024, NULL);
 
    int *ptr1 = mspace_alloc(m, sizeof(int));
    ck_assert_ptr_nonnull(ptr1);
@@ -82,7 +84,7 @@ static void generate_garbage(mspace_t *m, int count, size_t size)
 
 START_TEST(test_indirect)
 {
-   mspace_t *m = mspace_new(1024);
+   mspace_t *m = mspace_new(1024, NULL);
 
    // Do a few dummy allocations to ensure the pointer is not in the
    // first line which is often kept alive by stack pointers to m->space
@@ -101,7 +103,7 @@ END_TEST
 
 START_TEST(test_mptr)
 {
-   mspace_t *m = mspace_new(1024);
+   mspace_t *m = mspace_new(1024, NULL);
 
    // Do a few dummy allocations to ensure the pointer is not in the
    // first line which is often kept alive by stack pointers to m->space
@@ -125,7 +127,7 @@ END_TEST
 
 START_TEST(test_large)
 {
-   mspace_t *m = mspace_new(5 * 1024);
+   mspace_t *m = mspace_new(5 * 1024, NULL);
 
    // Do a few dummy allocations to ensure the pointer is not in the
    // first line which is often kept alive by stack pointers to m->space
@@ -147,7 +149,7 @@ END_TEST
 
 START_TEST(test_interior)
 {
-   mspace_t *m = mspace_new(5 * 1024);
+   mspace_t *m = mspace_new(5 * 1024, NULL);
 
    // Do a few dummy allocations to ensure the pointer is not in the
    // first line which is often kept alive by stack pointers to m->space
@@ -170,15 +172,20 @@ END_TEST
 
 static size_t oom_sz = 0;
 
-static void test_oom_cb(mspace_t *m, size_t size)
+static void test_oom_cb(mspace_t *m, size_t size, void *ctx)
 {
    oom_sz = size;
+   ck_assert_ptr_eq(ctx, (void *)0xdeadbeef);
 }
 
 START_TEST(test_oom)
 {
-   mspace_t *m = mspace_new(1024);
-   mspace_set_oom_handler(m, test_oom_cb);
+   const mspace_handler_t handler = {
+      .oom = test_oom_cb,
+      .context = (void *)0xdeadbeef,
+   };
+
+   mspace_t *m = mspace_new(1024, &handler);
 
    void *p = mspace_alloc(m, 1000000);
    ck_assert_ptr_null(p);
@@ -195,7 +202,7 @@ START_TEST(test_linked_list)
       int value;
    };
 
-   mspace_t *m = mspace_new(4096);
+   mspace_t *m = mspace_new(4096, NULL);
 
    struct list *head = NULL, **tailp = &head;
 
@@ -234,16 +241,18 @@ static void put_value(mspace_t *m, int **ptr, int value)
 
 START_TEST(test_tlab)
 {
-   mspace_t *m = mspace_new(2 * TLAB_SIZE);
+   opt_set_size(OPT_HEAP_SIZE, 2 * TLAB_SIZE);
 
-   tlab_t *t = tlab_acquire(m);
+   jit_t *j = jit_new(NULL, NULL);
+
+   tlab_t *t = tlab_acquire(j);
 
    int *precious = tlab_alloc(t, sizeof(int));
    *precious = 0xbeef;
 
    int **array = tlab_alloc(t, sizeof(int *) * 10);
    for (int i = 0; i < 10; i++)
-      put_value(m, array + i, i);
+      put_value(jit_get_mspace(j), array + i, i);
 
    int **p1 = tlab_alloc(t, sizeof(int *));
    *p1 = precious;
@@ -253,7 +262,7 @@ START_TEST(test_tlab)
       array[0] = 123;
 
       for (int i = 0; i < 10; i++) {
-         int *garbage = mspace_alloc(m, sizeof(int));
+         int *garbage = mspace_alloc(jit_get_mspace(j), sizeof(int));
          ck_assert_ptr_nonnull(garbage);
          *garbage = 0xdead;
       }
@@ -264,14 +273,14 @@ START_TEST(test_tlab)
    for (int i = 0; i < 10; i++)
       ck_assert_int_eq(*array[i], i);
 
-   tlab_release(t);
-   mspace_destroy(m);
+   tlab_release(j, t);
+   jit_free(j);
 }
 END_TEST
 
 START_TEST(test_end_ptr)
 {
-   mspace_t *m = mspace_new(5 * 1024);
+   mspace_t *m = mspace_new(5 * 1024, NULL);
 
    // Do a few dummy allocations to ensure the pointer is not in the
    // first line which is often kept alive by stack pointers to m->space
@@ -294,6 +303,40 @@ START_TEST(test_end_ptr)
 }
 END_TEST
 
+static void user_mark_cb(mspace_t *m, void *cookie, void *ctx)
+{
+   mspace_user_mark(m, cookie, ctx, sizeof(int *));
+}
+
+START_TEST(test_user_mark)
+{
+   int **precious = malloc(sizeof(int *));
+
+   const mspace_handler_t handler = {
+      .mark = user_mark_cb,
+      .context = precious,
+   };
+
+   mspace_t *m = mspace_new(1024, &handler);
+
+   (void)mspace_alloc(m, 500);
+
+   *precious = mspace_alloc(m, sizeof(int));
+   **precious = 0xbeef;
+
+   for (int i = 0; i < 10000; i++) {
+      int *garbage = mspace_alloc(m, sizeof(int));
+      ck_assert_ptr_nonnull(garbage);
+      *garbage = 0xdead;
+   }
+
+   ck_assert_int_eq(**precious, 0xbeef);
+
+   free(precious);
+   mspace_destroy(m);
+}
+END_TEST
+
 Suite *get_mspace_tests(void)
 {
    Suite *s = suite_create("mspace");
@@ -308,6 +351,7 @@ Suite *get_mspace_tests(void)
    tcase_add_test(tc, test_linked_list);
    tcase_add_test(tc, test_tlab);
    tcase_add_test(tc, test_end_ptr);
+   tcase_add_test(tc, test_user_mark);
    suite_add_tcase(s, tc);
 
    return s;

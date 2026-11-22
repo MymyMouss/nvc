@@ -43,8 +43,13 @@ input if
 is
 .Ql - .
 .\" -e
-.It Fl e Ar unit
-Elaborate a previously analysed top level design unit.
+.It Fl e Ar unit No ...
+Elaborate a previously analysed top level design unit.  A top level
+design unit is either a VHDL entity or configuration, or a Verilog
+module or program.  VHDL architectures can be specified with
+.Ql entity(arch) .
+Multiple design units may be specified, resulting in an elaborated
+hierarchy with multiple roots.
 .\" -r
 .It Fl r Bo Ar unit Bc
 Execute a previously elaborated top level design unit.
@@ -68,6 +73,38 @@ Generate an HTML report from a coverage database.
 Evaluate a batch TCL script, optionally with
 .Ar unit
 loaded.
+.\" --mcp
+.It Fl \-mcp Op Fl \-root= Ns Ar dir
+Run as a Model Context Protocol server that reads requests from standard
+input and writes responses to standard output, so that an AI agent can
+analyse designs with nvc.  The server never loads a design itself: each
+tool call runs in a separate worker process, so a fatal error cannot end
+the session.  File arguments are relative to
+.Ar dir ,
+which defaults to the current directory, and may not leave it.  Global
+options given before
+.Fl \-mcp
+are passed on to the workers.  Both the 2026-07-28 revision of the
+protocol and the earlier revisions that use an
+.Cm initialize
+handshake are supported.  The tools are
+.Cm nvc_analyse ,
+.Cm nvc_elaborate ,
+.Cm nvc_workspace_list ,
+.Cm nvc_library_list ,
+.Cm nvc_sim_open ,
+.Cm nvc_sim_run ,
+.Cm nvc_sim_close ,
+.Cm nvc_design_list ,
+.Cm nvc_design_search ,
+.Cm nvc_signal_get ,
+.Cm nvc_signal_set ,
+.Cm nvc_trace_start ,
+.Cm nvc_trace_get
+and
+.Cm nvc_trace_stop .
+At most four simulations can be open at once and an idle one is closed
+after 30 minutes.
 .\" --init
 .It Fl \-init
 Initialise the working library directory.  This is not normally
@@ -267,6 +304,8 @@ Comments starting with
 .Ql #
 are ignored.  References to environment variables such as
 .Ql $FOO
+or
+.Ql ${FOO}
 are automatically expanded.  This argument may also be passed as
 .Ar @list
 for compatibility with other tools.
@@ -404,7 +443,7 @@ option.  For example:
 $ nvc -e --no-save tb -r
 .Ed
 .\"
-.It Fl O0 , Fl 01 , Fl 02 , Fl O3
+.It Fl O0 , Fl O1 , Fl O2 , Fl O3
 Set LLVM optimisation level.  Default is
 .Fl O2 .
 .\"
@@ -495,6 +534,162 @@ Stop after
 delta cycles.  This can be used to detect zero-time loops in your model.
 The default is 10000 if not specified.  Setting this to zero disables
 the delta cycle limit.
+.\" --checkpoint
+.It Fl \-checkpoint Ns = Ns Ar FILE@TIME
+Save the state of the simulation to
+.Ar FILE
+at the end of the first time step at or after the simulated time
+.Ar TIME ,
+which has the same format as for
+.Fl \-stop-time ,
+and then carry on.  The file can be given to
+.Fl \-restore
+in another run of the same elaborated design to continue from that point.
+The checkpoint is not written, and the run fails, if the state cannot be
+saved exactly: the message names the object and the reason.  Currently
+this includes designs with PSL properties, Verilog, coverage, plugins,
+forced or deposited signal values and values waited on with the
+.Cm 'active
+attribute.  Signals, drivers and their pending transactions, processes
+(including those suspended inside a procedure), variables, files open
+at that time, and the heap data of access values and dynamically sized
+arrays are saved.  Files written by the design are saved with their
+contents and input files must not have changed when the checkpoint is
+restored.
+.\" --restore
+.It Fl \-restore Ns = Ns Ar FILE
+Start the simulation from a checkpoint written by
+.Fl \-checkpoint
+instead of at time zero.  The design must be elaborated from the same
+sources by the same build of nvc, which is checked, and the restored
+state is verified before the simulation resumes.  Text printed during
+initialisation is printed again.  Files named relative to the current
+directory are looked up there, so run from the same directory.
+.\" --allow-changes
+.It Fl \-allow-changes
+With
+.Fl \-restore ,
+accept a checkpoint written from a design whose source has since changed.
+Variables and signals are matched by name and the units whose code differs
+are listed.  The result is labelled
+.Cm exact
+only if no changed unit had run any of the changed part before the
+checkpoint, and
+.Cm approximate
+otherwise, in which case the simulation continues as if the fix had been
+applied at that time and should be validated by running the changed design
+from the start.  A process that is suspended in code that changed and had
+run is resumed at the wait with the same number in the new code, which is
+right only if the change does not add, remove or reorder waits before it:
+the result is then
+.Cm approximate
+and the verdict lists such processes in
+.Cm resumed_by_number .
+It is refused if the new code has no wait with that number, has a different
+number of waits, or the process has a loop variable.  Added or removed processes and drivers, and signals of a different
+size, are refused.  The checkpoint must have been written with code tracking,
+which
+.Fl \-checkpoint
+turns on and which slows the simulation by about a third.
+.\" --verdict
+.It Fl \-verdict Ns = Ns Ar FILE
+With
+.Fl \-allow-changes ,
+write the verdict, the changed units and whether each had run, as JSON to
+.Ar FILE .
+.\" --checkpoint every
+.It Fl \-checkpoint Ns = Ns Ar DIR@every=INTERVAL[,max=N]
+Write a checkpoint into the new directory
+.Ar DIR
+every
+.Ar INTERVAL
+of simulated time (the format is that of
+.Fl \-stop-time ) ,
+at the end of the first time step at or after each multiple, in files named
+by the time they were written at.  At most
+.Ar N
+(default 64) are kept: when there would be more every second one is deleted
+and the interval doubles.  Checkpoints written while waveform dumping is on
+cannot be used for confirmation.
+.\" --confirm
+.It Fl \-confirm Ns = Ns Ar DIR
+Instead of simulating, check that the design as it is now reproduces the
+run that wrote the checkpoints in
+.Ar DIR :
+the state of each checkpoint is restored into the design, which runs to the
+time of the next checkpoint and saves its state, and the two states are
+compared section by section.  The first segment starts from time zero.
+The state restored for each segment is verified by saving it again, and a
+segment that cannot be verified is reported as not checked, never as
+confirmed.  The result is
+.Cm confirmed
+if the design run from time zero would pass through every saved state,
+.Cm different
+with the first segment, its time interval and the object that differs, or
+.Cm incomplete
+with the segments that were not checked and why.  The exit status is 0, 1 or
+2.  Progress is printed as segments end and the result is written to
+.Fl \-confirm-result .
+A run that is interrupted (SIGINT) can be repeated with the same arguments:
+segments already settled for the same design, program, inputs and
+checkpoints are not run again.  Segments run in directories below
+.Ar DIR
+with the input files the design read made available by name, so a design
+that writes files by absolute path may overwrite them.
+.\" --restore-confirmed
+.It Fl \-restore-confirmed Ns = Ns Ar DIR
+Resume exactly after a fix, whatever the change.  The checkpoints in
+.Ar DIR
+were written by the original run with
+.Fl \-checkpoint=DIR@every= .
+The changed design is confirmed against them as for
+.Fl \-confirm
+(and settled segments of an earlier confirmation of the same design,
+program, inputs and files are reused), and the simulation is restored from the
+last checkpoint such that it and all before it agree, which is then proved to
+be the state of the changed design itself, and runs on.  The restore is
+reported as exact with the basis
+.Cm confirmed_by_segments ,
+the time and the number of segments confirmed.  If no checkpoint is confirmed
+the command stops, unless
+.Fl \-confirmed-or-zero
+is given, which starts from time zero.  Takes the options of
+.Fl \-confirm
+(including
+.Fl \-jobs
+and the budget); plusargs are not allowed.
+.\" --confirmed-or-zero
+.It Fl \-confirmed-or-zero
+With
+.Fl \-restore-confirmed ,
+start from time zero if no checkpoint is confirmed.
+.\" --jobs
+.It Fl \-jobs Ns = Ns Ar N
+With
+.Fl \-confirm ,
+run up to
+.Ar N
+segments at the same time.  The default is 1.
+.\" --confirm-budget
+.It Fl \-confirm-budget Ns = Ns Ar SECONDS
+With
+.Fl \-confirm ,
+start no new segment after this much real time and report the coverage
+reached, which is then incomplete.
+.\" --confirm-max
+.It Fl \-confirm-max Ns = Ns Ar N
+With
+.Fl \-confirm ,
+run at most
+.Ar N
+segments.
+.\" --confirm-result
+.It Fl \-confirm-result Ns = Ns Ar FILE
+With
+.Fl \-confirm ,
+write the result as JSON to
+.Ar FILE
+instead of standard output.
 .\" --stop-time
 .It Fl \-stop-time Ns = Ns Ar T
 Stop the simulation after the given time has elapsed.  Format of
@@ -695,6 +890,52 @@ command in the interactive environment
 .Ns ( Fl i Ns )
 to list these.
 .\" ------------------------------------------------------------
+.\" SIGNAL INITIALISATION
+.\" ------------------------------------------------------------
+.Sh "SIGNAL INITIALISATION"
+.Pp
+.Nm
+supports LRM-non-compliant initialisation of internal design signals,
+helping to find non-reset flip-flops before gate-level simulation.  Pass
+the
+.Ql --load=siginit
+option to enable it. Initial values depend on the
+.Ql +siginit+
+option and signal type:
+.Bl -column "+siginit+rand" "random value between" "random value between" "randomly chosen"
+.It Option Ta Enum Ta Integer Ta std_logic
+.It +siginit+zero Ta TYPE'left Ta TYPE'low Ta '0'
+.It +siginit+one Ta TYPE'right Ta TYPE'high Ta '1'
+.It +siginit+rand Ta "TYPE'left .. TYPE'right" Ta "TYPE'low .. TYPE'high" Ta "'0' or '1'"
+.El
+.Pp
+Multidimensional arrays and records are initialised recursively.
+Physical, file, protected, and shared-variable types are unaffected.
+.Pp
+Random initialisation is reproducible with the global
+.Ql --seed
+option and depends on the seed, signal name, and hierarchical path.
+.Pp
+Use
+.Ql +siginit+block+<entity_name>
+to limit initialisation to the hierarchy below instances of the VHDL
+entity
+.Ql <entity_name> .
+Entity names are matched case-insensitively; this is useful for
+initialising only DUT signals in a testbench.
+.Pp
+Use
+.Ql +siginit+report+<report_file>
+to write a report of initialised and skipped signals, followed by counts
+of signals, warnings, and errors.
+.Pp
+Examples:
+.Bd -literal -offset indent
+$ nvc -r tb --load=siginit +siginit+rand +siginit+block+my_dut \\
+	+siginit+report+siginit.txt
+$ nvc -r tb --load=siginit +siginit+zero
+.Ed
+.\" ------------------------------------------------------------
 .\" CODE COVERAGE
 .\" ------------------------------------------------------------
 .Sh CODE COVERAGE
@@ -761,7 +1002,7 @@ of expression operands, or expression result is incremented.
 - NVC tracks if states of Finite State Machines (FSMs) are visited. NVC creates
 a coverage bin for each state of an FSM. NVC considers internal signals of
 all user-defined enum types as FSMs. NVC does not consider port signals or
-variables as an FSM. When a signal recognized as FSM changes its value,
+variables as an FSM. When a signal recognised as FSM changes its value,
 coverage bin for new state value is incremented.
 .It
 .Cm functional
@@ -830,7 +1071,7 @@ given by
 .Cm --threshold-<value>
 option of
 .Cm --cover
-elabortion switch.
+elaboration switch.
 NVC supports two kinds of code coverage reports:
 .Bl -bullet
 .It
@@ -1033,15 +1274,15 @@ An example of coverage specification file is following:
 -package LEGACY_PKG
 
 # Example how to force all signals of enum types named 'T_FSM_STATE'
-# to be recognized as FSM
+# to be recognised as FSM
 +fsm_type T_FSM_STATE
 
 # Example how to force all signals of enum types with name matching
-# 'T_*_FSM' pattern to be recognized as FSM
+# 'T_*_FSM' pattern to be recognised as FSM
 +fsm_type T_*_FSM
 
 # Example how to force all signals of enum type named 'T_TRANSFER_TYPE'
-# not to be recognized as an FSM
+# not to be recognised as an FSM
 -fsm-type T_TRANSFER_TYPE
 .Ed
 .Pp
@@ -1162,7 +1403,7 @@ hierarchy when simulated in DUT top level test-bench and in the
 unit test. In DUT top level test-bench, the sub-block is
 instantiated under the DUT. In the unit-test, sub-block is instantiated
 directly. To merge coverage data from two such instantiations,
-you can utilize coverage folding.
+you can utilise coverage folding.
 .Pp
 Coverage folding is specified by
 .Ql fold
@@ -1418,7 +1659,7 @@ vhpiForeignDataT my_func_data = {
 vhpi_register_foreignf(&my_func_data);
 .Ed
 .Pp
-To use the simplified protocol the VHDL the
+To use the simplified protocol, the VHDL
 .Ql FOREIGN
 attribute should be specified with the keyword
 .Ql VHPIDIRECT

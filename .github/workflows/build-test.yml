@@ -107,7 +107,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-14, arch: arm64, llvm: llvm }
+          - { os: macos-26, arch: arm64, llvm: llvm }
     name: Mac OS (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
     steps:
@@ -325,6 +325,8 @@ jobs:
         run: ./vhdl-projects/axis2mm/test.sh
       - name: Test PicoRV32
         run: ./vhdl-projects/picorv32/test.sh
+      - name: Test alexforencich/verilog-ethernet
+        run: ./vhdl-projects/alexforencich/verilog-ethernet/test.sh
 
   vunit:
     name: VUnit
@@ -339,7 +341,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: VUnit/vunit
-          ref: master
+          ref: v5.0.0-dev.15
           path: vunit
           submodules: recursive
           fetch-depth: 1
@@ -472,5 +474,8 @@ jobs:
           nvc.exe -a test\regress\ieee1.vhd
           nvc.exe -e ieee1
           nvc.exe -r ieee1
+      - name: Windows TCL tests
+        shell: powershell
+        run: |
           'package require msgcat; package require yaml' | Set-Content -Path test.tcl
           nvc.exe --do .\test.tcl

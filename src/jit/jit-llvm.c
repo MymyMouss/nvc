@@ -23,7 +23,7 @@
 #include "lib.h"
 #include "object.h"
 #include "option.h"
-#include "rt/rt.h"
+#include "rt/defs.h"
 #include "thread.h"
 
 #include <assert.h>
@@ -129,15 +129,20 @@ typedef enum {
    LLVM_DO_EXIT,
    LLVM_PUTPRIV,
    LLVM_MSPACE_ALLOC,
-   LLVM_GET_OBJECT,
    LLVM_TLAB_ALLOC,
    LLVM_SCHED_WAVEFORM,
+   LLVM_SCHED_WAVEFORM_S0,
+   LLVM_SCHED_WAVEFORM_0,
    LLVM_TEST_EVENT,
    LLVM_LAST_EVENT,
    LLVM_SCHED_PROCESS,
    LLVM_PACK,
    LLVM_UNPACK,
    LLVM_VEC4OP,
+   LLVM_DRIVE_SIGNAL,
+   LLVM_SCHED_EVENT,
+   LLVM_LENGTH_FAIL,
+   LLVM_INDEX_FAIL,
 
    LLVM_LAST_FN,
 } llvm_fn_t;
@@ -285,6 +290,17 @@ static LLVMValueRef llvm_ptr(llvm_obj_t *obj, void *ptr)
 {
    return LLVMConstIntToPtr(llvm_intptr(obj, (intptr_t)ptr),
                             obj->types[LLVM_PTR]);
+}
+
+static LLVMValueRef llvm_load_ptr(llvm_obj_t *obj, LLVMValueRef ptr,
+                                  const char *name)
+{
+#ifndef LLVM_HAS_OPAQUE_POINTERS
+   LLVMTypeRef ptr_type = LLVMPointerType(obj->types[LLVM_PTR], 0);
+   ptr = LLVMBuildPointerCast(obj->builder, ptr, ptr_type, "");
+#endif
+
+   return LLVMBuildLoad2(obj->builder, obj->types[LLVM_PTR], ptr, name);
 }
 
 static LLVMValueRef llvm_real(llvm_obj_t *obj, double r)
@@ -466,7 +482,8 @@ static void llvm_optimise(LLVMModuleRef module, LLVMTargetMachineRef target,
    LLVMPassBuilderOptionsSetCallGraphProfile(options, false);
 
    const char *passes[] = {
-      "default<O0>", "default<O1>", "default<O2>", "default<O3>"
+      "default<O0>,function(early-cse)",
+      "default<O1>", "default<O2>", "default<O3>"
    };
 
    LLVM_CHECK(LLVMRunPasses, module, passes[olevel], target, options);
@@ -840,7 +857,7 @@ static LLVMValueRef llvm_get_fn(llvm_obj_t *obj, llvm_fn_t which)
          obj->fntypes[which] = LLVMFunctionType(obj->types[LLVM_VOID], args,
                                                 ARRAY_LEN(args), false);
 
-         fn = llvm_add_fn(obj, "__nvc_do_exit", obj->fntypes[which]);
+         fn = llvm_add_fn(obj, "nvc.do_exit", obj->fntypes[which]);
          llvm_add_func_attr(obj, fn, FUNC_ATTR_NOUNWIND, -1);
          llvm_add_func_attr(obj, fn, FUNC_ATTR_READONLY, 2);
          llvm_add_func_attr(obj, fn, FUNC_ATTR_NOCAPTURE, 2);
@@ -850,9 +867,134 @@ static LLVMValueRef llvm_get_fn(llvm_obj_t *obj, llvm_fn_t which)
       break;
 
    case LLVM_SCHED_WAVEFORM:
+      {
+         LLVMTypeRef args[] = {
+            obj->types[LLVM_PTR],
+            obj->types[LLVM_PTR],
+            obj->types[LLVM_INT32],
+            obj->types[LLVM_INT32],
+            obj->types[LLVM_INT64],
+            obj->types[LLVM_INT64],
+            obj->types[LLVM_INT64],
+            obj->types[LLVM_INT1],
+         };
+         obj->fntypes[which] = LLVMFunctionType(obj->types[LLVM_VOID], args,
+                                                ARRAY_LEN(args), false);
+
+         fn = llvm_add_fn(obj, "nvc.sched_waveform", obj->fntypes[which]);
+         llvm_add_func_attr(obj, fn, FUNC_ATTR_NOUNWIND, -1);
+      }
+      break;
+
+   case LLVM_SCHED_WAVEFORM_S0:
+      {
+         LLVMTypeRef args[] = {
+            obj->types[LLVM_PTR],
+            obj->types[LLVM_PTR],
+            obj->types[LLVM_INT32],
+            obj->types[LLVM_INT64],
+         };
+         obj->fntypes[which] = LLVMFunctionType(obj->types[LLVM_VOID], args,
+                                                ARRAY_LEN(args), false);
+
+         fn = llvm_add_fn(obj, "nvc.sched_waveform_s0", obj->fntypes[which]);
+         llvm_add_func_attr(obj, fn, FUNC_ATTR_NOUNWIND, -1);
+      }
+      break;
+
+   case LLVM_SCHED_WAVEFORM_0:
+      {
+         LLVMTypeRef args[] = {
+            obj->types[LLVM_PTR],
+            obj->types[LLVM_PTR],
+            obj->types[LLVM_INT32],
+            obj->types[LLVM_INT32],
+            obj->types[LLVM_INT64],
+         };
+         obj->fntypes[which] = LLVMFunctionType(obj->types[LLVM_VOID], args,
+                                                ARRAY_LEN(args), false);
+
+         fn = llvm_add_fn(obj, "nvc.sched_waveform_0", obj->fntypes[which]);
+         llvm_add_func_attr(obj, fn, FUNC_ATTR_NOUNWIND, -1);
+      }
+      break;
+
+   case LLVM_DRIVE_SIGNAL:
+   case LLVM_SCHED_EVENT:
+      {
+         LLVMTypeRef args[] = {
+            obj->types[LLVM_PTR],
+            obj->types[LLVM_PTR],
+            obj->types[LLVM_INT32],
+            obj->types[LLVM_INT32],
+         };
+         obj->fntypes[which] = LLVMFunctionType(obj->types[LLVM_VOID], args,
+                                                ARRAY_LEN(args), false);
+
+         const char *sym = which == LLVM_DRIVE_SIGNAL
+            ? "nvc.drive_signal" : "nvc.sched_event";
+
+         fn = llvm_add_fn(obj, sym, obj->fntypes[which]);
+         llvm_add_func_attr(obj, fn, FUNC_ATTR_NOUNWIND, -1);
+      }
+      break;
+
+   case LLVM_LENGTH_FAIL:
+      {
+         LLVMTypeRef args[] = {
+            obj->types[LLVM_PTR],
+            obj->types[LLVM_INT64],
+            obj->types[LLVM_INT64],
+            obj->types[LLVM_INT32],
+            obj->types[LLVM_PTR],
+         };
+         obj->fntypes[which] = LLVMFunctionType(obj->types[LLVM_VOID], args,
+                                                ARRAY_LEN(args), false);
+
+         fn = llvm_add_fn(obj, "nvc.length_fail", obj->fntypes[which]);
+         llvm_add_func_attr(obj, fn, FUNC_ATTR_NOUNWIND, -1);
+         llvm_add_func_attr(obj, fn, FUNC_ATTR_NORETURN, -1);
+         llvm_add_func_attr(obj, fn, FUNC_ATTR_COLD, -1);
+      }
+      break;
+
+   case LLVM_INDEX_FAIL:
+      {
+         LLVMTypeRef args[] = {
+            obj->types[LLVM_PTR],
+            obj->types[LLVM_INT64],
+            obj->types[LLVM_INT64],
+            obj->types[LLVM_INT64],
+            obj->types[LLVM_INT8],
+            obj->types[LLVM_PTR],
+            obj->types[LLVM_PTR],
+         };
+         obj->fntypes[which] = LLVMFunctionType(obj->types[LLVM_VOID], args,
+                                                ARRAY_LEN(args), false);
+
+         fn = llvm_add_fn(obj, "nvc.index_fail", obj->fntypes[which]);
+         llvm_add_func_attr(obj, fn, FUNC_ATTR_NOUNWIND, -1);
+         llvm_add_func_attr(obj, fn, FUNC_ATTR_NORETURN, -1);
+         llvm_add_func_attr(obj, fn, FUNC_ATTR_COLD, -1);
+      }
+      break;
+
+   case LLVM_SCHED_PROCESS:
+      {
+         LLVMTypeRef args[] = {
+            obj->types[LLVM_PTR],
+            obj->types[LLVM_INT64],
+         };
+         obj->fntypes[which] = LLVMFunctionType(obj->types[LLVM_VOID], args,
+                                                ARRAY_LEN(args), false);
+
+         fn = llvm_add_fn(obj, "nvc.sched_process", obj->fntypes[which]);
+         llvm_add_func_attr(obj, fn, FUNC_ATTR_NOUNWIND, -1);
+      }
+      break;
+
    case LLVM_TEST_EVENT:
    case LLVM_LAST_EVENT:
-   case LLVM_SCHED_PROCESS:
       {
          LLVMTypeRef args[] = {
             obj->types[LLVM_PTR],
@@ -872,10 +1014,8 @@ static LLVMValueRef llvm_get_fn(llvm_obj_t *obj, llvm_fn_t which)
 
          const char *sym = NULL;
          switch (which) {
-         case LLVM_SCHED_WAVEFORM: sym = "__nvc_sched_waveform"; break;
-         case LLVM_TEST_EVENT: sym = "__nvc_test_event"; break;
-         case LLVM_LAST_EVENT: sym = "__nvc_last_event"; break;
-         case LLVM_SCHED_PROCESS: sym = "__nvc_sched_process"; break;
+         case LLVM_TEST_EVENT: sym = "nvc.test_event"; break;
+         case LLVM_LAST_EVENT: sym = "nvc.last_event"; break;
          default: break;
          }
 
@@ -897,7 +1037,7 @@ static LLVMValueRef llvm_get_fn(llvm_obj_t *obj, llvm_fn_t which)
          obj->fntypes[which] = LLVMFunctionType(obj->types[LLVM_VOID], args,
                                                 ARRAY_LEN(args), false);
 
-         fn = llvm_add_fn(obj, "__nvc_putpriv", obj->fntypes[which]);
+         fn = llvm_add_fn(obj, "nvc.putpriv", obj->fntypes[which]);
          llvm_add_func_attr(obj, fn, FUNC_ATTR_NOUNWIND, -1);
       }
       break;
@@ -916,7 +1056,7 @@ static LLVMValueRef llvm_get_fn(llvm_obj_t *obj, llvm_fn_t which)
          obj->fntypes[which] = LLVMFunctionType(obj->types[LLVM_VOID], args,
                                                 ARRAY_LEN(args), false);
 
-         fn = llvm_add_fn(obj, "__nvc_pack", obj->fntypes[which]);
+         fn = llvm_add_fn(obj, "nvc.pack", obj->fntypes[which]);
          llvm_add_func_attr(obj, fn, FUNC_ATTR_NOUNWIND, -1);
       }
       break;
@@ -935,7 +1075,7 @@ static LLVMValueRef llvm_get_fn(llvm_obj_t *obj, llvm_fn_t which)
          obj->fntypes[which] = LLVMFunctionType(obj->types[LLVM_VOID], args,
                                                 ARRAY_LEN(args), false);
 
-         fn = llvm_add_fn(obj, "__nvc_unpack", obj->fntypes[which]);
+         fn = llvm_add_fn(obj, "nvc.unpack", obj->fntypes[which]);
          llvm_add_func_attr(obj, fn, FUNC_ATTR_NOUNWIND, -1);
       }
       break;
@@ -959,7 +1099,7 @@ static LLVMValueRef llvm_get_fn(llvm_obj_t *obj, llvm_fn_t which)
          obj->fntypes[which] = LLVMFunctionType(obj->types[LLVM_VOID], args,
                                                 ARRAY_LEN(args), false);
 
-         fn = llvm_add_fn(obj, "__nvc_vec4op", obj->fntypes[which]);
+         fn = llvm_add_fn(obj, "nvc.vec4op", obj->fntypes[which]);
          llvm_add_func_attr(obj, fn, FUNC_ATTR_NOUNWIND, -1);
       }
       break;
@@ -977,23 +1117,8 @@ static LLVMValueRef llvm_get_fn(llvm_obj_t *obj, llvm_fn_t which)
          obj->fntypes[which] = LLVMFunctionType(obj->types[LLVM_PTR], args,
                                                 ARRAY_LEN(args), false);
 
-         fn = llvm_add_fn(obj, "__nvc_mspace_alloc", obj->fntypes[which]);
+         fn = llvm_add_fn(obj, "nvc.mspace_alloc", obj->fntypes[which]);
          llvm_add_func_attr(obj, fn, FUNC_ATTR_NOUNWIND, -1);
-      }
-      break;
-
-   case LLVM_GET_OBJECT:
-      {
-         LLVMTypeRef args[] = {
-            obj->types[LLVM_PTR],
-            obj->types[LLVM_INTPTR]
-         };
-         obj->fntypes[which] = LLVMFunctionType(obj->types[LLVM_PTR], args,
-                                                ARRAY_LEN(args), false);
-         fn = llvm_add_fn(obj, "__nvc_get_object", obj->fntypes[which]);
-         llvm_add_func_attr(obj, fn, FUNC_ATTR_NOUNWIND, -1);
-         llvm_add_func_attr(obj, fn, FUNC_ATTR_NOCAPTURE, 1);
-         llvm_add_func_attr(obj, fn, FUNC_ATTR_READONLY, 1);
       }
       break;
 
@@ -1217,7 +1342,7 @@ static LLVMValueRef cgen_coerce_value(llvm_obj_t *obj, cgen_block_t *cgb,
    case LLVM_INT1:
       switch (LLVMGetTypeKind(lltype)) {
       case LLVMPointerTypeKind:
-         return LLVMBuildIntToPtr(obj->builder, raw, obj->types[LLVM_PTR], "");
+         return LLVMBuildPtrToInt(obj->builder, raw, obj->types[type], "");
       case LLVMIntegerTypeKind:
          {
             const int bits1 = LLVMGetIntTypeWidth(lltype);
@@ -1892,7 +2017,7 @@ static void cgen_op_call(llvm_obj_t *obj, cgen_block_t *cgb, jit_ir_t *ir)
    LLVMValueRef entry = cgen_maybe_inline(obj, callee);
    if (entry == NULL) {
       // Must have acquire semantics to synchronise with installing new code
-      entry = LLVMBuildLoad2(obj->builder, obj->types[LLVM_PTR], fptr, "entry");
+      entry = llvm_load_ptr(obj, fptr, "entry");
       LLVMSetAlignment(entry, sizeof(void *));
       LLVMSetOrdering(entry, LLVMAtomicOrderingAcquire);
 
@@ -2065,17 +2190,6 @@ static void cgen_macro_exit(llvm_obj_t *obj, cgen_block_t *cgb, jit_ir_t *ir)
    cgen_sync_irpos(obj, cgb, ir);
 
    switch (ir->arg1.exit) {
-   case JIT_EXIT_SCHED_WAVEFORM:
-      {
-         LLVMValueRef args[] = {
-            PTR(cgb->func->anchor),
-            cgb->func->args,
-            cgb->func->tlab,
-         };
-         llvm_call_fn(obj, LLVM_SCHED_WAVEFORM, args, ARRAY_LEN(args));
-      }
-      break;
-
    case JIT_EXIT_TEST_EVENT:
       {
          LLVMValueRef args[] = {
@@ -2095,17 +2209,6 @@ static void cgen_macro_exit(llvm_obj_t *obj, cgen_block_t *cgb, jit_ir_t *ir)
             cgb->func->tlab,
          };
          llvm_call_fn(obj, LLVM_LAST_EVENT, args, ARRAY_LEN(args));
-      }
-      break;
-
-   case JIT_EXIT_SCHED_PROCESS:
-      {
-         LLVMValueRef args[] = {
-            PTR(cgb->func->anchor),
-            cgb->func->args,
-            cgb->func->tlab,
-         };
-         llvm_call_fn(obj, LLVM_SCHED_PROCESS, args, ARRAY_LEN(args));
       }
       break;
 
@@ -2183,13 +2286,7 @@ static void cgen_macro_getpriv(llvm_obj_t *obj, cgen_block_t *cgb, jit_ir_t *ir)
    jit_func_t *f = jit_get_func(cgb->func->source->jit, ir->arg1.handle);
    LLVMValueRef ptrptr = llvm_ptr(obj, jit_get_privdata_ptr(f->jit, f));
 
-#ifndef LLVM_HAS_OPAQUE_POINTERS
-   LLVMTypeRef ptr_type = LLVMPointerType(obj->types[LLVM_PTR], 0);
-   ptrptr = LLVMBuildPointerCast(obj->builder, ptrptr, ptr_type, "");
-#endif
-
-   LLVMValueRef ptr =
-      LLVMBuildLoad2(obj->builder, obj->types[LLVM_PTR], ptrptr, "p2");
+   LLVMValueRef ptr = llvm_load_ptr(obj, ptrptr, "p2");
    LLVMSetAlignment(ptr, sizeof(void *));
    LLVMSetOrdering(ptr, LLVMAtomicOrderingAcquire);
 
@@ -2291,8 +2388,7 @@ static void cgen_macro_reexec(llvm_obj_t *obj, cgen_block_t *cgb, jit_ir_t *ir)
    LLVMValueRef fptr = LLVMGetParam(cgb->func->llvmfn, 0);
 
    // Must have acquire semantics to synchronise with installing new code
-   LLVMValueRef entry =
-      LLVMBuildLoad2(obj->builder, obj->types[LLVM_PTR], fptr, "entry");
+   LLVMValueRef entry = llvm_load_ptr(obj, fptr, "entry");
    LLVMSetAlignment(entry, sizeof(void *));
    LLVMSetOrdering(entry, LLVMAtomicOrderingAcquire);
 
@@ -2513,6 +2609,146 @@ static void cgen_ir(llvm_obj_t *obj, cgen_block_t *cgb, jit_ir_t *ir)
    }
 }
 
+static int cgen_fuse_ir(llvm_obj_t *obj, cgen_block_t *cgb, jit_ir_t *ir)
+{
+   if (ir->op != J_SEND)
+      return 0;
+
+   int nsend = 0;
+   jit_ir_t *exit = ir;
+   for (; exit->op == J_SEND; nsend++, exit++) {
+      if (exit->arg1.int64 != nsend)
+         return 0;   // Arguments out of order
+   }
+
+   if (exit->op != MACRO_EXIT)
+      return 0;
+
+   if (exit->arg1.exit == JIT_EXIT_SCHED_WAVEFORM && nsend == 7) {
+      LLVMValueRef shared = cgen_coerce_value(obj, cgb, ir[0].arg2, LLVM_PTR);
+      LLVMValueRef offset = cgen_coerce_value(obj, cgb, ir[1].arg2, LLVM_INT32);
+      LLVMValueRef count  = cgen_coerce_value(obj, cgb, ir[2].arg2, LLVM_INT32);
+      LLVMValueRef value  = cgen_coerce_value(obj, cgb, ir[3].arg2, LLVM_INT64);
+      LLVMValueRef after  = cgen_coerce_value(obj, cgb, ir[4].arg2, LLVM_INT64);
+      LLVMValueRef reject = cgen_coerce_value(obj, cgb, ir[5].arg2, LLVM_INT64);
+      LLVMValueRef scalar = cgen_coerce_value(obj, cgb, ir[6].arg2, LLVM_INT1);
+
+      cgen_sync_irpos(obj, cgb, exit);
+
+      LLVMValueRef args[] = {
+         PTR(cgb->func->anchor),
+         shared, offset, count, value, after, reject, scalar,
+      };
+      llvm_call_fn(obj, LLVM_SCHED_WAVEFORM, args, ARRAY_LEN(args));
+
+      return nsend;
+   }
+   else if (exit->arg1.exit == JIT_EXIT_SCHED_ZERO && nsend == 5) {
+      LLVMValueRef shared = cgen_coerce_value(obj, cgb, ir[0].arg2, LLVM_PTR);
+      LLVMValueRef offset = cgen_coerce_value(obj, cgb, ir[1].arg2, LLVM_INT32);
+      LLVMValueRef count  = cgen_coerce_value(obj, cgb, ir[2].arg2, LLVM_INT32);
+      LLVMValueRef value  = cgen_coerce_value(obj, cgb, ir[3].arg2, LLVM_INT64);
+
+      cgen_sync_irpos(obj, cgb, exit);
+
+      if (ir[4].arg2.kind == JIT_VALUE_INT64 && ir[4].arg2.int64 == 1) {
+         LLVMValueRef args[] = {
+            PTR(cgb->func->anchor),
+            shared, offset, value,
+         };
+         llvm_call_fn(obj, LLVM_SCHED_WAVEFORM_S0, args, ARRAY_LEN(args));
+      }
+      else {
+         LLVMValueRef args[] = {
+            PTR(cgb->func->anchor),
+            shared, offset, count, value,
+         };
+         llvm_call_fn(obj, LLVM_SCHED_WAVEFORM_0, args, ARRAY_LEN(args));
+      }
+
+      return nsend;
+   }
+   else if (exit->arg1.exit == JIT_EXIT_DRIVE_SIGNAL && nsend == 3) {
+      LLVMValueRef shared = cgen_coerce_value(obj, cgb, ir[0].arg2, LLVM_PTR);
+      LLVMValueRef offset = cgen_coerce_value(obj, cgb, ir[1].arg2, LLVM_INT32);
+      LLVMValueRef count  = cgen_coerce_value(obj, cgb, ir[2].arg2, LLVM_INT32);
+
+      cgen_sync_irpos(obj, cgb, exit);
+
+      LLVMValueRef args[] = {
+         PTR(cgb->func->anchor),
+         shared, offset, count,
+      };
+      llvm_call_fn(obj, LLVM_DRIVE_SIGNAL, args, ARRAY_LEN(args));
+
+      return nsend;
+   }
+   else if (exit->arg1.exit == JIT_EXIT_SCHED_EVENT && nsend == 3) {
+      LLVMValueRef shared = cgen_coerce_value(obj, cgb, ir[0].arg2, LLVM_PTR);
+      LLVMValueRef offset = cgen_coerce_value(obj, cgb, ir[1].arg2, LLVM_INT32);
+      LLVMValueRef count  = cgen_coerce_value(obj, cgb, ir[2].arg2, LLVM_INT32);
+
+      cgen_sync_irpos(obj, cgb, exit);
+
+      LLVMValueRef args[] = {
+         PTR(cgb->func->anchor),
+         shared, offset, count,
+      };
+      llvm_call_fn(obj, LLVM_SCHED_EVENT, args, ARRAY_LEN(args));
+
+      return nsend;
+   }
+   else if (exit->arg1.exit == JIT_EXIT_LENGTH_FAIL && nsend == 4) {
+      LLVMValueRef left  = cgen_coerce_value(obj, cgb, ir[0].arg2, LLVM_INT64);
+      LLVMValueRef right = cgen_coerce_value(obj, cgb, ir[1].arg2, LLVM_INT64);
+      LLVMValueRef dim   = cgen_coerce_value(obj, cgb, ir[2].arg2, LLVM_INT32);
+      LLVMValueRef where = cgen_coerce_value(obj, cgb, ir[3].arg2, LLVM_PTR);
+
+      cgen_sync_irpos(obj, cgb, exit);
+
+      LLVMValueRef args[] = {
+         PTR(cgb->func->anchor),
+         left, right, dim, where,
+      };
+      llvm_call_fn(obj, LLVM_LENGTH_FAIL, args, ARRAY_LEN(args));
+
+      return nsend;
+   }
+   else if (exit->arg1.exit == JIT_EXIT_INDEX_FAIL && nsend == 6) {
+      LLVMValueRef value = cgen_coerce_value(obj, cgb, ir[0].arg2, LLVM_INT64);
+      LLVMValueRef left  = cgen_coerce_value(obj, cgb, ir[1].arg2, LLVM_INT64);
+      LLVMValueRef right = cgen_coerce_value(obj, cgb, ir[2].arg2, LLVM_INT64);
+      LLVMValueRef dir   = cgen_coerce_value(obj, cgb, ir[3].arg2, LLVM_INT8);
+      LLVMValueRef where = cgen_coerce_value(obj, cgb, ir[4].arg2, LLVM_PTR);
+      LLVMValueRef hint  = cgen_coerce_value(obj, cgb, ir[5].arg2, LLVM_PTR);
+
+      cgen_sync_irpos(obj, cgb, exit);
+
+      LLVMValueRef args[] = {
+         PTR(cgb->func->anchor),
+         value, left, right, dir, where, hint,
+      };
+      llvm_call_fn(obj, LLVM_INDEX_FAIL, args, ARRAY_LEN(args));
+
+      return nsend;
+   }
+   else if (exit->arg1.exit == JIT_EXIT_SCHED_PROCESS && nsend == 1) {
+      LLVMValueRef after = cgen_coerce_value(obj, cgb, ir[0].arg2, LLVM_INT64);
+
+      cgen_sync_irpos(obj, cgb, exit);
+
+      LLVMValueRef args[] = {
+         PTR(cgb->func->anchor),
+         after,
+      };
+      llvm_call_fn(obj, LLVM_SCHED_PROCESS, args, ARRAY_LEN(args));
+
+      return nsend;
+   }
+
+   return 0;
+}
+
 static void cgen_basic_blocks(llvm_obj_t *obj, cgen_func_t *func,
                               jit_cfg_t *cfg)
 {
@@ -2628,8 +2864,7 @@ static void cgen_reexecute_guard(llvm_obj_t *obj, cgen_func_t *func,
    LLVMValueRef fptr = LLVMGetParam(func->llvmfn, 0);
 
    // Must have acquire semantics to synchronise with installing new code
-   LLVMValueRef entry =
-      LLVMBuildLoad2(obj->builder, obj->types[LLVM_PTR], fptr, "entry");
+   LLVMValueRef entry = llvm_load_ptr(obj, fptr, "entry");
    LLVMSetAlignment(entry, sizeof(void *));
    LLVMSetOrdering(entry, LLVMAtomicOrderingAcquire);
 
@@ -2803,7 +3038,11 @@ static void cgen_function(llvm_obj_t *obj, cgen_func_t *func)
 
       assert(i >= cgb->source->first && i <= cgb->source->last);
 
-      cgen_ir(obj, cgb, &(func->source->irbuf[i]));
+      const int skip = cgen_fuse_ir(obj, cgb, &(func->source->irbuf[i]));
+      if (skip == 0)
+         cgen_ir(obj, cgb, &(func->source->irbuf[i]));
+      else
+         i += skip;
 
       if (i == cgb->source->last) {
          if (LLVMGetBasicBlockTerminator(cgb->bbref) == NULL) {
@@ -2936,7 +3175,7 @@ static void cgen_tlab_alloc_body(llvm_obj_t *obj)
    LLVMValueRef indexes[] = { alloc };
    LLVMValueRef fast_ptr = LLVMBuildInBoundsGEP2(obj->builder,
                                                  obj->types[LLVM_INT8],
-                                                 base, indexes,
+                                                 PTR(base), indexes,
                                                  ARRAY_LEN(indexes), "");
 
    LLVMBuildRet(obj->builder, fast_ptr);

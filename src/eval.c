@@ -57,8 +57,8 @@ static tree_t eval_value_to_tree(jit_scalar_t value, type_t type,
    if (type_is_enum(type)) {
       type_t base = type_base_recur(type);
       if ((unsigned)value.integer >= type_enum_literals(base))
-         fatal_at(loc, "enum position %"PRIi64" out of range for type %s",
-                  value.integer, type_pp(base));
+         fatal_at(loc, "enum position %"PRIi64" out of range for type %pT",
+                  value.integer, base);
 
       tree_t lit = type_enum_literal(base, value.integer);
 
@@ -83,8 +83,7 @@ static tree_t eval_value_to_tree(jit_scalar_t value, type_t type,
       tree_set_ident(tree, tree_ident(type_unit(type_base_recur(type), 0)));
    }
    else
-      fatal_trace("cannot convert 0x%"PRIx64" to %s", value.integer,
-                  type_pp(type));
+      fatal_trace("cannot convert 0x%"PRIx64" to %pT", value.integer, type);
 
    tree_set_type(tree, type);
    tree_set_loc(tree, loc);
@@ -309,6 +308,7 @@ bool eval_possible(tree_t t, unit_registry_t *ur, mir_context_t *mc)
                return eval_not_possible(t, "subprogram not in package");
             break;
          case S_IEEE_MISC:
+         case S_IEEE_LOGICAL:
             break;
          default:
             if (!is_open_coded_builtin(kind)
@@ -386,8 +386,11 @@ bool eval_possible(tree_t t, unit_registry_t *ur, mir_context_t *mc)
                return false;
          }
 
-         // Check for missing choices in constrained array aggregates
          type_t composite_type = tree_type(t);
+         if (!type_const_bounds(composite_type))
+            return false;
+
+         // Check for missing choices in constrained array aggregates
          if (type_is_array(composite_type)
              && !type_is_unconstrained(composite_type)) {
             int64_t count = 0, elem_count = 0;

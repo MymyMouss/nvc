@@ -75,6 +75,8 @@
 #define ARCH_I386 1
 #elif defined __aarch64__
 #define ARCH_ARM64 1
+#elif defined __powerpc64__
+#define ARCH_PPC64 1
 #endif
 
 #ifdef __MINGW32__
@@ -230,8 +232,8 @@ void fatal_trace(const char *fmt, ...)
    __attribute__((format(printf, 1, 2), noreturn, cold, noinline));
 void fatal_errno(const char *fmt, ...)
    __attribute__((format(printf, 1, 2), noreturn, cold, noinline));
-
-const char *last_os_error(void);
+void fatal_win32(const char *fmt, ...)
+   __attribute__((format(printf, 1, 2), noreturn, cold, noinline));
 
 #define likely(x) __builtin_expect((x), 1)
 #define unlikely(x) __builtin_expect((x), 0)

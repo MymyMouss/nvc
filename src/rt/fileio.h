@@ -37,4 +37,31 @@ file_handle_t file_open(const char *name, file_mode_t mode);
 bool file_close(file_handle_t fh);
 FILE *file_stream(file_handle_t fh);
 
+// Support for forked copies of the simulation (see mcp-worker.c).  Save
+// the position of every open file before forking, and in the copy reopen
+// them all.  The latter returns NULL or a message for the caller to free.
+void file_save_positions(void);
+char *file_reopen_all(void);
+unsigned file_count_open(void);
+
+// Description of an open file for a checkpoint.  Files written by the
+// design are saved with their contents so that restoring does not depend
+// on what the original run did to them afterwards; input files must be
+// unchanged.
+typedef struct {
+   bool         predef;     // STD_INPUT or STD_OUTPUT
+   file_mode_t  mode;
+   char        *name;
+   int64_t      size;
+   int64_t      pos;
+   uint64_t     hash;       // Of the contents, input files only
+   uint8_t     *data;       // Contents of output files
+} file_ckpt_t;
+
+unsigned file_enum_open(file_handle_t *out, unsigned max);
+char *file_ckpt_describe(file_handle_t fh, file_ckpt_t *out);
+char *file_ckpt_apply(const file_ckpt_t *in, file_handle_t cur,
+                      file_handle_t *out);
+void file_ckpt_free(file_ckpt_t *f);
+
 #endif  // _RT_FILEIO_H

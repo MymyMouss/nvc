@@ -1,5 +1,5 @@
 //
-//  Copyright (C) 2022-2024  Nick Gasson
+//  Copyright (C) 2022-2026  Nick Gasson
 //
 //  This program is free software: you can redistribute it and/or modify
 //  it under the terms of the GNU General Public License as published by
@@ -25,8 +25,8 @@
 #include "object.h"
 #include "psl/psl-node.h"
 #include "rt/assert.h"
+#include "rt/defs.h"
 #include "rt/mspace.h"
-#include "rt/rt.h"
 #include "rt/structs.h"
 #include "type.h"
 #include "vlog/vlog-number.h"
@@ -48,7 +48,7 @@ void x_index_fail(int64_t value, int64_t left, int64_t right, int8_t dir,
    LOCAL_TEXT_BUF tb = tb_new();
    tb_cat(tb, "index ");
    to_string(tb, type, value);
-   tb_printf(tb, " outside of %s range ", type_pp(type));
+   tb_printf(tb, " outside of %pT range ", type);
    to_string(tb, type, left);
    tb_cat(tb, dir == RANGE_TO ? " to " : " downto ");
    to_string(tb, type, right);
@@ -139,7 +139,7 @@ void x_length_fail(int64_t left, int64_t right, int32_t dim, tree_t where)
    case T_TYPE_CONV:
    case T_ATTR_REF:
    case T_AGGREGATE:
-      tb_printf(tb, "subtype %s", type_pp(tree_type(where)));
+      tb_printf(tb, "subtype %pT", tree_type(where));
       break;
    default:
       tb_cat(tb, "target");
@@ -171,7 +171,7 @@ void x_range_fail(int64_t value, int64_t left, int64_t right, int8_t dir,
    LOCAL_TEXT_BUF tb = tb_new();
    tb_cat(tb, "value ");
    to_string(tb, type, value);
-   tb_printf(tb, " outside of %s range ", type_pp(type));
+   tb_printf(tb, " outside of %pT range ", type);
    to_string(tb, type, left);
    tb_cat(tb, dir == RANGE_TO ? " to " : " downto ");
    to_string(tb, type, right);
@@ -233,8 +233,8 @@ void x_overflow(int64_t lhs, int64_t rhs, tree_t where)
    }
 
    jit_msg(tree_loc(where), DIAG_FATAL,
-           "result of %s cannot be represented as %s",
-           tb_get(tb), type_pp(tree_type(where)));
+           "result of %s cannot be represented as %pT",
+           tb_get(tb), tree_type(where));
 }
 
 void x_null_deref(tree_t where)
@@ -275,25 +275,37 @@ void x_func_wait(void)
 ////////////////////////////////////////////////////////////////////////////////
 // Entry point from interpreter or JIT compiled code
 
-DLLEXPORT
-void __nvc_sched_waveform(jit_anchor_t *anchor, jit_scalar_t *args,
-                          tlab_t *tlab)
+void fast_sched_waveform(jit_anchor_t *anchor, sig_shared_t *shared,
+                         int32_t offset, int32_t count, jit_scalar_t value,
+                         int64_t after, int64_t reject, bool scalar)
 {
    jit_thread_local_t *thread = jit_attach_thread(anchor);
-
-   sig_shared_t *shared = args[0].pointer;
-   int32_t       offset = args[1].integer;
-   int32_t       count  = args[2].integer;
-   jit_scalar_t  value  = { .integer = args[3].integer };
-   int64_t       after  = args[4].integer;
-   int64_t       reject = args[5].integer;
-   bool          scalar = args[6].integer;
 
    if (scalar)
       x_sched_waveform_s(shared, offset, value.integer, after, reject);
    else
       x_sched_waveform(shared, offset, value.pointer, count,
                        after, reject);
+
+   thread->anchor = NULL;
+}
+
+void fast_sched_waveform_s0(jit_anchor_t *anchor, sig_shared_t *shared,
+                            int32_t offset, jit_scalar_t value)
+{
+   jit_thread_local_t *thread = jit_attach_thread(anchor);
+
+   x_sched_waveform_s0(shared, offset, value.integer);
+
+   thread->anchor = NULL;
+}
+
+void fast_sched_waveform_0(jit_anchor_t *anchor, sig_shared_t *shared,
+                           int32_t offset, int32_t count, jit_scalar_t value)
+{
+   jit_thread_local_t *thread = jit_attach_thread(anchor);
+
+   x_sched_waveform(shared, offset, value.pointer, count, 0, 0);
 
    thread->anchor = NULL;
 }
@@ -312,7 +324,6 @@ void __nvc_test_event(jit_anchor_t *anchor, jit_scalar_t *args, tlab_t *tlab)
    thread->anchor = NULL;
 }
 
-DLLEXPORT
 void __nvc_last_event(jit_anchor_t *anchor, jit_scalar_t *args, tlab_t *tlab)
 {
    jit_thread_local_t *thread = jit_attach_thread(anchor);
@@ -326,14 +337,51 @@ void __nvc_last_event(jit_anchor_t *anchor, jit_scalar_t *args, tlab_t *tlab)
    thread->anchor = NULL;
 }
 
-DLLEXPORT
-void __nvc_sched_process(jit_anchor_t *anchor, jit_scalar_t *args, tlab_t *tlab)
+void fast_sched_process(jit_anchor_t *anchor, int64_t after)
 {
    jit_thread_local_t *thread = jit_attach_thread(anchor);
 
-   int64_t after = args[0].integer;
-
    x_sched_process(after);
+
+   thread->anchor = NULL;
+}
+
+void fast_drive_signal(jit_anchor_t *anchor, sig_shared_t *shared,
+                       int32_t offset, int32_t count)
+{
+   jit_thread_local_t *thread = jit_attach_thread(anchor);
+
+   x_drive_signal(shared, offset, count);
+
+   thread->anchor = NULL;
+}
+
+void fast_sched_event(jit_anchor_t *anchor, sig_shared_t *shared,
+                      int32_t offset, int32_t count)
+{
+   jit_thread_local_t *thread = jit_attach_thread(anchor);
+
+   x_sched_event(shared, offset, count);
+
+   thread->anchor = NULL;
+}
+
+void fast_length_fail(jit_anchor_t *anchor, int64_t left, int64_t right,
+                      int32_t dim, tree_t where)
+{
+   jit_thread_local_t *thread = jit_attach_thread(anchor);
+
+   x_length_fail(left, right, dim, where);
+
+   thread->anchor = NULL;
+}
+
+void fast_index_fail(jit_anchor_t *anchor, int64_t value, int64_t left,
+                     int64_t right, int8_t dir, tree_t where, tree_t hint)
+{
+   jit_thread_local_t *thread = jit_attach_thread(anchor);
+
+   x_index_fail(value, left, right, dir, where, hint);
 
    thread->anchor = NULL;
 }
@@ -368,6 +416,16 @@ void __nvc_do_exit(jit_exit_t which, jit_anchor_t *anchor, jit_scalar_t *args,
          object_t *where    = args[3].pointer;
 
          x_report(msg, len, severity, where);
+      }
+      break;
+
+   case JIT_EXIT_TCHECK:
+      {
+         int64_t   stamp = args[0].integer;
+         int64_t   limit = args[1].integer;
+         object_t *where = args[2].pointer;
+
+         x_timing_check(stamp, limit, where);
       }
       break;
 
@@ -450,11 +508,44 @@ void __nvc_do_exit(jit_exit_t which, jit_anchor_t *anchor, jit_scalar_t *args,
       break;
 
    case JIT_EXIT_SCHED_PROCESS:
-      __nvc_sched_process(anchor, args, tlab);
+      {
+         int64_t after = args[0].integer;
+
+         x_sched_process(after);
+      }
       break;
 
    case JIT_EXIT_SCHED_WAVEFORM:
-      __nvc_sched_waveform(anchor, args, tlab);
+      {
+         sig_shared_t *shared = args[0].pointer;
+         int32_t       offset = args[1].integer;
+         int32_t       count  = args[2].integer;
+         jit_scalar_t  value  = { .integer = args[3].integer };
+         int64_t       after  = args[4].integer;
+         int64_t       reject = args[5].integer;
+         bool          scalar = args[6].integer;
+
+         if (scalar)
+            x_sched_waveform_s(shared, offset, value.integer, after, reject);
+         else
+            x_sched_waveform(shared, offset, value.pointer, count,
+                             after, reject);
+      }
+      break;
+
+   case JIT_EXIT_SCHED_ZERO:
+      {
+         sig_shared_t *shared = args[0].pointer;
+         int32_t       offset = args[1].integer;
+         int32_t       count  = args[2].integer;
+         jit_scalar_t  value  = { .integer = args[3].integer };
+         bool          scalar = args[4].integer;
+
+         if (scalar)
+            x_sched_waveform_s(shared, offset, value.integer, 0, 0);
+         else
+            x_sched_waveform(shared, offset, value.pointer, count, 0, 0);
+      }
       break;
 
    case JIT_EXIT_SCHED_INACTIVE:
@@ -560,7 +651,7 @@ void __nvc_do_exit(jit_exit_t which, jit_anchor_t *anchor, jit_scalar_t *args,
       }
       break;
 
-   case JIT_EXIT_FORCE:
+   case JIT_EXIT_SCHED_FORCE:
       {
          sig_shared_t *shared = args[0].pointer;
          int32_t       offset = args[1].integer;
@@ -569,19 +660,45 @@ void __nvc_do_exit(jit_exit_t which, jit_anchor_t *anchor, jit_scalar_t *args,
          bool          scalar = args[4].integer;
 
          if (scalar)
-            x_force(shared, offset, count, &value.integer);
+            x_sched_force(shared, offset, count, &value.integer);
          else
-            x_force(shared, offset, count, value.pointer);
+            x_sched_force(shared, offset, count, value.pointer);
       }
       break;
 
-   case JIT_EXIT_RELEASE:
+   case JIT_EXIT_SCHED_RELEASE:
       {
          sig_shared_t *shared = args[0].pointer;
          int32_t       offset = args[1].integer;
          int32_t       count  = args[2].integer;
 
-         x_release(shared, offset, count);
+         x_sched_release(shared, offset, count);
+      }
+      break;
+
+   case JIT_EXIT_FORCE_SIGNAL:
+      {
+         sig_shared_t *shared = args[0].pointer;
+         int32_t       offset = args[1].integer;
+         int32_t       count  = args[2].integer;
+         jit_scalar_t  value  = { .integer = args[3].integer };
+         bool          scalar = args[4].integer;
+
+         if (scalar)
+            x_force_signal(shared, offset, count, &value.integer);
+         else
+            x_force_signal(shared, offset, count, value.pointer);
+      }
+      break;
+
+   case JIT_EXIT_RELEASE_SIGNAL:
+      {
+         sig_shared_t *shared = args[0].pointer;
+         int32_t       offset = args[1].integer;
+         int32_t       count  = args[2].integer;
+         release_mode_t mode  = args[3].integer;
+
+         x_release_signal(shared, offset, count, mode);
       }
       break;
 
@@ -906,8 +1023,9 @@ void __nvc_do_exit(jit_exit_t which, jit_anchor_t *anchor, jit_scalar_t *args,
          const uint8_t *spec   = args[0].pointer;
          size_t         length = args[1].integer;
          tree_t         where  = args[2].pointer;
+         tree_t         region = args[3].pointer;
 
-         jit_bind_foreign(anchor->func, spec, length, where);
+         jit_bind_foreign(anchor->func, spec, length, where, region);
       }
       break;
 
@@ -923,7 +1041,7 @@ void __nvc_do_exit(jit_exit_t which, jit_anchor_t *anchor, jit_scalar_t *args,
 
    case JIT_EXIT_BIND_EXTERNAL:
       {
-         tree_t       where = args[0].pointer;
+         object_t    *where = args[0].pointer;
          jit_handle_t scope = args[1].integer;
 
          x_bind_external(where, scope, args);
@@ -979,6 +1097,7 @@ void __nvc_vec4op(jit_vec_op_t op, jit_anchor_t *anchor, jit_scalar_t *args,
    case JIT_VEC_SGE:
    case JIT_VEC_AND1:
    case JIT_VEC_OR1:
+   case JIT_VEC_XOR1:
       {
          assert(size > 64);
 
@@ -1054,6 +1173,10 @@ void __nvc_vec4op(jit_vec_op_t op, jit_anchor_t *anchor, jit_scalar_t *args,
          case JIT_VEC_OR1:
             bresult = vec2_or1(size, xb);
             aresult = vec2_or1(size, xa) | bresult;
+            break;
+         case JIT_VEC_XOR1:
+            bresult = vec2_or1(size, xb);
+            aresult = vec2_xor1(size, xa) | bresult;
             break;
          case JIT_VEC_LOG_NOT:
             {
@@ -1148,8 +1271,8 @@ void __nvc_vec4op(jit_vec_op_t op, jit_anchor_t *anchor, jit_scalar_t *args,
          uint64_t *aresult = ptr, *bresult = aresult + nwords;
 
          const int arg_size = args[2].integer;
-         const uint64_t msb_mask =
-            arg_size % 64 != 0 ? UINT64_C(1) << ((arg_size % 64) - 1) : 0;
+         const int msb_word = (arg_size - 1) / 64;
+         const uint64_t msb_mask = UINT64_C(1) << ((arg_size - 1) % 64);
          const bool sext = op == JIT_VEC_SEXT;
 
          if (arg_size <= 64) {
@@ -1176,9 +1299,9 @@ void __nvc_vec4op(jit_vec_op_t op, jit_anchor_t *anchor, jit_scalar_t *args,
             const uint64_t *bsrc = args[1].pointer;
 
             const uint64_t aext =
-               sext && (asrc[arg_size / 64] & msb_mask) ? ~UINT64_C(0) : 0;
+               sext && (asrc[msb_word] & msb_mask) ? ~UINT64_C(0) : 0;
             const uint64_t bext =
-               sext && (bsrc[arg_size / 64] & msb_mask) ? ~UINT64_C(0) : 0;
+               sext && (bsrc[msb_word] & msb_mask) ? ~UINT64_C(0) : 0;
 
             const int full_words = arg_size / 64;
             const int partial_index = (arg_size % 64) != 0 ? full_words : -1;
@@ -1267,6 +1390,71 @@ void __nvc_vec4op(jit_vec_op_t op, jit_anchor_t *anchor, jit_scalar_t *args,
 
          args[0].pointer = aresult;
          args[1].pointer = bresult;
+      }
+      break;
+   case JIT_VEC_EXTRACT:
+      {
+         const int arg_size = args[2].integer;
+         const int pos      = args[3].integer;
+
+         assert(arg_size > 64);
+
+         const int bitpos = arg_size - size - pos;
+         const uint64_t *afull = args[0].pointer;
+         const uint64_t *bfull = args[1].pointer;
+
+         if (size <= 64) {
+            const int word = bitpos / 64;
+            const int shift = bitpos % 64;
+
+            uint64_t abits = afull[word] >> shift;
+            uint64_t bbits = bfull != NULL ? bfull[word] >> shift : 0;
+
+            if (shift != 0 && size > 64 - shift) {
+               abits |= afull[word + 1] << (64 - shift);
+               if (bfull != NULL)
+                  bbits |= bfull[word + 1] << (64 - shift);
+            }
+
+            if (size < 64) {
+               const uint64_t mask = ~UINT64_C(0) >> (64 - size);
+               abits &= mask;
+               bbits &= mask;
+            }
+
+            args[0].integer = abits;
+            args[1].integer = bbits;
+         }
+         else {
+            void *ptr = jit_mspace_alloc(nwords * 2 * sizeof(uint64_t));
+            uint64_t *aresult = ptr, *bresult = aresult + nwords;
+
+            for (int i = 0; i < nwords; i++) {
+               const int offset = bitpos + i * 64;
+               const int word = offset / 64;
+               const int shift = offset % 64;
+               const int remain = size - i * 64;
+               const int chunk = MIN(remain, 64);
+
+               aresult[i] = afull[word] >> shift;
+               bresult[i] = bfull != NULL ? bfull[word] >> shift : 0;
+
+               if (shift != 0 && chunk > 64 - shift) {
+                  aresult[i] |= afull[word + 1] << (64 - shift);
+                  if (bfull != NULL)
+                     bresult[i] |= bfull[word + 1] << (64 - shift);
+               }
+
+               if (chunk < 64) {
+                  const uint64_t mask = ~UINT64_C(0) >> (64 - chunk);
+                  aresult[i] &= mask;
+                  bresult[i] &= mask;
+               }
+            }
+
+            args[0].pointer = aresult;
+            args[1].pointer = bresult;
+         }
       }
       break;
    case JIT_VEC_TERNARY:
@@ -1375,6 +1563,9 @@ void __nvc_vec4op(jit_vec_op_t op, jit_anchor_t *anchor, jit_scalar_t *args,
             break;
          case JIT_VEC_EXP:
             vec4_exp(size, aresult, bresult, a2, b2);
+            break;
+         case JIT_VEC_NEGATE:
+            vec4_neg(size, aresult, bresult);
             break;
          default:
             should_not_reach_here();

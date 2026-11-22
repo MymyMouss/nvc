@@ -20,6 +20,7 @@
 #include "diag.h"
 #include "jit/jit-ffi.h"
 #include "option.h"
+#include "printf.h"
 #include "rt/assert.h"
 #include "type.h"
 #include "vhpi/vhpi-macros.h"
@@ -151,7 +152,7 @@ void vhpi_trace(const char *func, const char *fmt, ...)
    va_start(ap, fmt);
 
    fprintf(stderr, "VHPI: %s ", func);
-   vfprintf(stderr, fmt, ap);
+   nvc_vfprintf(nvc_stderr(), fmt, ap);
    fprintf(stderr, "\n");
 
    va_end(ap);
@@ -369,6 +370,9 @@ void vhpi_load_plugins(const char *plugins)
    char *plugins_copy LOCAL = xstrdup(plugins);
 
    char *tok = strtok(plugins_copy, ",");
+   if (tok == NULL)
+      return;
+
    do {
       jit_dll_t *dll = ffi_load_dll(tok);
 

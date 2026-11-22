@@ -520,11 +520,14 @@ START_TEST(test_vlog1)
              "  parameter /* implicit */ [7:0] p1 = 5;\n"
              "  localparam bit p2 = 0;\n"
              "  logic [7:0] array1 [127:0];\n"
-             "  function func;\n"
-             "    input p;\n"
+             "  function func; -- WORK.MOD2.func\n"
+             "    input /* implicit */ [7:0] p;\n"
              "  endfunction\n"
              "  enum byte { a=5, b } e1;\n"
              "  logic signed [3:0] s1;\n"
+             "  tri0 /* implicit */ grst = glbl.grst;\n"
+             "  typedef enum int { RED, GREEN, BLUE } t_color;\n"
+             "  integer arr [];\n"
              "  initial begin\n"
              "    $display(\"hello\", $time);\n"
              "    if (bus) r <= 1 | r;\n"
@@ -552,6 +555,7 @@ START_TEST(test_vlog1)
              "    1'b0, 1'b1: r = p1[3:0];\n"
              "    default: r = 0;\n"
              "  endcase\n"
+             "  initial arr = new [5] (p2);\n"
              "endmodule // mod2\n\n");
    tb_rewind(tb);
 
@@ -586,6 +590,7 @@ START_TEST(test_vlog1)
              "  real v1 = 1.5;\n"
              "  integer v2 = x ? 1 : 2;\n"
              "  wire logic zz;\n"
+             "  genvar integer i;\n"
              "  initial begin\n"
              "    if (x || (y === z)) ;\n"
              "    if ((x & y) | (y & (z === (x + z)))) ;\n"
@@ -595,7 +600,28 @@ START_TEST(test_vlog1)
              "  assign z = {x, y};\n"
              "  assign zz = {5{z}};\n"
              "  final v1 /= 2;\n"
+             "  for (i = 1; i <= 4; i = i + 1;) begin\n"
+             "  end\n"
              "endmodule // mod3\n\n");
+   tb_rewind(tb);
+
+   vlog_node_t m5 = vlog_parse();
+   fail_if(m5 == NULL);
+
+   vlog_dump(m5, 0);
+   diff_dump(tb_get(tb),
+             "module mod4;\n"
+             "  wire /* implicit */ d;\n"
+             "  wire /* implicit */ clk;\n"
+             "  wire /* implicit */ en;\n"
+             "  specify\n"
+             "    $setup(d, clk, 10);\n"
+             "    $setup(edge d, clk, 10);\n"
+             "    $setup(negedge d, posedge clk, 5);\n"
+             "    $hold(posedge clk &&& en, negedge d &&& en, 3);\n"
+             "  endspecify\n"
+             "endmodule // mod4\n"
+             "\n");
    tb_rewind(tb);
 
    fail_if_errors();

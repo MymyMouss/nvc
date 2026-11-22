@@ -2405,7 +2405,11 @@ void vcode_dump_with_mark(int mark_op, vcode_dump_fn_t callback, void *arg)
                vcode_dump_reg(op->args.items[1]);
                if (op->args.count > 2) {
                   printf(" locus ");
-                  vcode_dump_reg(op->args.items[1]);
+                  vcode_dump_reg(op->args.items[2]);
+               }
+               if (op->args.count > 3) {
+                  printf(" region ");
+                  vcode_dump_reg(op->args.items[3]);
                }
             }
             break;
@@ -2416,7 +2420,8 @@ void vcode_dump_with_mark(int mark_op, vcode_dump_fn_t callback, void *arg)
                col += vcode_dump_reg(op->result);
                col += nvc_printf(" := %s ", vcode_op_string(op->kind));
                col += vcode_dump_reg(op->args.items[0]);
-               col += nvc_printf(" scope $magenta$%s$$ ", istr(op->ident));
+               if (op->ident != NULL)
+                  col += nvc_printf(" scope $magenta$%pi$$ ", op->ident);
                for (int i = 1; i < op->args.count; i++) {
                   if (i > 1) col += printf(", ");
                   col += vcode_dump_reg(op->args.items[i]);
@@ -3250,8 +3255,6 @@ vcode_unit_t emit_procedure(ident_t name, object_t *obj, vcode_unit_t context)
 
 vcode_unit_t emit_process(ident_t name, object_t *obj, vcode_unit_t context)
 {
-   assert(context->kind == VCODE_UNIT_INSTANCE);
-
    vcode_unit_t vu = xcalloc(sizeof(struct _vcode_unit));
    vu->kind     = VCODE_UNIT_PROCESS;
    vu->name     = name;
@@ -6181,13 +6184,16 @@ void emit_deposit_signal(vcode_reg_t target, vcode_reg_t count,
                 "signal cannot be values argument for deposit signal");
 }
 
-void emit_bind_foreign(vcode_reg_t spec, vcode_reg_t length, vcode_reg_t locus)
+void emit_bind_foreign(vcode_reg_t spec, vcode_reg_t length, vcode_reg_t locus,
+                       vcode_reg_t region)
 {
    op_t *op = vcode_add_op(VCODE_OP_BIND_FOREIGN);
    vcode_add_arg(op, spec);
    vcode_add_arg(op, length);
    if (locus != VCODE_INVALID_REG)
       vcode_add_arg(op, locus);
+   if (region != VCODE_INVALID_REG)
+      vcode_add_arg(op, region);
 
    VCODE_ASSERT(vcode_reg_kind(spec) == VCODE_TYPE_POINTER,
                 "spec argument to bind foreign must be a pointer");
@@ -6196,6 +6202,11 @@ void emit_bind_foreign(vcode_reg_t spec, vcode_reg_t length, vcode_reg_t locus)
    VCODE_ASSERT(locus == VCODE_INVALID_REG
                 || vcode_reg_kind(locus) == VCODE_TYPE_DEBUG_LOCUS,
                 "locus argument to bind foreign value must be a debug locus");
+   VCODE_ASSERT(region == VCODE_INVALID_REG
+                || vcode_reg_kind(region) == VCODE_TYPE_DEBUG_LOCUS,
+                "region argument to bind foreign value must be a debug locus");
+   VCODE_ASSERT(locus != VCODE_INVALID_REG || region == VCODE_INVALID_REG,
+                "region only valid with locus");
 }
 
 vcode_reg_t emit_instance_name(vcode_reg_t kind)

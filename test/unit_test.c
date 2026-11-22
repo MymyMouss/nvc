@@ -30,6 +30,7 @@
 #include <time.h>
 
 Suite *get_ident_tests(void);
+Suite *get_checkmap_tests(void);
 Suite *get_lower_tests(void);
 
 #define RUN_TESTS(name)                                         \
@@ -93,6 +94,7 @@ int main(int argc, char **argv)
 
    int nfail = 0;
    nfail += RUN_TESTS(ident);
+   nfail += RUN_TESTS(checkmap);
    nfail += RUN_TESTS(misc);
    nfail += RUN_TESTS(lib);
    nfail += RUN_TESTS(parse);
@@ -120,6 +122,7 @@ int main(int argc, char **argv)
    nfail += RUN_TESTS(driver);
    nfail += RUN_TESTS(mir);
    nfail += RUN_TESTS(cover);
+   nfail += RUN_TESTS(mcp);
 
    return nfail == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

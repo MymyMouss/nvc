@@ -1,4 +1,4 @@
-AC_INIT([nvc], [1.22-devel],
+AC_INIT([nvc], [1.24-devel],
         [https://github.com/nickg/nvc/issues],
         [nvc],
         [https://www.nickg.me.uk/nvc/])
@@ -285,6 +285,10 @@ case $host_os in
     DLL_EXT=dll
     LIB_EXT=lib
     ;;
+  darwin*)
+    DLL_EXT=dylib
+    LIB_EXT=a
+    ;;
   *)
     DLL_EXT=so
     LIB_EXT=a
@@ -300,7 +304,7 @@ AM_CONDITIONAL([IMPLIB_REQUIRED], [test x$implib_required = xyes])
 
 case $host_os in
   darwin*)
-    SHLIB_LDFLAGS="-shared -flat_namespace -undefined dynamic_lookup"
+    SHLIB_LDFLAGS="-shared -undefined dynamic_lookup"
 
     AX_CHECK_LINK_FLAG(
       [-Wl,-no_fixup_chains],
@@ -489,5 +493,5 @@ ARFLAGS="${ARFLAGS:-cr}"
 AC_SUBST(ARFLAGS)
 
 AC_CONFIG_HEADERS([config.h])
-AC_CONFIG_FILES([Makefile])
+AC_CONFIG_FILES([Makefile contrib/nvc.pc])
 AC_OUTPUT

@@ -129,6 +129,7 @@ INTEGER         [0-9][0-9_]*
 EXPONENT        [Ee][+-]?{INTEGER}
 DECIMAL         {INTEGER}(\.{INTEGER})?{EXPONENT}?
 HEX             [0-9a-fA-FzZxX][0-9a-fA-FzZxX_]*
+VLOG_DIGITS     [0-9a-fA-FzZxX?][0-9a-fA-FzZxX?_]*
 BASED_HASH      {INTEGER}[#]{HEX}(\.{HEX})?[#]{EXPONENT}?
 BASED_COLON     {INTEGER}[:]{HEX}(\.{HEX})?[:]{EXPONENT}?
 BASED           {BASED_HASH}|{BASED_COLON}
@@ -143,13 +144,14 @@ TRANSLATE_ON    {PRAGMA}(?i:pragma)[ \t]+(?i:translate_on).*
 PSL_COMMENT     {PRAGMA}(?i:psl)
 PSL_CONT        ^{SPACE}*({PSL_COMMENT}|"--")
 UTF8_MB         [\x80-\xff][\x80-\xbf]{1,3}
-VLOG_NUMBER     ({INTEGER}{SPACE}*)?\'s?[bhdoBHDO]{SPACE}*({HEX}|[?])+
-VLOG_REAL       {INTEGER}\.{INTEGER}
+VLOG_NUMBER     ({INTEGER}{SPACE}*)?\'[sS]?[bhdoBHDO]{SPACE}*{VLOG_DIGITS}
+VLOG_REAL       ({INTEGER}\.{INTEGER}{EXPONENT}?|{INTEGER}{EXPONENT})
 UDP_LEVEL       [01xX?bB]
 UDP_EDGE        [rRfFpPnN*]
 SCALAR_ZERO     ('b0|'B0|1'b0|1'B0)
 SCALAR_ONE      ('b1|'B1|1'b1|1'B1)
 PAREN_STAR      "("{SPACE}*"*"{SPACE}*")"
+TIME_LITERAL    {INTEGER}(s|ms|us|ns|ps|fs)
 
 %x COMMENT C_COMMENT PSL VLOG UDP SDF SDF_EXPR CSTRING PROTECT
 %x STRING PSTRING BITSTRING PBITSTRING
@@ -714,6 +716,7 @@ PROTECT           ?i:protect
 <VLOG>"fork"             { return tFORK; }
 <VLOG>"join"             { return tJOIN; }
 <VLOG>"automatic"        { return KEYWORD_2001(tAUTOMATIC); }
+<VLOG>"property"         { return KEYWORD_2005(tPROPERTY); }
 <VLOG>"`timescale"       { return tTIMESCALE; }
 <VLOG>"`default_nettype" { return tDEFNETTYPE; }
 <VLOG>"`celldefine"      { }
@@ -781,6 +784,9 @@ PROTECT           ?i:protect
 <VLOG>"+=>"              { yyless(1); return tPLUS; }
 <VLOG>"-=>"              { yyless(1); return tMINUS; }
 <VLOG>"::"               { return tSCOPE; }
+<VLOG>"|->"              { return tSUFFIXOVR; }
+<VLOG>"|=>"              { return tSUFFIXNON; }
+<VLOG>"##"               { return tCYCLEDLY; }
 <VLOG>"var"              { return KEYWORD_2005(tVAR); }
 <VLOG>"specify"          { return tSPECIFY; }
 <VLOG>"endspecify"       { return tENDSPECIFY; }
@@ -863,6 +869,7 @@ PROTECT           ?i:protect
 <VLOG>"genvar"           { return KEYWORD_2001(tGENVAR); }
 <VLOG>"assert"           { return KEYWORD_2005(tASSERT); }
 <VLOG>"assume"           { return KEYWORD_2005(tASSUME); }
+<VLOG>"cover"            { return KEYWORD_2005(tCOVER); }
 <VLOG>"class"            { return KEYWORD_2005(tCLASS); }
 <VLOG>"chandle"          { return KEYWORD_2005(tCHANDLE); }
 <VLOG>"export"           { return KEYWORD_2005(tEXPORT); }
@@ -898,6 +905,7 @@ PROTECT           ?i:protect
 <VLOG>{VLOG_ID}          { yylval.ident = ident_new(yytext); return tID; }
 <VLOG>{VLOG_ESCAPED}     { yylval.ident = ident_new(yytext + 1); return tID; }
 <VLOG>{INTEGER}          { yylval.str = xstrdup(yytext); return tUNSNUM; }
+<VLOG>{TIME_LITERAL}     { yylval.str = xstrdup(yytext); return tTIMELIT; }
 <VLOG>{VLOG_NUMBER}      { yylval.str = xstrdup(yytext); return tNUMBER; }
 <VLOG>{VLOG_REAL}        { return parse_verilog_real(yytext); };
 <VLOG>{PAREN_STAR}       { return tPARENSTAR; }
@@ -1265,7 +1273,10 @@ static int parse_verilog_real(const char *str)
 {
    // unsigned_number [ . unsigned_number ] exp [ sign ] unsigned_number
 
-   yylval.real = strtod(str, NULL);
+   char *tmp LOCAL = xstrdup(str);
+   strip_underscores(tmp);
+
+   yylval.real = strtod(tmp, NULL);
    return tREAL;
 }
 

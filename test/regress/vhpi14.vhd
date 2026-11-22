@@ -31,6 +31,25 @@ architecture test of vhpi14 is
 
     attribute foreign of test2 : procedure is "VHPI lib test2";
 
+    procedure test3 (x : inout integer; y : in integer) is
+    begin
+    end procedure;
+
+    attribute foreign of test3 : procedure is "VHPI lib test3";
+
+    function get_width return integer is
+    begin
+        return 4;
+    end function;
+
+    constant WIDTH : integer := get_width;
+
+    procedure test4 (x : inout t_int_vec(1 to WIDTH); y : in integer) is
+    begin
+    end procedure;
+
+    attribute foreign of test4 : procedure is "VHPI lib test4";
+
     function iota (n : natural) return t_int_vec is
     begin
     end function;
@@ -53,6 +72,7 @@ begin
     p: process is
         variable v1 : t_int_vec(1 to 4) := (1, 2, 3, 4);
         variable v2 : std_ulogic;
+        variable v3 : integer;
     begin
         assert add2(1) = 3;
         assert add2(-1) = 1;
@@ -69,6 +89,29 @@ begin
         v1 := (-4, -3, -2, -1);
         test2(v1, 2);
         assert v1 = (-2, -1, 0, 1);
+
+        v3 := 1;
+        test3(v3, 2);
+        assert v3 = 3;
+
+        v3 := 2;
+        test3(v3, 2);
+        assert v3 = 4;
+
+        v3 := -4;
+        test3(v3, 2);
+        assert v3 = -2;
+
+        v3 := -2;
+        test3(v3, 2);
+        assert v3 = 0;
+
+        v3 := -1;
+        test3(v3, 2);
+        assert v3 = 1;
+
+        test4(v1, 1);
+        assert v1 = (-1, 0, 1, 2);
 
         assert iota(2) = (0, 1);
         assert iota(4) = (0, 1, 2, 3);

@@ -23,8 +23,8 @@
 #include "mask.h"
 #include "jit/jit.h"
 #include "jit/jit-ffi.h"
+#include "rt/defs.h"
 #include "rt/mspace.h"
-#include "rt/rt.h"
 #include "thread.h"
 
 typedef void *(*value_fn_t)(rt_nexus_t *);
@@ -61,6 +61,8 @@ typedef struct _rt_trigger {
    void           *pending;
    rt_trigger_t   *chain;
    trigger_kind_t  kind;
+   ident_t         owner;     // Name of the process that created it
+   unsigned        id;        // Creation order, for checkpoints
    jit_scalar_t    result;
    jit_scalar_t    args[];
 } rt_trigger_t;
@@ -132,7 +134,7 @@ typedef struct {
 
 typedef struct {
    rt_nexus_t *nexus;
-   rt_value_t  value;
+   waveform_t  waveforms;
 } rt_pseudo_t;
 
 typedef struct _rt_source {
@@ -142,7 +144,6 @@ typedef struct _rt_source {
    unsigned        disconnected : 1;
    unsigned        fastqueued : 1;
    unsigned        sigqueued : 1;
-   unsigned        pseudoqueued : 1;
    unsigned        was_active : 1;
    union {
       rt_port_t      port;

@@ -1014,8 +1014,7 @@ tree_t range_of(type_t type, unsigned dim)
    case T_ENUM:
       return type_dim(type, dim);
    default:
-      fatal_trace("invalid type kind %s for %s in range_of",
-                  type_kind_str(type_kind(type)), type_pp(type));
+      fatal_trace("invalid type kind %pK for %pT in range_of", type, type);
    }
 }
 
@@ -1078,14 +1077,6 @@ type_t index_type_of(type_t type, unsigned dim)
       return index_type_of(type_designated(type), dim);
    else
       return tree_type(range_of(base, dim));
-}
-
-int64_t rebase_index(type_t array_type, int dim, int64_t value)
-{
-   // Convert value which is in the range of array_type to a zero-based index
-   tree_t r = range_of(array_type, dim);
-   const int64_t left = assume_int(tree_left(r));
-   return (tree_subkind(r) == RANGE_TO) ? value - left : left - value;
 }
 
 ident_t well_known(well_known_t id)
@@ -1154,6 +1145,11 @@ void intern_strings(void)
       [W_DLR_SIGNED]      = "$signed",
       [W_DLR_UNSIGNED]    = "$unsigned",
       [W_DLR_CLOG2]       = "$clog2",
+      [W_DLR_SQRT]        = "$sqrt",
+      [W_DLR_BITS]        = "$bits",
+      [W_DLR_RTOI]        = "$rtoi",
+      [W_DLR_CEIL]        = "$ceil",
+      [W_DLR_FLOOR]        = "$floor",
       [W_COUNTERS]        = "#counters",
 
       [W_IEEE_LOGIC_VECTOR]      = "IEEE.STD_LOGIC_1164.STD_LOGIC_VECTOR",
@@ -1613,6 +1609,14 @@ tree_t primary_unit_of(tree_t unit)
       fatal_trace("invalid kind %s in primary_unit_of",
                   tree_kind_str(tree_kind(unit)));
    }
+}
+
+static int64_t rebase_index(type_t array_type, int dim, int64_t value)
+{
+   // Convert value which is in the range of array_type to a zero-based index
+   tree_t r = range_of(array_type, dim);
+   const int64_t left = assume_int(tree_left(r));
+   return (tree_subkind(r) == RANGE_TO) ? value - left : left - value;
 }
 
 unsigned get_case_choice_char(tree_t value, int depth)
@@ -2247,16 +2251,20 @@ static void build_wait_for_target(tree_t expr, build_wait_fn_t fn, void *ctx)
    switch (tree_kind(expr)) {
    case T_ARRAY_SLICE:
       build_wait(tree_range(expr, 0), fn, ctx);
+      build_wait_for_target(tree_value(expr), fn, ctx);
       break;
-
    case T_ARRAY_REF:
       {
          const int nparams = tree_params(expr);
          for (int i = 0; i < nparams; i++)
             build_wait(tree_value(tree_param(expr, i)), fn, ctx);
+
+         build_wait_for_target(tree_value(expr), fn, ctx);
       }
       break;
-
+   case T_RECORD_REF:
+      build_wait_for_target(tree_value(expr), fn, ctx);
+      break;
    default:
       break;
    }
@@ -2420,12 +2428,16 @@ void build_wait(tree_t expr, build_wait_fn_t fn, void *ctx)
 
    case T_PROCESS:
    case T_SEQUENCE:
+   case T_FUNC_BODY:
    case T_PROC_BODY:
+   case T_FUNC_INST:
+   case T_PROC_INST:
       {
          const int ndecls = tree_decls(expr);
          for (int i = 0; i < ndecls; i++) {
             tree_t d = tree_decl(expr, i);
-            if (tree_kind(d) == T_PROC_BODY)
+            const tree_kind_t dkind = tree_kind(d);
+            if (dkind == T_FUNC_BODY || dkind == T_PROC_BODY)
                build_wait(d, fn, ctx);
          }
 
@@ -2494,6 +2506,7 @@ void build_wait(tree_t expr, build_wait_fn_t fn, void *ctx)
 
    case T_NEXT:
    case T_EXIT:
+   case T_RETURN:
       if (tree_has_value(expr))
          build_wait(tree_value(expr), fn, ctx);
       break;
@@ -2595,67 +2608,6 @@ void capture_syntax(text_buf_t *tb)
 {
    assert(tb == NULL || syntax_buf == NULL);
    syntax_buf = tb;
-}
-
-void analyse_file(const char *file, jit_t *jit, unit_registry_t *ur,
-                  mir_context_t *mc)
-{
-   input_from_file(file);
-
-   switch (source_kind()) {
-   case SOURCE_VHDL:
-      {
-         lib_t work = lib_work();
-         int base_errors = 0;
-         tree_t unit;
-         while (base_errors = error_count(), (unit = parse())) {
-            if (error_count() == base_errors) {
-               lib_put(work, unit);
-
-               simplify_local(unit, jit, ur, mc);
-               bounds_check(unit);
-            }
-            else
-               lib_put_error(work, unit);
-         }
-      }
-      break;
-
-   case SOURCE_VERILOG:
-      {
-         LOCAL_TEXT_BUF tb = tb_new();
-         vlog_preprocess(tb, true);
-
-         file_ref_t file_ref = loc_file_ref(file, NULL);
-         input_from_buffer(tb_get(tb), tb_len(tb), file_ref, SOURCE_VERILOG);
-
-         lib_t work = lib_work();
-         vlog_node_t module;
-         while ((module = vlog_parse())) {
-            if (error_count() == 0) {
-               vlog_check(module);
-
-               if (error_count() == 0) {
-                  vlog_simp(module);
-                  lib_put_vlog(work, module);
-               }
-            }
-         }
-      }
-      break;
-
-   case SOURCE_SDF:
-      {
-         sdf_file_t *sdf_file = sdf_parse(file, 0);
-         progress("analysed SDF file: %s", file);
-
-         if (sdf_file != NULL) {
-            warnf("SDF is not yet supported");
-            sdf_file_free(sdf_file);
-         }
-      }
-      break;
-   }
 }
 
 bool all_character_literals(type_t type)
@@ -2920,10 +2872,16 @@ bool calculate_aggregate_bounds(tree_t expr, range_kind_t *kind,
             else if (folded_length(range_of(value_type, 0), &length)) {
                if (i == 0) {
                   int64_t ileft;
-                  if (folded_int(tree_left(base_r), &ileft))
-                     ilow = ihigh = ileft;
-                  else
+                  if (!folded_int(tree_left(base_r), &ileft))
                      return false;
+                  else if (dir == RANGE_TO) {
+                     ilow = ileft;
+                     ihigh = ileft + length - 1;
+                  }
+                  else {
+                     ihigh = ileft;
+                     ilow = ileft - length + 1;
+                  }
                }
                else if (dir == RANGE_TO) {
                   ilow = clow + pos;

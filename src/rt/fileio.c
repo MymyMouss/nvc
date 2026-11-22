@@ -20,7 +20,6 @@
 #include "jit/jit-ffi.h"
 #include "jit/jit.h"
 #include "rt/fileio.h"
-#include "rt/rt.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -76,6 +75,8 @@ typedef struct {
    file_kind_t  kind;
    file_mode_t  mode;
    uint16_t     generation;
+   off_t        saved_pos;   // Logical position at the last checkpoint
+   bool         touched;     // Standard input has been read
 } file_slot_t;
 
 #define HANDLE_BITS      (sizeof(file_handle_t) * 8)
@@ -135,6 +136,7 @@ static file_handle_t handle_for(FILE *f, const char *name, file_kind_t kind,
    slot->name = xstrdup(name);
    slot->kind = kind;
    slot->mode = mode;
+   slot->touched = false;
 
    free_hint = index + 1;
 
@@ -209,6 +211,67 @@ bool file_close(file_handle_t fh)
    return drop_handle(fh);
 }
 
+unsigned file_count_open(void)
+{
+   unsigned count = 0;
+   for (unsigned i = 0; i < num_handles; i++) {
+      if (handles[i].file != NULL)
+         count++;
+   }
+   return count;
+}
+
+void file_save_positions(void)
+{
+   for (unsigned i = 0; i < num_handles; i++) {
+      file_slot_t *slot = &(handles[i]);
+      if (slot->file != NULL && slot->kind == FILE_USER)
+         slot->saved_pos = ftello(slot->file);
+   }
+}
+
+char *file_reopen_all(void)
+{
+   // A forked copy shares the kernel file offset with the original, so
+   // each file is opened again to get a private one.  The same path is
+   // used without creating or truncating it: if it has gone the copy
+   // cannot be made to behave like the original.
+   for (unsigned i = 0; i < num_handles; i++) {
+      file_slot_t *slot = &(handles[i]);
+      if (slot->file == NULL || slot->kind != FILE_USER)
+         continue;
+
+      int flags = 0;
+      switch (slot->mode) {
+      case FILE_READ: flags = O_RDONLY; break;
+      case FILE_WRITE: flags = O_WRONLY; break;
+      case FILE_READ_WRITE: flags = O_RDWR; break;
+      case FILE_APPEND: flags = O_WRONLY | O_APPEND; break;
+      }
+
+      const int fd = open(slot->name, flags);
+      if (fd < 0)
+         return xasprintf("cannot open file %s again, which the design had "
+                          "open at the checkpoint: %s", slot->name,
+                          strerror(errno));
+
+      const int old = fileno(slot->file);
+      if (dup2(fd, old) < 0) {
+         close(fd);
+         return xasprintf("cannot reopen file %s: %s", slot->name,
+                          strerror(errno));
+      }
+      close(fd);
+
+      if (slot->mode != FILE_APPEND
+          && fseeko(slot->file, slot->saved_pos, SEEK_SET) != 0)
+         return xasprintf("cannot seek in file %s: %s", slot->name,
+                          strerror(errno));
+   }
+
+   return NULL;
+}
+
 FILE *file_stream(file_handle_t fh)
 {
    file_slot_t *slot = decode_handle(fh);
@@ -234,6 +297,8 @@ void __nvc_endfile(jit_scalar_t *args)
    file_slot_t *slot = decode_handle(*handle);
    if (slot == NULL)
       jit_msg(NULL, DIAG_FATAL, "ENDFILE called on closed file");
+
+   slot->touched = true;
 
    int c = fgetc(slot->file);
    if (c == EOF)
@@ -488,6 +553,8 @@ int64_t x_file_read(void **_fp, void *data, int64_t size, int64_t count)
    if (slot == NULL)
       jit_msg(NULL, DIAG_FATAL, "read from closed file");
 
+   slot->touched = true;
+
    const unsigned long actual = fread(data, size, count, slot->file);
    if (actual != count && ferror(slot->file))
       jit_msg(NULL, DIAG_FATAL, "read from file failed");
@@ -498,4 +565,208 @@ int64_t x_file_read(void **_fp, void *data, int64_t size, int64_t count)
 void _file_io_init(void)
 {
    // Dummy function to force linking
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Checkpoint support
+
+#define CKPT_FILE_MAX (256 * 1024 * 1024)
+
+unsigned file_enum_open(file_handle_t *out, unsigned max)
+{
+   unsigned n = 0;
+   for (unsigned i = 0; i < num_handles && n < max; i++) {
+      if (handles[i].file != NULL)
+         out[n++] = (file_handle_t)handles[i].generation << HANDLE_BITS/2 | i;
+   }
+   return n;
+}
+
+static uint64_t hash_bytes(uint64_t h, const uint8_t *p, size_t n)
+{
+   for (size_t i = 0; i < n; i++)
+      h = (h ^ p[i]) * 0x100000001b3ULL;
+   return h;
+}
+
+static char *read_prefix(const char *name, int64_t size, uint8_t **data)
+{
+   *data = NULL;
+
+   int fd = open(name, O_RDONLY);
+   if (fd < 0)
+      return xasprintf("cannot open file %s: %s", name, strerror(errno));
+
+   uint8_t *buf = xmalloc(MAX(size, 1));
+   int64_t got = 0;
+   while (got < size) {
+      const ssize_t n = pread(fd, buf + got, size - got, got);
+      if (n <= 0)
+         break;
+      got += n;
+   }
+   close(fd);
+
+   if (got != size) {
+      free(buf);
+      return xasprintf("file %s is shorter than at the checkpoint", name);
+   }
+
+   *data = buf;
+   return NULL;
+}
+
+char *file_ckpt_describe(file_handle_t fh, file_ckpt_t *out)
+{
+   memset(out, '\0', sizeof(*out));
+
+   file_slot_t *slot = decode_handle(fh);
+   if (slot == NULL)
+      return xstrdup("handle does not refer to an open file");
+
+   out->mode   = slot->mode;
+   out->name   = xstrdup(slot->name);
+   out->predef = (slot->kind == FILE_PREDEF);
+
+   if (out->predef) {
+      if (slot->mode == FILE_READ && slot->touched)
+         return xasprintf("standard input has been read and cannot be "
+                          "restored");
+      return NULL;
+   }
+
+   if (slot->mode != FILE_READ && fflush(slot->file) != 0)
+      return xasprintf("cannot flush file %s: %s", slot->name,
+                       strerror(errno));
+
+   out->pos = ftello(slot->file);
+   if (out->pos < 0)
+      return xasprintf("cannot get the position of file %s: %s", slot->name,
+                       strerror(errno));
+
+   struct stat st;
+   if (fstat(fileno(slot->file), &st) != 0)
+      return xasprintf("cannot stat file %s: %s", slot->name, strerror(errno));
+   else if (!S_ISREG(st.st_mode))
+      return xasprintf("file %s is not a regular file", slot->name);
+   else if (st.st_size > CKPT_FILE_MAX)
+      return xasprintf("file %s is too large to save (%lld bytes)", slot->name,
+                       (long long)st.st_size);
+
+   out->size = st.st_size;
+
+   uint8_t *data;
+   char *err = read_prefix(slot->name, out->size, &data);
+   if (err != NULL)
+      return err;
+
+   if (slot->mode == FILE_READ) {
+      out->hash = hash_bytes(0xcbf29ce484222325ULL, data, out->size);
+      free(data);
+   }
+   else
+      out->data = data;
+
+   return NULL;
+}
+
+void file_ckpt_free(file_ckpt_t *f)
+{
+   free(f->name);
+   free(f->data);
+   memset(f, '\0', sizeof(*f));
+}
+
+char *file_ckpt_apply(const file_ckpt_t *in, file_handle_t cur,
+                      file_handle_t *out)
+{
+   file_slot_t *curslot = decode_handle(cur);
+
+   if (in->predef) {
+      if (curslot != NULL && curslot->kind == FILE_PREDEF
+          && curslot->mode == in->mode && !strcmp(curslot->name, in->name)) {
+         *out = cur;
+         return NULL;
+      }
+
+      for (unsigned i = 0; i < num_handles; i++) {
+         if (handles[i].file != NULL && handles[i].kind == FILE_PREDEF
+             && handles[i].mode == in->mode
+             && !strcmp(handles[i].name, in->name)) {
+            *out = (file_handle_t)handles[i].generation << HANDLE_BITS/2 | i;
+            return NULL;
+         }
+      }
+
+      if (curslot != NULL)
+         file_close(cur);
+
+      FILE *f = in->mode == FILE_READ ? stdin : stdout;
+      *out = handle_for(f, in->name, FILE_PREDEF, in->mode);
+      return NULL;
+   }
+
+   // Bring the file on disk to the state it had at the checkpoint
+   if (in->mode == FILE_READ) {
+      uint8_t *data;
+      char *err = read_prefix(in->name, in->size, &data);
+      if (err != NULL)
+         return err;
+
+      struct stat st;
+      const bool same = stat(in->name, &st) == 0 && st.st_size == in->size
+         && hash_bytes(0xcbf29ce484222325ULL, data, in->size) == in->hash;
+      free(data);
+
+      if (!same)
+         return xasprintf("input file %s has changed since the checkpoint",
+                          in->name);
+   }
+
+   if (curslot != NULL && curslot->kind == FILE_USER) {
+      // The reset opened it: start again from the saved state
+      if (curslot->mode != FILE_READ)
+         fflush(curslot->file);
+      file_close(cur);
+   }
+
+   if (in->mode != FILE_READ) {
+      int fd = open(in->name, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+      if (fd < 0)
+         return xasprintf("cannot recreate file %s: %s", in->name,
+                          strerror(errno));
+
+      int64_t done = 0;
+      while (done < in->size) {
+         const ssize_t n = write(fd, in->data + done, in->size - done);
+         if (n <= 0) {
+            close(fd);
+            return xasprintf("cannot write file %s: %s", in->name,
+                             strerror(errno));
+         }
+         done += n;
+      }
+      close(fd);
+   }
+
+   const char *osmode = "rb";
+   switch (in->mode) {
+   case FILE_READ: osmode = "rb"; break;
+   case FILE_WRITE: osmode = "r+b"; break;
+   case FILE_READ_WRITE: osmode = "r+b"; break;
+   case FILE_APPEND: osmode = "ab"; break;
+   }
+
+   FILE *fp = fopen(in->name, osmode);
+   if (fp == NULL)
+      return xasprintf("cannot reopen file %s: %s", in->name, strerror(errno));
+
+   if (in->mode != FILE_APPEND && fseeko(fp, in->pos, SEEK_SET) != 0) {
+      fclose(fp);
+      return xasprintf("cannot seek in file %s: %s", in->name,
+                       strerror(errno));
+   }
+
+   *out = handle_for(fp, in->name, FILE_USER, in->mode);
+   return NULL;
 }

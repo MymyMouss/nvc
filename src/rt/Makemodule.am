@@ -3,7 +3,7 @@ lib_libnvc_a_SOURCES += \
 	src/rt/cover.c \
 	src/rt/wave.c \
 	src/rt/wave.h \
-	src/rt/rt.h \
+	src/rt/defs.h \
 	src/rt/heap.h \
 	src/rt/mspace.h \
 	src/rt/mspace.c \
@@ -13,6 +13,13 @@ lib_libnvc_a_SOURCES += \
 	src/rt/structs.h \
 	src/rt/model.h \
 	src/rt/model.c \
+	src/rt/model-priv.h \
+	src/rt/checkpoint.c \
+	src/rt/checkmap.c \
+	src/rt/confirm.c \
+	src/rt/confirm.h \
+	src/rt/checkmap.h \
+	src/rt/checkpoint.h \
 	src/rt/fileio.c \
 	src/rt/fileio.h \
 	src/rt/printer.h \

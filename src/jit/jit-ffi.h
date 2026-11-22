@@ -90,6 +90,10 @@ typedef void (*ffi_internal_t)(jit_scalar_t *, tlab_t *);
 
 jit_dll_t *ffi_load_dll(const char *path);
 void ffi_unload_dll(jit_dll_t *dll);
+
+// True once a shared library other than the executable has been loaded,
+// such as a VHPI plugin or the library of a foreign subprogram
+bool ffi_external_dll_loaded(void);
 void *ffi_find_symbol(jit_dll_t *dll, const char *name);
 
 void ffi_copy_closure(ffi_closure_t *dst, const ffi_closure_t *src);

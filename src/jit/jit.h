@@ -25,6 +25,16 @@
 typedef int32_t jit_handle_t;
 #define JIT_HANDLE_INVALID 0xffffffff
 
+#define TLAB_SIZE (64 * 1024)
+
+// The code generator knows the layout of this struct
+typedef struct _tlab {
+   mspace_t *mspace;
+   uint32_t  alloc;
+   uint32_t  limit;
+   char      data[0];
+} tlab_t;
+
 typedef union {
    int64_t  integer;
    void    *pointer;
@@ -52,6 +62,86 @@ typedef struct {
 
 typedef void (*jit_irq_fn_t)(jit_t *, void *);
 
+// Typed description of the variables in a unit's persistent frame: this
+// is what lets a checkpoint save and restore a frame by variable name
+// instead of copying raw memory which may contain pointers
+typedef enum {
+   VT_INT, VT_OFFSET, VT_REAL, VT_VEC2, VT_VEC4, VT_CARRAY, VT_RECORD,
+   VT_UARRAY, VT_POINTER, VT_ACCESS, VT_SIGNAL, VT_CONTEXT, VT_FILE,
+   VT_TRIGGER, VT_RESOLUTION,
+} jit_vt_kind_t;
+
+typedef struct _jit_vtype jit_vtype_t;
+
+typedef struct {
+   uint32_t           offset;
+   const jit_vtype_t *type;
+} jit_vfield_t;
+
+struct _jit_vtype {
+   jit_vt_kind_t       kind;
+   uint32_t            size;     // Bytes occupied inside the frame
+   uint32_t            align;
+   uint32_t            count;    // Array length, field count or dimensions
+   const jit_vtype_t  *elem;     // Element or pointed-to type
+   jit_vfield_t       *fields;   // Record only
+};
+
+typedef struct {
+   ident_t            name;      // NULL for temporaries (not in frame)
+   ptrdiff_t          offset;
+   const jit_vtype_t *type;
+} jit_var_t;
+
+typedef struct {
+   unsigned         nvars;
+   const jit_var_t *vars;
+   unsigned         kind;       // mir_unit_kind_t
+   unsigned         hdrsz;      // Bytes before the first variable
+} jit_framelay_t;
+
+// Returns false if the unit has no persistent frame
+bool jit_get_framelay(jit_t *j, jit_handle_t handle, jit_framelay_t *out,
+                      bool compile);
+bool jit_get_cpool(jit_t *j, jit_handle_t handle, const void **base,
+                   size_t *size, bool compile);
+unsigned jit_handle_count(jit_t *j);
+
+// Which instructions of each function have run, for checkpoints.  Set the
+// flag before any function is compiled.
+extern bool jit_exec_tracking;
+
+#define JIT_NO_LABEL UINT32_MAX
+
+typedef enum {
+   JIT_FLOW_NEXT,      // Continues with the next instruction
+   JIT_FLOW_JUMP,      // Always goes to its label
+   JIT_FLOW_BRANCH,    // Goes to its label or to the next instruction
+   JIT_FLOW_END,       // Does not continue
+} jit_flow_t;
+
+typedef struct {
+   unsigned       nirs;
+   uint64_t      *hash;       // Of each instruction without its branch target
+   uint32_t      *label;      // Branch target of each, or JIT_NO_LABEL
+   uint8_t       *kind;       // JIT_FLOW_* of each: free all three with free()
+   bool           unsupported;   // Control flow that is not understood
+   const uint8_t *exec;       // NULL if not tracked
+   uint64_t       cpool_hash;
+   size_t         cpool_size;
+   bool           restart_top;
+   int            restart_state;
+   const uint32_t *resume;    // States a suspended unit can resume at
+   unsigned       nresume;
+   bool           has_next_tier;
+} jit_code_t;
+
+bool jit_get_code(jit_t *j, jit_handle_t handle, jit_code_t *out);
+void jit_set_exec(jit_t *j, jit_handle_t handle, const uint8_t *bits,
+                  unsigned n, bool all);
+void *jit_get_privdata(jit_t *j, jit_handle_t handle);
+void jit_set_privdata(jit_t *j, jit_handle_t handle, void *ptr);
+
 jit_t *jit_new(unit_registry_t *ur, mir_context_t *mc);
 void jit_free(jit_t *j);
 jit_handle_t jit_compile(jit_t *j, ident_t name);
@@ -73,7 +163,11 @@ void jit_check_interrupt(jit_t *j);
 void jit_reset(jit_t *j);
 bool jit_is_shutdown(jit_t *j);
 
+tlab_t *tlab_acquire(jit_t *j);
+void tlab_release(jit_t *j, tlab_t *t);
+
 void *jit_mspace_alloc(size_t size) RETURNS_NONNULL;
+void *tlab_alloc(tlab_t *t, size_t size) RETURNS_NONNULL;
 jit_stack_trace_t *jit_stack_trace(void);
 jit_t *jit_for_thread(void);
 

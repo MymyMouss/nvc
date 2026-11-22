@@ -1,5 +1,5 @@
 //
-//  Copyright (C) 2024-2025 Nick Gasson
+//  Copyright (C) 2024-2026 Nick Gasson
 //
 //  This program is free software: you can redistribute it and/or modify
 //  it under the terms of the GNU General Public License as published by
@@ -23,6 +23,7 @@
 bool vlog_is_net(vlog_node_t v);
 unsigned vlog_dimensions(vlog_node_t v);
 bool vlog_get_const(vlog_node_t v, int64_t *value);
+int64_t vlog_must_be_const(vlog_node_t v);
 bool vlog_is_const(vlog_node_t v);
 bool vlog_is_up(vlog_node_t v);
 bool vlog_bounds(vlog_node_t v, int64_t *left, int64_t *right);
@@ -38,10 +39,11 @@ bool vlog_equal_node(vlog_node_t a, vlog_node_t b);
 uint32_t vlog_hash_node(vlog_node_t v);
 vlog_node_t vlog_get_type(vlog_node_t v);
 vlog_node_t vlog_get_dim(vlog_node_t v, int n);
+tree_t vlog_walk_mod_refs(vlog_node_t v, tree_t where);
 
 #define CANNOT_HANDLE(v) do {                                           \
-      fatal_at(vlog_loc(v), "cannot handle %s in %s" ,                  \
-               vlog_kind_str(vlog_kind(v)), __FUNCTION__);              \
+      fatal_at(vlog_loc(v), "cannot handle %pK in %s" ,                 \
+               v, __FUNCTION__);                                        \
    } while (0)
 
 #endif  // _VLOG_UTIL_H

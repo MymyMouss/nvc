@@ -27,6 +27,7 @@
 #include "tree.h"
 #include "type.h"
 #include "vcode.h"
+#include "vhdl/vhdl-phase.h"
 
 #include <assert.h>
 #include <stdlib.h>
@@ -144,15 +145,20 @@ static void psl_lower_cover(lower_unit_t *lu, psl_node_t p)
    if (!cover_enabled(lu->cover, COVER_MASK_FUNCTIONAL))
       return;
 
-   cover_item_t *item = cover_add_items_for(lu->cover, lu->cscope,
-                                            psl_to_object(p),
-                                            COV_ITEM_FUNCTIONAL);
-   if (item == NULL)
+   cover_obj_t item = cover_get_item(lu->cover, lu->cscope,
+                                     COV_ITEM_FUNCTIONAL, 0);
+   if (cover_is_null(item))
       return;
 
+   cover_obj_t bin = cover_at(lu->cover, item, COV_REL_BINS, 0);
+   uint32_t tag = cover_get_u32(lu->cover, bin, COV_ATTR_TAG, -1);
+
+   cover_obj_t inst = cover_get_obj(lu->cover, lu->cscope, COV_ATTR_INST);
+   ident_t qual_name = cover_get_ident(lu->cover, inst, COV_ATTR_QUAL_NAME);
+
    // TODO: move this to initialisation
-   vcode_reg_t counters = emit_get_counters(lu->name);
-   emit_cover_stmt(counters, item->tag);
+   vcode_reg_t counters = emit_get_counters(qual_name);
+   emit_cover_stmt(counters, tag);
 }
 
 static void psl_lower_assert(lower_unit_t *lu, vcode_reg_t taken_reg,
@@ -520,7 +526,7 @@ vcode_reg_t psl_lower_fcall(lower_unit_t *lu, psl_node_t p)
    }
 }
 
-void psl_lower_directive(lower_unit_t *lu, object_t *obj)
+static void psl_lower_property(lower_unit_t *lu, object_t *obj)
 {
    tree_t wrapper = tree_from_object(obj);
    assert(tree_kind(wrapper) == T_PSL_DIRECT);
@@ -535,8 +541,8 @@ void psl_lower_directive(lower_unit_t *lu, object_t *obj)
    ident_t prefix = vcode_unit_name(context);
    ident_t name = vcode_unit_name(lu->vunit);
 
-   lu->cscope = cover_create_block(lu->cover, name, lu->parent->cscope,
-                                   wrapper, wrapper);
+   lu->cscope = cover_get_child(lu->cover, lu->parent->cscope,
+                                vhdl_scope_name(lu->container, NULL, 0));
 
    vcode_type_t vcontext = vtype_context(prefix);
    emit_param(vcontext, VCODE_INVALID_STAMP, ident_new("context"));
@@ -556,10 +562,8 @@ void psl_lower_directive(lower_unit_t *lu, object_t *obj)
    // Only handle a single clock for the whole property
    psl_node_t top = psl_value(p);
    assert(psl_kind(top) == P_CLOCKED);
-   assert(psl_has_ref(top));
-
-   psl_node_t clk = psl_ref(top);
-   tree_t clk_expr = psl_tree(psl_ref(top));
+   psl_node_t clk = psl_has_ref(top) ? psl_ref(top) : top;
+   tree_t clk_expr = psl_tree(clk);
 
    int hops;
    vcode_var_t trigger_var = lower_search_vcode_obj(clk, lu, &hops);
@@ -639,7 +643,7 @@ void psl_lower_directive(lower_unit_t *lu, object_t *obj)
 static void psl_lower_clock_func(lower_unit_t *lu, object_t *obj)
 {
    psl_node_t p = psl_from_object(obj);
-   assert(psl_kind(p) == P_CLOCK_DECL);
+   assert(psl_kind(p) == P_CLOCK_DECL || psl_kind(p) == P_CLOCKED);
 
    vcode_unit_t context = vcode_unit_context(lu->vunit);
    ident_t prefix = vcode_unit_name(context);
@@ -662,7 +666,7 @@ static void psl_lower_clock_decl(unit_registry_t *ur, lower_unit_t *parent,
    ident_t name = ident_prefix(prefix, label, '.');
 
    unit_registry_defer(ur, name, parent, emit_function, psl_lower_clock_func,
-                       psl_to_object(p));
+                       NULL, psl_to_object(p));
 
    vcode_type_t vtrigger = vtype_trigger();
    vcode_var_t var = emit_var(vtrigger, VCODE_INVALID_STAMP, label, 0);
@@ -673,6 +677,25 @@ static void psl_lower_clock_decl(unit_registry_t *ur, lower_unit_t *parent,
    emit_store(trigger_reg, var);
 
    lower_put_vcode_obj(p, var, parent);
+}
+
+void psl_lower_directive(unit_registry_t *ur, lower_unit_t *parent,
+                         cover_data_t *cover, tree_t wrapper, ident_t name)
+{
+   assert(tree_kind(wrapper) == T_PSL_DIRECT);
+
+   psl_node_t top = psl_value(tree_psl(wrapper));
+   assert(psl_kind(top) == P_CLOCKED);
+
+   if (!psl_has_ref(top)) {
+      // Inline clock
+      ident_t label = ident_sprintf("%s$clock", istr(tree_ident(wrapper)));
+      psl_lower_clock_decl(ur, parent, top, label);
+   }
+
+   unit_registry_defer(ur, name,
+                       parent, emit_property, psl_lower_property,
+                       cover, tree_to_object(wrapper));
 }
 
 void psl_lower_decl(unit_registry_t *ur, lower_unit_t *parent, psl_node_t p,

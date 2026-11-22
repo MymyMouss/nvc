@@ -732,6 +732,8 @@ static void gvn_visit_block(mir_unit_t *mu, mir_block_t block,
       case MIR_OP_CONST:
       case MIR_OP_CONST_REAL:
       case MIR_OP_CONST_VEC:
+      case MIR_OP_CONST_ARRAY:
+      case MIR_OP_ADDRESS_OF:
       case MIR_OP_BINARY:
       case MIR_OP_UNARY:
       case MIR_OP_CLOSURE:
@@ -750,6 +752,11 @@ static void gvn_visit_block(mir_unit_t *mu, mir_block_t block,
       case MIR_OP_NEG:
       case MIR_OP_WRAP:
       case MIR_OP_DIV:
+      case MIR_OP_EXP:
+      case MIR_OP_TRAP_ADD:
+      case MIR_OP_TRAP_SUB:
+      case MIR_OP_TRAP_MUL:
+      case MIR_OP_BIND_EXTERNAL:
          gvn_generic(mu, node, block, opt);
          break;
       case MIR_OP_UARRAY_LEFT:
@@ -784,6 +791,9 @@ static void gvn_visit_block(mir_unit_t *mu, mir_block_t block,
       case MIR_OP_SYSCALL:
       case MIR_OP_ALLOC:
       case MIR_OP_NEW:
+      case MIR_OP_LAST_VALUE:
+      case MIR_OP_LAST_EVENT:
+      case MIR_OP_LAST_ACTIVE:
          opt->gvn->nodevn[node.id] = gvn_new_value(node, opt->gvn);
          break;
       default:

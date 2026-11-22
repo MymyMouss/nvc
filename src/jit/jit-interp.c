@@ -944,6 +944,8 @@ static void interp_loop(jit_interp_t *state)
 {
    for (;;) {
       JIT_ASSERT(state->pc < state->func->nirs);
+      if (unlikely(state->func->exec != NULL))
+         state->func->exec[state->pc] = 1;
       jit_ir_t *ir = &(state->func->irbuf[state->pc++]);
       switch (ir->op) {
       case J_RECV:

@@ -25,6 +25,7 @@
 typedef struct {
    type_t      tree;
    mir_type_t  type;
+   mir_type_t  bounds;
    mir_stamp_t stamp;
    type_kind_t kind;
    size_t      size;
@@ -37,7 +38,7 @@ typedef struct {
    mir_unit_t *mu;
 } vhdl_gen_t;
 
-const type_info_t *type_info(mir_unit_t *mu, type_t type);
+const type_info_t *type_info(vhdl_gen_t *g, type_t type);
 
 void vhdl_lower_predef(mir_unit_t *mu, object_t *obj);
 void vhdl_lower_image_helper(mir_unit_t *mu, object_t *obj);

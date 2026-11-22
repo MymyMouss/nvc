@@ -193,6 +193,7 @@ __attribute__((aligned(16)))
 static const uint8_t lane_iota[16] = {
    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
 };
+#endif
 
 static const uint32_t spread_nibble[16] = {
    0x02020202, 0x03020202, 0x02030202, 0x03030202,
@@ -218,8 +219,6 @@ static const uint8_t spread_mask[16] = {
    0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
    0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
 };
-#endif
-
 #endif
 
 static void (*ieee_packed_add)(const uint8_t *, const uint8_t *,
@@ -849,15 +848,15 @@ static void ieee_plus_unsigned_natural(jit_func_t *func, jit_anchor_t *anchor,
    uint8_t *left = args[1].pointer;
    const uint64_t right = args[4].integer;
 
-   // Must be unconditional to generate warning on truncation
-   uint8_t *result = __to_unsigned(func, anchor, tlab, right, size);
-
    if (size == 0) {
       args[0].pointer = NULL;
       args[1].integer = 0;
       args[2].integer = -1;
    }
    else {
+      // Must be unconditional to generate warning on truncation
+      uint8_t *result = __to_unsigned(func, anchor, tlab, right, size);
+
       left = __to_01(tlab, left, size, _X);
 
       if (left[0] == _X || right == 0)

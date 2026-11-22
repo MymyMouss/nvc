@@ -23,16 +23,20 @@
 #include "jit/jit.h"
 #include "lib.h"
 #include "lower.h"
+#include "mcp/mcp.h"
 #include "mir/mir-unit.h"
 #include "option.h"
 #include "phase.h"
 #include "printf.h"
 #include "rt/assert.h"
+#include "rt/defs.h"
+#include "rt/checkpoint.h"
+#include "rt/confirm.h"
 #include "rt/model.h"
 #include "rt/mspace.h"
-#include "rt/rt.h"
 #include "rt/wave.h"
 #include "scan.h"
+#include "sdf/sdf-phase.h"
 #include "tcl/tcl-shell.h"
 #include "thread.h"
 #include "vhpi/vhpi-model.h"
@@ -45,6 +49,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <assert.h>
+#include <inttypes.h>
 #include <sys/types.h>
 #include <limits.h>
 #include <unistd.h>
@@ -65,12 +70,15 @@ typedef struct {
    bool             user_set_std;
    vhpi_context_t  *vhpi;
    vpi_context_t   *vpi;
-   const char      *plugins;
+   text_buf_t      *plugins;
    rt_model_t      *model;
    cover_data_t    *cover;
    ident_t          top_level;
    const char      *top_level_arg;
    lib_t            work;
+   const char      *exe;
+   const char     **gargv;    // Global options, forwarded to MCP workers
+   int              gargc;
 } cmd_state_t;
 
 const char copy_string[] =
@@ -83,12 +91,25 @@ const char version_string[] =
    LLVM_ONLY(" (Using LLVM " LLVM_VERSION ")") DEBUG_ONLY(" [debug]");
 
 static int process_command(int argc, char **argv, cmd_state_t *state);
+static char **g_global_argv;
+static const char *g_global_work;
 static int parse_int(const char *str);
 static jit_t *get_jit(cmd_state_t *state);
 
 static ident_t to_unit_name(const char *str)
 {
    char *name LOCAL = xstrdup(str);
+
+   char *lparen = strchr(name, '(');
+   if (lparen != NULL) {
+      char *rparen = strrchr(lparen + 1, ')');
+      if (rparen == NULL || rparen == lparen + 1 || rparen[1] != '\0')
+         fatal("'%s' is not a valid design unit name", str);
+
+      *lparen = '-';
+      *rparen = '\0';
+   }
+
    for (char *p = name; *p; p++) {
       if (!isalnum_iso88591(*p) && (p == name || (*p != '_' && *p != '-')))
          fatal("'%s' is not a valid design unit name", str);
@@ -105,7 +126,7 @@ static int scan_cmd(int start, int argc, char **argv)
       "-a", "-e", "-r", "-c", "--dump", "--make", "--syntax", "--list",
       "--init", "--install", "--print-deps", "--do", "-i",
       "--cover-export", "--preprocess", "--cover-merge",
-      "--cover-report",
+      "--cover-report", "--mcp", "--mcp-worker",
    };
 
    for (int i = start; i < argc; i++) {
@@ -160,8 +181,71 @@ static bool parse_warn_option(char *optarg)
    }
 }
 
-static void do_file_list(const char *file, jit_t *jit, unit_registry_t *ur,
-                         mir_context_t *mc)
+static void analyse_file(const char *file, cmd_state_t *state)
+{
+   input_from_file(file);
+
+   switch (source_kind()) {
+   case SOURCE_VHDL:
+      {
+         lib_t work = lib_work();
+         int base_errors = 0;
+         tree_t unit;
+         while (base_errors = error_count(), (unit = parse())) {
+            if (error_count() == base_errors) {
+               lib_put(work, unit);
+
+               simplify_local(unit, state->jit, state->registry, state->mir);
+               bounds_check(unit);
+            }
+            else
+               lib_put_error(work, unit);
+         }
+      }
+      break;
+
+   case SOURCE_VERILOG:
+      {
+         LOCAL_TEXT_BUF tb = tb_new();
+         vlog_preprocess(tb, true);
+
+         file_ref_t file_ref = loc_file_ref(file, NULL);
+         input_from_buffer(tb_get(tb), tb_len(tb), file_ref, SOURCE_VERILOG);
+
+         if (state->vpi == NULL)
+            state->vpi = vpi_context_new();
+
+         lib_t work = lib_work();
+         vlog_node_t module;
+         while ((module = vlog_parse())) {
+            if (error_count() == 0) {
+               vlog_check(module);
+
+               if (error_count() == 0) {
+                  vlog_simp(module);
+                  vlog_fold(module, state->mir, state->jit);
+                  lib_put_vlog(work, module);
+               }
+            }
+         }
+      }
+      break;
+
+   case SOURCE_SDF:
+      {
+         sdf_file_t *sdf_file = sdf_parse(file, 0);
+         progress("analysed SDF file: %s", file);
+
+         if (sdf_file != NULL) {
+            warnf("SDF is not yet supported");
+            sdf_file_free(sdf_file);
+         }
+      }
+      break;
+   }
+}
+
+static void do_file_list(const char *file, cmd_state_t *state)
 {
    FILE *f;
    if (strcmp(file, "-") == 0)
@@ -187,26 +271,40 @@ static void do_file_list(const char *file, jit_t *jit, unit_registry_t *ur,
 
       for (char *p = line; *p;) {
          if (*p == '$') {  // Interpolate environment variable
-            const char *start = ++p;
+            p++;
+            // Check environment variables with braces
+            bool envvar_with_braces = (*p == '{');
+            if (envvar_with_braces) // Skip opening brace
+               p++;
+            const char *start = p;
+
             while (isalnum_iso88591(*p) || *p == '_') p++;
             const char tail = *p;
             *p++ = '\0';
+            if (envvar_with_braces && tail != '}')
+               warnf("missing closing brace for environment variable"
+                     " %s\n", start);
+            else if (!envvar_with_braces && (tail == '}'))
+               warnf("missing opening brace for environment variable"
+                     " %s\n", start);
 
             const char *envvar = getenv(start);
             if (envvar == NULL) {
                warnf("environment variable $%s not set", start);
-               tb_cat(tb, start - 1);
+               tb_cat(tb, start - (envvar_with_braces ? 2 : 1));
             }
             else
                tb_cat(tb, envvar);
 
-            tb_append(tb, tail);
+            // Do not append the closing brace for valid envvars with braces
+            if (envvar == NULL || tail != '}')
+               tb_append(tb, tail);
          }
          else
             tb_append(tb, *p++);
       }
 
-      analyse_file(tb_get(tb), jit, ur, mc);
+      analyse_file(tb_get(tb), state);
    }
 
    free(line);
@@ -334,21 +432,30 @@ static int analyse(int argc, char **argv, cmd_state_t *state)
    if (state->registry == NULL)
       state->registry = unit_registry_new(state->mir);
 
-   jit_t *jit = jit_new(state->registry, state->mir);
+   if (state->model != NULL) {
+      // The model of an earlier elaboration or run lives in the JIT
+      model_free(state->model);
+      state->model = NULL;
+   }
+
+   if (state->jit != NULL)
+      jit_free(state->jit);
+
+   state->jit = jit_new(state->registry, state->mir);
 
    if (state->vhpi != NULL)
       vhpi_run_callbacks(vhpiCbStartOfAnalysis);
 
    if (file_list != NULL)
-      do_file_list(file_list, jit, state->registry, state->mir);
+      do_file_list(file_list, state);
    else if (optind == next_cmd)
       fatal("missing file name");
 
    for (int i = optind; i < next_cmd; i++) {
       if (argv[i][0] == '@')
-         do_file_list(argv[i] + 1, jit, state->registry, state->mir);
+         do_file_list(argv[i] + 1, state);
       else
-         analyse_file(argv[i], jit, state->registry, state->mir);
+         analyse_file(argv[i], state);
    }
 
    if (state->vhpi != NULL)
@@ -357,7 +464,9 @@ static int analyse(int argc, char **argv, cmd_state_t *state)
    if (werror)
       diag_remove_hint_fn(werror_diag_cb, NULL);
 
-   jit_free(jit);
+   jit_free(state->jit);
+   state->jit = NULL;
+
    set_error_limit(0);
 
    if (error_count() > 0)
@@ -558,14 +667,26 @@ static int elaborate(int argc, char **argv, cmd_state_t *state)
       }
    }
 
-   set_top_level(argv, next_cmd, state);
+   const int ntops = next_cmd - optind;
+   if (ntops == 0)
+      fatal("missing top-level unit name");
 
    progress("initialising");
 
-   object_t *obj = lib_get_generic(state->work, state->top_level, NULL);
-   if (obj == NULL)
-      fatal("cannot find unit %s in library %s",
-            istr(state->top_level), istr(lib_name(state->work)));
+   object_t **tops LOCAL = xmalloc_array(ntops, sizeof(object_t *));
+   for (int i = 0; i < ntops; i++) {
+      ident_t name = to_unit_name(argv[optind + i]);
+
+      tops[i] = lib_get_generic(state->work, name, NULL);
+      if (tops[i] == NULL)
+         fatal("cannot find unit %pI in library %pI", name,
+               lib_name(state->work));
+
+      if (i == 0) {
+         state->top_level = name;
+         state->top_level_arg = argv[optind + i];
+      }
+   }
 
    progress("loading top-level unit");
 
@@ -584,7 +705,7 @@ static int elaborate(int argc, char **argv, cmd_state_t *state)
 
    if (sdf_args != NULL) {
       // TODO: Pass min-max spec to underlying sdf_parse somehow
-      analyse_file(sdf_args, NULL, NULL, NULL);
+      analyse_file(sdf_args, state);
    }
 
    if (state->model != NULL) {
@@ -620,13 +741,13 @@ static int elaborate(int argc, char **argv, cmd_state_t *state)
 
    vhpi_run_callbacks(vhpiCbStartOfElaboration);
 
-   tree_t top = elab(obj, state->jit, state->registry, state->mir,
-                     state->cover, NULL, state->model);
+   tree_t e = elab(tops, ntops, state->jit, state->registry, state->mir,
+                   state->cover, NULL, state->model);
 
-   if (top == NULL)
+   if (e == NULL)
       return EXIT_FAILURE;
 
-   lib_put_meta(state->work, top, &meta);
+   lib_put_meta(state->work, e, &meta);
 
    progress("elaborating design");
 
@@ -660,10 +781,10 @@ static int elaborate(int argc, char **argv, cmd_state_t *state)
 static uint64_t parse_time(const char *str)
 {
    char     unit[4];
-   unsigned base;
+   uint64_t base;
    uint64_t mult = 1;
 
-   if (sscanf(str, "%u%3s", &base, unit) != 2)
+   if (sscanf(str, "%"SCNu64"%3s", &base, unit) != 2)
       fatal("invalid time format: %s", str);
 
    if      (strcmp(unit, "fs") == 0)  mult = 1;
@@ -831,6 +952,23 @@ static void enable_ieee_warnings_cb(rt_model_t *m, void *ctx)
    *ptr = 0;
 }
 
+// Program arguments of a segment of a confirmation: the global options of
+// this run and the work library by its absolute path
+static char **confirm_child_args(void)
+{
+   unsigned nglobal = 0;
+   while (g_global_argv[nglobal] != NULL)
+      nglobal++;
+
+   char **args = xcalloc_array(nglobal + 3, sizeof(char *));
+   for (unsigned i = 0; i < nglobal; i++)
+      args[i] = g_global_argv[i];
+
+   char *abswork = realpath(g_global_work, NULL);
+   args[nglobal] = xasprintf("--work=%s", abswork ?: g_global_work);
+   return args;
+}
+
 static int run_cmd(int argc, char **argv, cmd_state_t *state)
 {
    static struct option long_options[] = {
@@ -851,14 +989,40 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       { "vhpi-trace",    no_argument,       0, 'T' },
       { "gtkw",          optional_argument, 0, 'g' },
       { "shuffle",       no_argument,       0, 'H' },
+      { "checkpoint",    required_argument, 0, 'C' },
+      { "restore",       required_argument, 0, 'R' },
+      { "allow-changes", no_argument,       0, 'A' },
+      { "verdict",       required_argument, 0, 'V' },
+      { "resave",        required_argument, 0, 'J' },
+      { "confirm",       required_argument, 0, 'F' },
+      { "jobs",          required_argument, 0, 'j' },
+      { "confirm-budget", required_argument, 0, 'B' },
+      { "confirm-max",   required_argument, 0, 'N' },
+      { "confirm-result", required_argument, 0, 'Q' },
+      { "restore-confirmed", required_argument, 0, 'K' },
+      { "confirmed-or-zero", no_argument,       0, 'Z' },
       { 0, 0, 0, 0 }
    };
 
-   wave_format_t wave_fmt = WAVE_FORMAT_FST;
-   uint64_t      stop_time = TIME_HIGH;
-   const char   *wave_fname = NULL;
-   const char   *gtkw_fname = NULL;
-   const char   *pli_plugins = NULL;
+   const char     *restore_confirmed = NULL;
+   bool            or_zero = false;
+   bool            allow_changes = false;
+   const char     *verdict_file = NULL;
+   const char     *resave_file = NULL;
+   const char     *confirm_dir = NULL, *confirm_result = NULL;
+   unsigned        confirm_jobs = 1, confirm_max = 0;
+   double          confirm_budget = 0;
+   const char     *every_dir = NULL;
+   uint64_t        every = 0;
+   unsigned        every_max = 64;
+   const char     *ckpt_file = NULL;
+   uint64_t        ckpt_time = 0;
+   const char     *restore_file = NULL;
+   wave_format_t   wave_fmt = WAVE_FORMAT_FST;
+   uint64_t        stop_time = TIME_HIGH;
+   const char     *wave_fname = NULL;
+   const char     *gtkw_fname = NULL;
+   LOCAL_TEXT_BUF  pli_plugins = tb_new();
 
    static bool have_run = false;
    if (have_run)
@@ -928,7 +1092,8 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
          wave_exclude_glob(optarg);
          break;
       case 'l':
-         pli_plugins = optarg;
+         tb_append(pli_plugins, ',');
+         tb_cat(pli_plugins, optarg);
          break;
       case 'x':
          parse_exit_severity(optarg);
@@ -952,6 +1117,72 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
          else
             opt_set_int(OPT_DUMP_ARRAYS, parse_int(optarg));
          break;
+      case 'C':
+         {
+            // FILE@TIME: the last @ separates the time as a file name
+            // may contain one
+            const char *at = strrchr(optarg, '@');
+            if (at == NULL || at == optarg || at[1] == '\0')
+               fatal("invalid argument to $bold$--checkpoint$$: expected "
+                     "FILE@TIME such as state.ckpt@1ms or DIR@every=1ms");
+
+            if (strncmp(at + 1, "every=", 6) == 0) {
+               // DIR@every=INTERVAL[,max=COUNT]
+               char *spec = xstrdup(at + 7);
+               char *comma = strchr(spec, ',');
+               if (comma != NULL) {
+                  *comma = '\0';
+                  if (strncmp(comma + 1, "max=", 4) != 0)
+                     fatal("invalid argument to $bold$--checkpoint$$: "
+                           "expected max=COUNT after the interval");
+                  every_max = parse_int(comma + 5);
+               }
+               every = parse_time(spec);
+               every_dir = xstrndup(optarg, at - optarg);
+               free(spec);
+            }
+            else {
+               ckpt_file = xstrndup(optarg, at - optarg);
+               ckpt_time = parse_time(at + 1);
+            }
+            jit_exec_tracking = true;
+         }
+         break;
+      case 'R':
+         restore_file = optarg;
+         jit_exec_tracking = true;
+         break;
+      case 'A':
+         allow_changes = true;
+         break;
+      case 'V':
+         verdict_file = optarg;
+         break;
+      case 'J':
+         resave_file = optarg;   // For tests: save right after a restore
+         break;
+      case 'F':
+         confirm_dir = optarg;
+         break;
+      case 'j':
+         confirm_jobs = parse_int(optarg);
+         break;
+      case 'B':
+         confirm_budget = parse_int(optarg);
+         break;
+      case 'N':
+         confirm_max = parse_int(optarg);
+         break;
+      case 'Q':
+         confirm_result = optarg;
+         break;
+      case 'K':
+         restore_confirmed = optarg;
+         jit_exec_tracking = true;
+         break;
+      case 'Z':
+         or_zero = true;
+         break;
       case 'H':
          warnf("the $bold$--shuffle$$ option is intended for debug use only "
                "and may introduce significant performance overhead as well "
@@ -974,6 +1205,61 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
    }
 
    set_top_level(argv, next_cmd, state);
+
+   confirm_prefix_t cpx = {};
+   bool restore_own = false;
+
+   if (confirm_dir != NULL || restore_confirmed != NULL) {
+      // Run segments of the simulation in other processes: nothing is loaded
+      // here
+      if (confirm_dir != NULL && restore_confirmed != NULL)
+         fatal("$bold$--confirm$$ and $bold$--restore-confirmed$$ cannot be "
+               "used together");
+      else if (restore_confirmed != NULL && restore_file != NULL)
+         fatal("$bold$--restore-confirmed$$ and $bold$--restore$$ cannot be "
+               "used together");
+      else if (restore_confirmed != NULL && nplusargs > 0)
+         fatal("plusargs cannot be used with $bold$--restore-confirmed$$: "
+               "the segments that are confirmed run without them");
+
+      const confirm_opts_t opts = {
+         .dir = confirm_dir ?: restore_confirmed,
+         .top = state->top_level_arg, .child_args = confirm_child_args(),
+         .jobs = confirm_jobs, .budget_s = confirm_budget,
+         .max_segments = confirm_max, .result_file = confirm_result,
+         .quiet = restore_confirmed != NULL,
+         .prefix = restore_confirmed != NULL ? &cpx : NULL,
+      };
+      const int crc = confirm_run(&opts);
+      if (confirm_dir != NULL)
+         return crc;
+      else if (crc == 130)
+         return crc;   // Interrupted
+
+      // Only the part of the run that the confirmation proved is used
+      if (cpx.confirmed == 0 && !or_zero)
+         fatal("no checkpoint in %s is confirmed as a state of this design "
+               "(%s): run without $bold$--restore-confirmed$$ to start from "
+               "time zero, or add $bold$--confirmed-or-zero$$ to do that "
+               "when nothing is confirmed", restore_confirmed,
+               cpx.first_diff == 1 ? "the first segment differs"
+               : cpx.budget_out ? "the budget ran out"
+               : "no segment could be checked");
+      else if (cpx.confirmed == 0)
+         notef("no checkpoint is confirmed: starting from time zero");
+      else {
+         char tm[64];
+         checkpoint_format_time(cpx.up_to_fs, tm, sizeof(tm));
+         notef("confirmed by segments up to %s (%u of %u segments)%s", tm,
+               cpx.confirmed, cpx.total,
+               cpx.first_diff ? ": the next one differs"
+               : cpx.confirmed < cpx.total ? ": the rest was not checked"
+               : "");
+         restore_file = cpx.path;
+         restore_own = true;
+         allow_changes = true;
+      }
+   }
 
    ident_t ename = ident_prefix(state->top_level, well_known(W_ELAB), '.');
 
@@ -1039,7 +1325,7 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
    if (nplusargs > 0)
       vhpi_set_plusargs(state->vhpi, nplusargs, plusargs);
 
-   if (pli_plugins != NULL || state->plugins != NULL) {
+   if (tb_len(pli_plugins) > 0 || tb_len(state->plugins) > 0) {
       vhpi_context_initialise(state->vhpi, top, state->model, state->jit);
       vpi_context_initialise(state->vpi, top, state->model, state->jit,
                              nplusargs, plusargs);
@@ -1047,12 +1333,111 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
    else if (nplusargs > 0)
       warnf("found plusargs on command line but no VHPI plugin was loaded");
 
-   if (pli_plugins != NULL)
-      vhpi_load_plugins(pli_plugins);
+   if (tb_len(pli_plugins) > 0)
+      vhpi_load_plugins(tb_get(pli_plugins));
 
    set_ctrl_c_handler(ctrl_c_handler, state->model);
 
    model_reset(state->model);
+
+   if ((ckpt_file != NULL || restore_file != NULL || every_dir != NULL)
+       && (tb_len(pli_plugins) > 0 || tb_len(state->plugins) > 0))
+      fatal("$bold$--checkpoint$$ and $bold$--restore$$ cannot be used "
+            "with VHPI or VPI plugins");
+
+   if (ckpt_file != NULL)
+      checkpoint_schedule(state->model, state->jit, ckpt_file, ckpt_time);
+
+   if (every_dir != NULL)
+      checkpoint_schedule_every(state->model, state->jit, every_dir, every,
+                                every_max);
+
+   ckpt_id_t *resave_id = NULL;
+   if (restore_file != NULL && resave_file != NULL)
+      resave_id = checkpoint_identify(state->model, state->jit);
+
+   if (restore_file != NULL) {
+      const uint64_t t0 = get_timestamp_us();
+      ckpt_report_t rep = {};
+      char *err = restore_own
+         ? checkpoint_restore_confirmed(state->model, state->jit,
+                                        restore_file, &rep)
+         : checkpoint_restore(state->model, state->jit, restore_file,
+                              allow_changes, &rep);
+      if (err != NULL)
+         fatal("cannot restore checkpoint: %s", err);
+
+      char tmbuf[64];
+      checkpoint_format_time(model_now(state->model, NULL), tmbuf,
+                             sizeof(tmbuf));
+      notef("restored checkpoint %s at %s (%.1f ms)", restore_file, tmbuf,
+            (get_timestamp_us() - t0) / 1000.0);
+
+      if (restore_own) {
+         if (!rep.verified)
+            fatal("cannot restore checkpoint: the restored state could not "
+                  "be verified");
+
+         rep.by_confirmation = true;
+         rep.conf_segments = cpx.confirmed;
+         rep.conf_total = cpx.total;
+         rep.conf_first_diff = cpx.first_diff;
+         rep.conf_up_to_fs = cpx.up_to_fs;
+
+         char tm[64];
+         checkpoint_format_time(cpx.up_to_fs, tm, sizeof(tm));
+         notef("restore verdict: EXACT BY CONFIRMATION (this is the state of "
+               "the changed design at %s: segments 1 to %u of %u agree, "
+               "first difference at %s)", tm, cpx.confirmed, cpx.total,
+               cpx.first_diff ? "the next segment" : "none");
+
+         if (verdict_file != NULL) {
+            char *json = checkpoint_report_json(&rep);
+            FILE *vf = fopen(verdict_file, "w");
+            if (vf == NULL)
+               fatal_errno("%s", verdict_file);
+            fprintf(vf, "%s\n", json);
+            fclose(vf);
+            free(json);
+         }
+      }
+      else if (allow_changes) {
+         LOCAL_TEXT_BUF tb = tb_new();
+         unsigned nran = 0;
+         for (unsigned i = 0; i < rep.nchanged; i++)
+            nran += rep.executed[i];
+         tb_printf(tb, "restore verdict: %s (%u changed units, %u had "
+                   "already run", rep.exact ? "EXACT" : "APPROXIMATE",
+                   rep.nchanged, nran);
+         for (unsigned i = 0; i < rep.nnotes && i < 6; i++)
+            tb_printf(tb, "; %s", rep.notes[i]);
+         tb_append(tb, ')');
+         if (rep.exact)
+            notef("%s", tb_get(tb));
+         else
+            warnf("%s: validate the fix by running the changed design from "
+                  "time zero", tb_get(tb));
+
+         if (verdict_file != NULL) {
+            char *json = checkpoint_report_json(&rep);
+            FILE *vf = fopen(verdict_file, "w");
+            if (vf == NULL)
+               fatal_errno("%s", verdict_file);
+            fprintf(vf, "%s\n", json);
+            fclose(vf);
+            free(json);
+         }
+      }
+
+      checkpoint_report_free(&rep);
+
+      if (resave_file != NULL) {
+         char *serr = checkpoint_save(state->model, state->jit, resave_id,
+                                      resave_file);
+         if (serr != NULL)
+            fatal("cannot save after restore: %s", serr);
+      }
+   }
 
    if (dumper != NULL)
       wave_dumper_restart(dumper, state->model, state->jit);
@@ -1065,7 +1450,19 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
 
    set_ctrl_c_handler(NULL, NULL);
 
-   const int rc = model_exit_status(state->model);
+   int rc = model_exit_status(state->model);
+
+   if ((ckpt_file != NULL || every_dir != NULL)
+       && checkpoint_finish(state->model) && rc == 0)
+      rc = EXIT_FAILURE;
+
+   if (getenv("NVC_CKPT_INVENTORY") != NULL) {
+      FILE *inv = fopen(getenv("NVC_CKPT_INVENTORY"), "a");
+      if (inv != NULL) {
+         checkpoint_inventory(state->model, state->jit, inv);
+         fclose(inv);
+      }
+   }
 
    if (dumper != NULL)
       wave_dumper_free(dumper);
@@ -1558,10 +1955,186 @@ static int do_cmd(int argc, char **argv, cmd_state_t *state)
    vpi_context_free(state->vpi);
    state->vpi = NULL;
 
+   if (get_vhdl_assert_exit_status() != 0)
+      return EXIT_FAILURE;
+
    argc -= next_cmd - 1;
    argv += next_cmd - 1;
 
    return argc > 1 ? process_command(argc, argv, state) : EXIT_SUCCESS;
+}
+
+static int mcp_worker_cmd(int argc, char **argv, cmd_state_t *state)
+{
+   static struct option long_options[] = {
+      { "fd", required_argument, 0, 'f' },
+      { "files-dir", required_argument, 0, 'd' },
+      { "restore-from", required_argument, 0, 'R' },
+      { "allow-changes", no_argument, 0, 'A' },
+      { "track-code", no_argument, 0, 'T' },
+      { "checkpoint-dir", required_argument, 0, 'D' },
+      { "checkpoint-every", required_argument, 0, 'E' },
+      { "restore-confirmed", required_argument, 0, 'K' },
+      { "confirm-jobs", required_argument, 0, 'j' },
+      { "confirm-budget", required_argument, 0, 'B' },
+      { 0, 0, 0, 0 }
+   };
+
+   const int next_cmd = scan_cmd(2, argc, argv);
+   int c, index = 0, ctl_fd = -1;
+   const char *files_dir = NULL, *restore_from = NULL, *every_dir = NULL;
+   uint64_t every_fs = 0;
+   const char *restore_confirmed = NULL;
+   unsigned confirm_jobs = 2;
+   double confirm_budget = 0;
+   bool allow_changes = false;
+   const char *spec = ":";
+   while ((c = getopt_long(next_cmd, argv, spec, long_options, &index)) != -1) {
+      switch (c) {
+      case 0: break;  // Set a flag
+      case 'f':
+         ctl_fd = parse_int(optarg);
+         break;
+      case 'd':
+         files_dir = optarg;
+         break;
+      case 'R':
+         restore_from = optarg;
+         jit_exec_tracking = true;
+         break;
+      case 'A':
+         allow_changes = true;
+         break;
+      case 'T':
+         jit_exec_tracking = true;
+         break;
+      case 'D':
+         every_dir = optarg;
+         jit_exec_tracking = true;
+         break;
+      case 'E':
+         every_fs = strtoull(optarg, NULL, 10);
+         break;
+      case 'K':
+         restore_confirmed = optarg;
+         jit_exec_tracking = true;
+         break;
+      case 'j':
+         confirm_jobs = parse_int(optarg);
+         break;
+      case 'B':
+         confirm_budget = parse_int(optarg);
+         break;
+      case '?': bad_option("mcp-worker", argv);
+      case ':': missing_argument("mcp-worker", argv);
+      default: abort();
+      }
+   }
+
+   if (ctl_fd < 0)
+      fatal("the $bold$--mcp-worker$$ command requires $bold$--fd$$");
+
+
+
+   set_top_level(argv, next_cmd, state);
+
+   confirm_prefix_t cpx = {};
+   if (restore_confirmed != NULL) {
+      // Find the last checkpoint that is proved to be a state of this
+      // design before anything is loaded
+      if (restore_from != NULL)
+         fatal("$bold$--restore-confirmed$$ and $bold$--restore-from$$ "
+               "cannot be used together");
+
+      const confirm_opts_t opts = {
+         .dir = restore_confirmed, .top = state->top_level_arg,
+         .child_args = confirm_child_args(), .jobs = confirm_jobs,
+         .budget_s = confirm_budget, .quiet = true, .prefix = &cpx,
+      };
+      if (confirm_run(&opts) == 130)
+         return 130;
+
+      if (cpx.confirmed == 0)
+         fatal("no checkpoint in %s is confirmed as a state of this design "
+               "(%s)", restore_confirmed,
+               cpx.first_diff == 1 ? "the first segment differs"
+               : cpx.budget_out ? "the budget ran out"
+               : "no segment could be checked");
+
+      restore_from = cpx.path;
+      allow_changes = true;
+   }
+
+   ident_t ename = ident_prefix(state->top_level, well_known(W_ELAB), '.');
+
+   const unit_meta_t *meta = NULL;
+   object_t *obj = lib_get_generic(state->work, ename, &meta);
+   if (obj == NULL)
+      fatal("%s not elaborated", istr(state->top_level));
+
+   tree_t top = tree_from_object(obj);
+   assert(top != NULL);
+
+   opt_set_int(OPT_NO_COLLAPSE, meta->no_collapse);
+
+   if (state->mir == NULL)
+      state->mir = mir_context_new();
+
+   if (state->registry == NULL)
+      state->registry = unit_registry_new(state->mir);
+
+   if (state->jit == NULL)
+      state->jit = get_jit(state);
+
+   state->model = model_new(state->jit, NULL);
+   reheat(top, state->registry, state->mir, NULL, state->model);
+
+   state->vhpi = vhpi_context_new();
+   state->vpi = vpi_context_new();
+
+   const int rc = mcp_worker_main(state->model, top, state->jit, ctl_fd,
+                                  files_dir, restore_from, allow_changes,
+                                  every_dir, every_fs,
+                                  restore_confirmed ? &cpx : NULL);
+
+   vhpi_context_free(state->vhpi);
+   state->vhpi = NULL;
+
+   vpi_context_free(state->vpi);
+   state->vpi = NULL;
+
+   model_free(state->model);
+   state->model = NULL;
+
+   return rc;
+}
+
+static int mcp_cmd(int argc, char **argv, cmd_state_t *state)
+{
+   static struct option long_options[] = {
+      { "root", required_argument, 0, 'r' },
+      { 0, 0, 0, 0 }
+   };
+
+   const int next_cmd = scan_cmd(2, argc, argv);
+   int c, index = 0;
+   const char *spec = ":", *root = NULL;
+   while ((c = getopt_long(next_cmd, argv, spec, long_options, &index)) != -1) {
+      switch (c) {
+      case 0: break;  // Set a flag
+      case 'r':
+         root = optarg;
+         break;
+      case '?': bad_option("mcp", argv);
+      case ':': missing_argument("mcp", argv);
+      default: abort();
+      }
+   }
+
+   if (optind < next_cmd)
+      fatal("unexpected argument $bold$%s$$ after --mcp", argv[optind]);
+
+   return mcp_run(root, state->exe, state->gargv, state->gargc);
 }
 
 static int interact_cmd(int argc, char **argv, cmd_state_t *state)
@@ -1757,7 +2330,7 @@ static int coverage_cmd(int argc, char **argv, cmd_state_t *state)
             merged = db;
          else {
             cover_merge(merged, db, MERGE_UNION);
-            // TODO: not safe to free db here
+            cover_data_free(db);
          }
       }
       else
@@ -2154,11 +2727,13 @@ static void usage(void)
       { "Commands",
         {
            { "-a [OPTION]... FILE...", "Analyse FILEs into work library" },
-           { "-e [OPTION]... TOP", "Elaborate design unit TOP" },
+           { "-e [OPTION]... TOP...", "Elaborate design unit TOP" },
            { "-r [OPTION]... TOP", "Execute previously elaborated TOP" },
 #ifdef ENABLE_TCL
            { "-i [TOP]", "Launch interactive TCL shell" },
 #endif
+           { "--mcp [--root=DIR]",
+             "Run as a Model Context Protocol server on stdin and stdout" },
            { "--cover-export FILE...",
              "Export coverage database to external format" },
            { "--cover-report FILE...",
@@ -2451,6 +3026,8 @@ static int process_command(int argc, char **argv, cmd_state_t *state)
       { "cover-merge",  no_argument, 0, 'M' },
       { "cover-report", no_argument, 0, 'p' },
       { "preprocess",   no_argument, 0, 'R' },
+      { "mcp",          no_argument, 0, 'C' },
+      { "mcp-worker",   no_argument, 0, 'K' },
       { 0, 0, 0, 0 }
    };
 
@@ -2494,6 +3071,10 @@ static int process_command(int argc, char **argv, cmd_state_t *state)
       return cover_report_cmd(argc, argv, state);
    case 'R':
       return preprocess_cmd(argc, argv, state);
+   case 'C':
+      return mcp_cmd(argc, argv, state);
+   case 'K':
+      return mcp_worker_cmd(argc, argv, state);
    default:
       fatal("missing command, try $bold$%s --help$$ for usage", PACKAGE);
       return EXIT_FAILURE;
@@ -2527,15 +3108,24 @@ int main(int argc, char **argv)
       { "vhpi-debug",    no_argument,       0, 'D' },
       { "vhpi-trace",    no_argument,       0, 'T' },
       { "seed",          required_argument, 0, 'S' },
+      { "diag-json",     required_argument, 0, 'J' },   // Internal
       { 0, 0, 0, 0 }
    };
 
    opterr = 0;
 
    const char *work_name = "work";
-   cmd_state_t state = {};
+   cmd_state_t state = { .plugins = tb_new() };
 
    const int next_cmd = scan_cmd(1, argc, argv);
+
+   // Kept for programs started to run parts of a simulation
+   g_global_argv = xcalloc_array(next_cmd + 2, sizeof(char *));
+   g_global_argv[0] = xstrdup("/proc/self/exe");
+   for (int i = 1; i < next_cmd; i++)
+      g_global_argv[i] = xstrdup(argv[i]);
+   g_global_argv[next_cmd] = NULL;
+   g_global_work = work_name;
    int c, index = 0;
    const char *spec = ":hivL:M:P:G:H:";
    while ((c = getopt_long(next_cmd, argv, spec, long_options, &index)) != -1) {
@@ -2586,7 +3176,8 @@ int main(int argc, char **argv)
          parse_stderr_severity(optarg);
          break;
       case 'l':
-         state.plugins = optarg;
+         tb_append(state.plugins, ',');
+         tb_cat(state.plugins, optarg);
          break;
       case 'T':
          opt_set_str(OPT_PLI_TRACE, "1");
@@ -2601,6 +3192,9 @@ int main(int argc, char **argv)
       case 'S':
          opt_set_int(OPT_RANDOM_SEED, parse_int(optarg));
          break;
+      case 'J':
+         mcp_diag_install(parse_int(optarg));
+         break;
       case '?':
          bad_option("global", argv);
       case ':':
@@ -2614,6 +3208,7 @@ int main(int argc, char **argv)
 
    state.work = lib_new(work_name);
    lib_set_work(state.work);
+   g_global_work = work_name;
 
    // Shuffle the arguments to put all the plusargs first
    qsort(argv + optind, next_cmd - optind, sizeof(char *), plusarg_cmp);
@@ -2625,15 +3220,25 @@ int main(int argc, char **argv)
          nplusargs++, optind++;
    }
 
-   if (state.plugins != NULL) {
+   if (tb_len(state.plugins) > 0) {
       state.vhpi = vhpi_context_new();
-      vhpi_load_plugins(state.plugins);
 
       if (nplusargs > 0)
          vhpi_set_plusargs(state.vhpi, nplusargs, plusargs);
+
+      vhpi_load_plugins(tb_get(state.plugins));
    }
    else if (nplusargs > 0)
       warnf("found plusargs on command line but no VHPI plugin was loaded");
+
+   // Remember the global options so the MCP server can pass them to its
+   // workers: plusargs are left out as they only matter to simulation
+   state.exe = argv[0];
+   state.gargv = xcalloc_array(next_cmd, sizeof(char *));
+   for (int i = 1; i < next_cmd; i++) {
+      if (argv[i][0] != '+')
+         state.gargv[state.gargc++] = argv[i];
+   }
 
    argc -= next_cmd - 1;
    argv += next_cmd - 1;
@@ -2654,6 +3259,9 @@ int main(int argc, char **argv)
 
    if (state.cover != NULL)
       cover_data_free(state.cover);
+
+   free(state.gargv);
+   tb_free(state.plugins);
 
    return ret;
 }

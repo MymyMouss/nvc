@@ -61,9 +61,19 @@ static const vhpi_test_t tests[] = {
    { "vhpi18",    vhpi18_startup },
    { "issue1428", issue1428_startup },
    { "vhpi19",    vhpi19_startup },
+   { "vhpi21",    vhpi21_startup },
    { "issue1463", issue1463_startup },
    { "issue1473", issue1473_startup },
    { "issue1505", issue1505_startup },
+   { "issue1616", issue1616_startup },
+   { "issue1621", issue1621_startup },
+   { "issue1632", NULL },
+   { "issue1641", NULL },
+   { "issue1579", issue1579_startup },
+   { "vhpi23",    vhpi23_startup },
+   { "vhpi24",    vhpi24_startup },
+   { "vhpi25",    vhpi25_startup },
+   { "vhpi26",    vhpi26_startup },
    { NULL,        NULL },
 };
 
@@ -86,7 +96,9 @@ void __check_handle(vhpiHandleT h, const char *file, int lineno)
 void __check_string(const vhpiCharT *v, const char *s, const char *file,
                     int lineno)
 {
-   if (strcmp((const char *)v, s) != 0)
+   if (v == NULL)
+      vhpi_assert(vhpiFailure, "%s:%d: (null) != %s", file, lineno, s);
+   else if (strcasecmp((const char *)v, s) != 0)
       vhpi_assert(vhpiFailure, "%s:%d: %s != %s", file, lineno, v, s);
 }
 

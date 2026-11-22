@@ -23,8 +23,8 @@
 #include "hash.h"
 #include "jit/jit-layout.h"
 #include "option.h"
+#include "rt/defs.h"
 #include "rt/model.h"
-#include "rt/rt.h"
 #include "rt/structs.h"
 #include "rt/wave.h"
 #include "printf.h"
@@ -137,9 +137,9 @@ static bool should_dump_array(tree_t where, unsigned length)
    if (warned || limit > 0)
       return false;
 
-   notef("arrays of composite types such as %s are not dumped by default, "
+   notef("arrays of composite types such as %pT are not dumped by default, "
          "pass $bold$--dump-arrays$$ to include these in the waveform dump",
-         type_pp(tree_type(where)));
+         tree_type(where));
 
    warned = true;
    return false;
@@ -148,6 +148,9 @@ static bool should_dump_array(tree_t where, unsigned length)
 static void fst_close(rt_model_t *m, void *arg)
 {
    wave_dumper_t *wd = arg;
+
+   if (wd->fst_ctx == NULL)
+      return;   // Already closed with wave_dumper_close
 
    fstWriterEmitTimeChange(wd->fst_ctx, model_now(m, NULL));
    fstWriterClose(wd->fst_ctx);
@@ -174,7 +177,7 @@ static void fst_close(rt_model_t *m, void *arg)
 #if !defined __CYGWIN__ && !defined __MINGW32__
       char *tmpdir = dirname(wd->tmpfst);
       if (rmdir(tmpdir) != 0)
-         fatal_errno("unlink: %s", tmpdir);
+         fatal_errno("rmdir: %s", tmpdir);
 #endif
 
       free(wd->tmpfst);
@@ -278,6 +281,9 @@ static void fst_event_cb(uint64_t now, rt_signal_t *s, rt_watch_t *w,
                          void *user)
 {
    fst_data_t *data = user;
+
+   if (data->dumper->fst_ctx == NULL)
+      return;
 
    if (now != data->dumper->last_time) {
       fstWriterEmitTimeChange(data->dumper->fst_ctx, now);
@@ -1241,7 +1247,10 @@ void wave_dumper_restart(wave_dumper_t *wd, rt_model_t *m, jit_t *jit)
    wd->model     = m;
    wd->jit       = jit;
 
-   fst_walk_design(wd, tree_stmt(wd->top, 0));
+   const int nroots = tree_stmts(wd->top);
+   for (int i = 0; i < nroots; i++)
+      fst_walk_design(wd, tree_stmt(wd->top, i));
+
    fst_walk_packages(wd);
 
    if (wd->gtkw != NULL) {
@@ -1255,7 +1264,7 @@ void wave_dumper_restart(wave_dumper_t *wd, rt_model_t *m, jit_t *jit)
    // are created to avoid expensive mmap/munmap calls
    for (int i = 0; i < wd->dumped.count; i++) {
       fst_data_t *data = wd->dumped.items[i];
-      fst_event_cb(0, data->signal, data->watch, data);
+      fst_event_cb(model_now(m, NULL), data->signal, data->watch, data);
    }
 
    model_set_phase_cb(m, END_OF_SIMULATION, fst_close, wd);
@@ -1323,6 +1332,56 @@ void wave_dumper_free(wave_dumper_t *wd)
 
    hash_free(wd->typecache);
    free(wd);
+}
+
+void wave_dumper_close(wave_dumper_t *wd)
+{
+   if (wd->fst_ctx == NULL)
+      return;
+
+   rt_model_t *m = wd->model;
+   fst_close(m, wd);
+
+   // Stop watching so another dumper can be attached to the same signals
+   for (int i = 0; i < wd->dumped.count; i++) {
+      fst_data_t *data = wd->dumped.items[i];
+      if (data->watch != NULL) {
+         watch_free(m, data->watch);
+         data->watch = NULL;
+      }
+   }
+}
+
+void wave_dumper_abandon(wave_dumper_t *wd)
+{
+   if (wd->fst_ctx == NULL)
+      return;
+
+   // Unlike wave_dumper_close this leaves the writer alone: it must not
+   // flush or close a file that another process is still writing.  Clearing
+   // the context makes the end of simulation callback do nothing.
+   rt_model_t *m = wd->model;
+   for (int i = 0; i < wd->dumped.count; i++) {
+      fst_data_t *data = wd->dumped.items[i];
+      if (data->watch != NULL) {
+         watch_free(m, data->watch);
+         data->watch = NULL;
+      }
+   }
+
+   wd->fst_ctx = NULL;
+   wd->model   = NULL;
+}
+
+void wave_clear_globs(void)
+{
+   for (int i = 0; i < incl.count; i++)
+      free(incl.items[i].text);
+   for (int i = 0; i < excl.count; i++)
+      free(excl.items[i].text);
+
+   ACLEAR(incl);
+   ACLEAR(excl);
 }
 
 void wave_include_glob(const char *glob)

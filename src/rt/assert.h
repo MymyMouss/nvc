@@ -36,6 +36,8 @@ void clear_vhdl_assert(void);
 void set_vhdl_assert_enable(vhdl_severity_t severity, bool enable);
 bool get_vhdl_assert_enable(vhdl_severity_t severity);
 int get_vhdl_assert_exit_status(void);
+void get_vhdl_assert_state(unsigned *counts, unsigned *enable_mask);
+void set_vhdl_assert_state(const unsigned *counts, unsigned enable_mask);
 
 diag_level_t get_diag_severity(vhdl_severity_t severity);
 void emit_vhdl_diag(diag_t *d, vhdl_severity_t severity);

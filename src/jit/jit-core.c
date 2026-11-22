@@ -49,6 +49,8 @@
 #define FUNC_LIST_SZ    512
 #define COMPILE_TIMEOUT 10000
 
+typedef struct _linked_tlab linked_tlab_t;
+
 typedef struct _jit_tier {
    jit_tier_t    *next;
    int            threshold;
@@ -60,6 +62,12 @@ typedef struct {
    size_t      length;
    jit_func_t *items[0];
 } func_array_t;
+
+typedef struct _linked_tlab {
+   linked_tlab_t *next;
+   linked_tlab_t *prev;
+   tlab_t         tlab;
+} linked_tlab_t;
 
 typedef struct _jit {
    chash_t          *index;
@@ -76,13 +84,15 @@ typedef struct _jit {
    void             *interrupt_ctx;
    unit_registry_t  *registry;
    mir_context_t    *mir;
+   linked_tlab_t    *live_tlabs;
+   linked_tlab_t    *free_tlabs;
 } jit_t;
 
 static void jit_transition(jit_thread_local_t *thread, jit_t *j,
                            jit_state_t from, jit_state_t to);
 static void jit_diag_cb(diag_t *d, void *arg);
 
-static void jit_oom_cb(mspace_t *m, size_t size)
+static void jit_oom_cb(mspace_t *m, size_t size, void *ctx)
 {
    diag_t *d = diag_new(DIAG_FATAL, NULL);
    diag_printf(d, "out of memory attempting to allocate %zu byte object", size);
@@ -94,6 +104,14 @@ static void jit_oom_cb(mspace_t *m, size_t size)
 
    diag_emit(d);
    jit_abort_with_status(EXIT_FAILURE);
+}
+
+static void jit_mark_cb(mspace_t *m, void *cookie, void *ctx)
+{
+   jit_t *j = ctx;
+
+   for (linked_tlab_t *lt = j->live_tlabs; lt; lt = lt->next)
+      mspace_user_mark(m, cookie, lt->tlab.data, lt->tlab.alloc);
 }
 
 __attribute__((always_inline))
@@ -126,15 +144,20 @@ jit_t *jit_new(unit_registry_t *ur, mir_context_t *mc)
    jit_t *j = xcalloc(sizeof(jit_t));
    j->registry    = ur;
    j->index       = chash_new(FUNC_HASH_SZ);
-   j->mspace      = mspace_new(opt_get_size(OPT_HEAP_SIZE));
    j->exit_status = INT_MIN;
    j->mir         = mc;
+
+   const mspace_handler_t mspace_handler = {
+      .oom     = jit_oom_cb,
+      .mark    = jit_mark_cb,
+      .context = j,
+   };
+
+   j->mspace = mspace_new(opt_get_size(OPT_HEAP_SIZE), &mspace_handler);
 
    j->funcs = xcalloc_flex(sizeof(func_array_t),
                            FUNC_LIST_SZ, sizeof(jit_func_t *));
    j->funcs->length = FUNC_LIST_SZ;
-
-   mspace_set_oom_handler(j->mspace, jit_oom_cb);
 
    // Ensure we can resolve symbols from the executable
    ffi_load_dll(NULL);
@@ -144,10 +167,26 @@ jit_t *jit_new(unit_registry_t *ur, mir_context_t *mc)
    return j;
 }
 
+static void jit_free_vtype(const jit_vtype_t *vt)
+{
+   if (vt == NULL)
+      return;
+
+   jit_free_vtype(vt->elem);
+   for (unsigned i = 0; i < vt->count && vt->fields != NULL; i++)
+      jit_free_vtype(vt->fields[i].type);
+   free(vt->fields);
+   free((void *)vt);
+}
+
 static void jit_free_func(jit_func_t *f)
 {
    mptr_free(f->jit->mspace, &(f->privdata));
    free(f->irbuf);
+   free(f->exec);
+   free(f->resume);
+   for (unsigned i = 0; f->linktab != NULL && i < f->nvars; i++)
+      jit_free_vtype(f->linktab[i].type);
    free(f->linktab);
    free(f->cpool);
    free(f);
@@ -169,6 +208,12 @@ void jit_free(jit_t *j)
    }
 
    diag_remove_hint_fn(jit_diag_cb, j);
+
+   assert(j->live_tlabs == NULL);
+   for (linked_tlab_t *lt = j->free_tlabs, *tmp; lt; lt = tmp) {
+      tmp = lt->next;
+      free(lt);
+   }
 
    mspace_destroy(j->mspace);
    chash_free(j->index);
@@ -374,6 +419,190 @@ void *jit_link(jit_t *j, jit_handle_t handle)
    return result.pointer;
 }
 
+bool jit_get_framelay(jit_t *j, jit_handle_t handle, jit_framelay_t *out,
+                      bool compile)
+{
+   jit_func_t *f = jit_get_func(j, handle);
+
+   if (compile)
+      jit_fill_irbuf(f);
+   else if (load_acquire(&(f->state)) != JIT_FUNC_READY)
+      return false;
+
+   if (f->linktab == NULL)
+      return false;
+
+   out->nvars = f->nvars;
+   out->vars  = f->linktab;
+   out->kind  = f->ukind;
+   out->hdrsz = f->hdrsz;
+   return true;
+}
+
+bool jit_get_cpool(jit_t *j, jit_handle_t handle, const void **base,
+                   size_t *size, bool compile)
+{
+   jit_func_t *f = jit_get_func(j, handle);
+   if (compile)
+      jit_fill_irbuf(f);
+   else if (load_acquire(&(f->state)) != JIT_FUNC_READY)
+      return false;
+
+   if (f->cpool == NULL)
+      return false;
+
+   *base = f->cpool;
+   *size = f->cpoolsz;
+   return true;
+}
+
+bool jit_exec_tracking = false;
+
+static uint64_t code_mix(uint64_t h, uint64_t v)
+{
+   return (h ^ v) * 0x100000001b3ULL;
+}
+
+static uint64_t code_value(jit_t *j, uint64_t h, const jit_value_t *v)
+{
+   h = code_mix(h, v->kind);
+
+   // The displacement is only meaningful in an address
+   if (v->kind == JIT_ADDR_REG || v->kind == JIT_ADDR_ABS
+       || v->kind == JIT_ADDR_CPOOL)
+      h = code_mix(h, (uint32_t)v->disp);
+
+   switch (v->kind) {
+   case JIT_VALUE_REG: case JIT_ADDR_REG:
+      return code_mix(h, v->reg);
+   case JIT_VALUE_INT64: case JIT_ADDR_ABS: case JIT_ADDR_CPOOL:
+      return code_mix(h, v->int64);
+   case JIT_VALUE_DOUBLE:
+      {
+         uint64_t bits;
+         memcpy(&bits, &v->dval, sizeof(bits));
+         return code_mix(h, bits);
+      }
+   case JIT_VALUE_LABEL:
+      return h;   // Kept apart: see jit_get_code
+   case JIT_VALUE_EXIT:
+      return code_mix(h, v->exit);
+   case JIT_VALUE_HANDLE:
+      {
+         // Handle numbers depend on the order of compilation
+         if (v->handle == JIT_HANDLE_INVALID || v->handle < 0
+             || v->handle >= j->next_handle)
+            return code_mix(h, 0xfffff);
+
+         const char *name = istr(jit_get_name(j, v->handle));
+         for (; *name; name++)
+            h = code_mix(h, (uint8_t)*name);
+         return h;
+      }
+   default:
+      return h;   // Source locations and loci only affect messages
+   }
+}
+
+bool jit_get_code(jit_t *j, jit_handle_t handle, jit_code_t *out)
+{
+   jit_func_t *f = jit_get_func(j, handle);
+   if (load_acquire(&(f->state)) != JIT_FUNC_READY || f->irbuf == NULL)
+      return false;
+
+   out->nirs = f->nirs;
+   out->exec = f->exec;
+   out->restart_top = f->restart_top;
+   out->restart_state = f->restart_state;
+   out->resume = f->resume;
+   out->nresume = f->nresume;
+   out->has_next_tier = f->next_tier != NULL;
+   out->hash = xmalloc_array(MAX(f->nirs, 1), sizeof(uint64_t));
+   out->label = xmalloc_array(MAX(f->nirs, 1), sizeof(uint32_t));
+   out->kind = xmalloc_array(MAX(f->nirs, 1), sizeof(uint8_t));
+   out->unsupported = false;
+
+   for (unsigned i = 0; i < f->nirs; i++) {
+      const jit_ir_t *ir = &(f->irbuf[i]);
+
+      // Only jumps and the case macro have a label, and only one
+      out->label[i] = JIT_NO_LABEL;
+      out->kind[i] = JIT_FLOW_NEXT;
+
+      const bool l1 = ir->arg1.kind == JIT_VALUE_LABEL;
+      const bool l2 = ir->arg2.kind == JIT_VALUE_LABEL;
+      if (l1 || l2) {
+         out->label[i] = l1 ? ir->arg1.label : ir->arg2.label;
+         if ((l1 && l2) || (ir->op != J_JUMP && ir->op != MACRO_CASE))
+            out->unsupported = true;
+      }
+
+      switch (ir->op) {
+      case J_JUMP:
+         out->kind[i] = ir->cc == JIT_CC_NONE ? JIT_FLOW_JUMP : JIT_FLOW_BRANCH;
+         break;
+      case MACRO_CASE:
+         out->kind[i] = JIT_FLOW_BRANCH;
+         break;
+      case J_RET: case J_TRAP:
+         out->kind[i] = JIT_FLOW_END;
+         break;
+      case MACRO_REEXEC:
+         out->kind[i] = JIT_FLOW_END;
+         out->unsupported = true;
+         break;
+      default:
+         break;
+      }
+
+      uint64_t h = 0xcbf29ce484222325ULL;
+      h = code_mix(h, ir->op);
+      if (ir->op != J_DEBUG) {
+         h = code_mix(h, ir->size);
+         h = code_mix(h, ir->cc);
+         h = code_mix(h, ir->result);
+         h = code_value(j, h, &(ir->arg1));
+         h = code_value(j, h, &(ir->arg2));
+      }
+      out->hash[i] = h;
+   }
+
+   uint64_t ch = 0xcbf29ce484222325ULL;
+   for (unsigned i = 0; i < f->cpoolsz; i++)
+      ch = code_mix(ch, f->cpool[i]);
+   out->cpool_hash = ch;
+   out->cpool_size = f->cpoolsz;
+   return true;
+}
+
+void jit_set_exec(jit_t *j, jit_handle_t handle, const uint8_t *bits,
+                  unsigned n, bool all)
+{
+   jit_func_t *f = jit_get_func(j, handle);
+   if (f->exec == NULL)
+      return;
+
+   for (unsigned i = 0; i < f->nirs; i++)
+      f->exec[i] = all || (i < n && bits[i]) ? 1 : 0;
+}
+
+unsigned jit_handle_count(jit_t *j)
+{
+   return j->next_handle;
+}
+
+void *jit_get_privdata(jit_t *j, jit_handle_t handle)
+{
+   jit_func_t *f = jit_get_func(j, handle);
+   return f->privdata == MPTR_INVALID ? NULL : *mptr_get(f->privdata);
+}
+
+void jit_set_privdata(jit_t *j, jit_handle_t handle, void *ptr)
+{
+   jit_func_t *f = jit_get_func(j, handle);
+   *jit_get_privdata_ptr(j, f) = ptr;
+}
+
 void **jit_get_privdata_ptr(jit_t *j, jit_func_t *f)
 {
    if (f->privdata == MPTR_INVALID)
@@ -404,28 +633,27 @@ static void jit_emit_trace(diag_t *d, const loc_t *loc, object_t *enclosing,
       case T_PROCESS:
          {
             rt_proc_t *proc = get_active_proc();
-            const char *name = istr(proc ? proc->name : tree_ident(tree));
-            diag_trace(d, loc, "Process$$ %s", name);
+            ident_t name = proc ? proc->name : tree_ident(tree);
+            diag_trace(d, loc, "Process$$ %pi", name);
          }
          break;
       case T_ATTR_SPEC:
          assert(ident_casecmp(tree_ident(tree), well_known(W_FOREIGN)));
-         diag_trace(d, loc, "Subprogram$$ %s",
-                    type_pp(tree_type(tree_ref(tree))));
+         diag_trace(d, loc, "Subprogram$$ %pT", tree_type(tree_ref(tree)));
          break;
       case T_FUNC_BODY:
       case T_FUNC_DECL:
-         diag_trace(d, loc, "Function$$ %s", type_pp(tree_type(tree)));
+         diag_trace(d, loc, "Function$$ %pT", tree_type(tree));
          break;
       case T_PROC_BODY:
       case T_PROC_DECL:
-         diag_trace(d, loc, "Procedure$$ %s", type_pp(tree_type(tree)));
+         diag_trace(d, loc, "Procedure$$ %pT", tree_type(tree));
          break;
       case T_TYPE_DECL:
          if (strstr(symbol, "$value"))
-            diag_trace(d, loc, "Attribute$$ %s'VALUE", istr(tree_ident(tree)));
+            diag_trace(d, loc, "Attribute$$ %pI'VALUE", tree_ident(tree));
          else
-            diag_trace(d, loc, "Type$$ %s", istr(tree_ident(tree)));
+            diag_trace(d, loc, "Type$$ %pI", tree_ident(tree));
          break;
       case T_BLOCK:
          diag_trace(d, loc, "Process$$ (init)");
@@ -433,16 +661,16 @@ static void jit_emit_trace(diag_t *d, const loc_t *loc, object_t *enclosing,
       case T_PACKAGE:
       case T_PACK_BODY:
       case T_PACK_INST:
-         diag_trace(d, loc, "Package$$ %s", istr(tree_ident(tree)));
+         diag_trace(d, loc, "Package$$ %pI", tree_ident(tree));
          break;
       case T_INERTIAL:
          diag_trace(d, loc, "Equivalent process");
          break;
       case T_TYPE_CONV:
-         diag_trace(d, loc, "Type conversion %s", type_pp(tree_type(tree)));
+         diag_trace(d, loc, "Type conversion %pT", tree_type(tree));
          break;
       case T_PARAM_DECL:
-         diag_trace(d, loc, "Parameter %s", istr(tree_ident(tree)));
+         diag_trace(d, loc, "Parameter %pI", tree_ident(tree));
          break;
       case T_PARAM:
          diag_trace(d, loc, "Port conversion");
@@ -461,20 +689,23 @@ static void jit_emit_trace(diag_t *d, const loc_t *loc, object_t *enclosing,
    if (v != NULL) {
       switch (vlog_kind(v)) {
       case V_INITIAL:
-         diag_trace(d, loc, "Initial procedure %pi", vlog_ident(v));
+         diag_trace(d, loc, "Initial procedure %pQ", vlog_ident(v));
          break;
       case V_ALWAYS:
-         diag_trace(d, loc, "Always procedure %pi", vlog_ident(v));
+         diag_trace(d, loc, "Always procedure %pQ", vlog_ident(v));
          break;
       case V_PORT_MAP:
-         diag_trace(d, loc, "Port connection for '%pi'",
+         diag_trace(d, loc, "Port connection for %pQ",
                     vlog_ident(vlog_ref(v)));
          break;
       case V_INST_BODY:
-         diag_trace(d, loc, "Instance %pi", vlog_ident(v));
+         diag_trace(d, loc, "Instance %pQ", vlog_ident(v));
+         break;
+      case V_TCHECK:
+         diag_trace(d, loc, "Timing check");
          break;
       default:
-         diag_trace(d, loc, "%pi", vlog_ident(v));
+         diag_trace(d, loc, "%pQ", vlog_ident(v));
       }
    }
 }
@@ -682,7 +913,9 @@ bool jit_vfastcall(jit_t *j, jit_handle_t handle, const jit_scalar_t *inargs,
    if (!jit_try_vcall(j, f, args, tlab))
       return false;
 
-   memcpy(results, args, nresults * sizeof(jit_scalar_t));
+   if (nresults > 0)
+      memcpy(results, args, nresults * sizeof(jit_scalar_t));
+
    return true;
 }
 
@@ -1293,4 +1526,94 @@ jit_thread_local_t *jit_attach_thread(jit_anchor_t *anchor)
    jit_check_interrupt(thread->jit);
 
    return thread;
+}
+
+
+#ifdef DEBUG
+static bool tlab_on_list(linked_tlab_t *lt, linked_tlab_t *list)
+{
+   for (linked_tlab_t *it = list; it; it = it->next) {
+      if (it == lt)
+         return true;
+   }
+
+   return false;
+}
+#endif
+
+tlab_t *tlab_acquire(jit_t *j)
+{
+   SCOPED_LOCK(j->lock);
+
+   linked_tlab_t *lt = j->free_tlabs;
+   if (lt == NULL) {
+      lt = xmalloc(sizeof(linked_tlab_t) + TLAB_SIZE);
+      lt->tlab.mspace = j->mspace;
+   }
+   else {
+      assert(!tlab_on_list(lt, j->live_tlabs));
+      assert(lt->prev == NULL);
+      j->free_tlabs = lt->next;
+   }
+
+   lt->next = j->live_tlabs;
+   lt->prev = NULL;
+
+   if (j->live_tlabs != NULL) {
+      assert(j->live_tlabs->prev == NULL);
+      j->live_tlabs->prev = lt;
+   }
+
+   j->live_tlabs = lt;
+
+   // Ensure proper starting alignment on 32-bit systems
+   const size_t data_off = offsetof(tlab_t, data);
+   lt->tlab.alloc = ALIGN_UP(data_off, sizeof(double)) - data_off;
+   lt->tlab.limit = TLAB_SIZE - OVERRUN_MARGIN;
+
+   return &(lt->tlab);
+}
+
+void tlab_release(jit_t *j, tlab_t *t)
+{
+   if (t == NULL)
+      return;
+
+   SCOPED_LOCK(j->lock);
+
+   linked_tlab_t *lt = container_of(t, linked_tlab_t, tlab);
+
+   assert(t->alloc <= t->limit);
+   assert(!tlab_on_list(lt, j->free_tlabs));
+   assert(tlab_on_list(lt, j->live_tlabs));
+
+   if (lt->prev == NULL)
+      j->live_tlabs = lt->next;
+   else {
+      assert(lt->prev->next == lt);
+      lt->prev->next = lt->next;
+   }
+
+   if (lt->next != NULL)
+      lt->next->prev = lt->prev;
+
+   assert(!tlab_on_list(lt, j->live_tlabs));
+
+   lt->prev = NULL;
+   lt->next = j->free_tlabs;
+   j->free_tlabs = lt;
+}
+
+void *tlab_alloc(tlab_t *t, size_t size)
+{
+   assert(t->alloc <= t->limit);
+   assert((t->alloc & (sizeof(double) - 1)) == 0);
+
+   if (t->alloc + size <= t->limit) {
+      void *p = t->data + t->alloc;
+      t->alloc += ALIGN_UP(size, sizeof(double));
+      return p;
+   }
+   else
+      return mspace_alloc(t->mspace, size);
 }

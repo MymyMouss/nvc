@@ -17,11 +17,10 @@
 
 #include "util.h"
 #include "cov/cov-api.h"
-#include "cov/cov-data.h"
+#include "cov/cov-priv.h"
 #include "ident.h"
 #include "jit/jit-exits.h"
 #include "rt/model.h"
-#include "rt/rt.h"
 #include "rt/structs.h"
 
 #include <assert.h>
@@ -234,7 +233,7 @@ void x_cover_setup_toggle_cb(sig_shared_t *ss, uint32_t offset, int32_t count,
    if (counters == NULL)
       return;
 
-   cover_mask_t op_mask = data->mask;
+   cover_mask_t op_mask = cover_get_u32(data, COVER_NULL_OBJ, COV_ATTR_MASK, 0);
 
    if (is_constant_input(s)) {
       int32_t *toggle_01 = counters + tag;
@@ -320,9 +319,9 @@ void x_cover_setup_state_cb(sig_shared_t *ss, int64_t low, int32_t tag)
 ///////////////////////////////////////////////////////////////////////////////
 
 typedef struct {
-   ident_t        name;
-   cover_scope_t *scope;
-   int32_t       *counters;
+   ident_t      name;
+   cover_obj_t  scope;
+   int32_t     *counters;
 } user_scope_t;
 
 static void sanitise_name(text_buf_t *tb, const char *bytes, size_t len)
@@ -352,36 +351,44 @@ void _nvc_create_cover_scope(jit_scalar_t *args)
    if (m == NULL)
       return;
 
-   cover_data_t *data = get_coverage(m);
-   if (data == NULL || !cover_enabled(data, COVER_MASK_FUNCTIONAL))
+   cover_data_t *db = get_coverage(m);
+   if (db == NULL || !cover_enabled(db, COVER_MASK_FUNCTIONAL))
       return;
 
-   rt_scope_t *inst = get_active_scope(m);
-   assert(inst->kind == SCOPE_INSTANCE);
+   rt_scope_t *rt_scope = get_active_scope(m);
+   assert(rt_scope->kind == SCOPE_INSTANCE);
 
-   cover_scope_t *parent = cover_get_scope(data, inst->name);
-   if (parent == NULL)
+   cover_obj_t inst = cover_find(db, rt_scope->name);
+   if (cover_is_null(inst))
       return;
 
    LOCAL_TEXT_BUF tb = tb_new();
    sanitise_name(tb, name_bytes, name_len);
 
    const size_t pfxlen = tb_len(tb);
-   for (int i = 0, dup = 0; i < parent->children.count; i++) {
-      if (icmp(parent->children.items[i]->name, tb_get(tb))) {
+
+   cover_obj_t root = cover_get_obj(db, inst, COV_ATTR_ROOT);
+
+   cover_iter_t it = cover_begin(db, root, COV_REL_CHILDREN);
+   cover_obj_t child;
+   int dup = 0;
+   while (cover_next(&it, &child)) {
+      ident_t name = cover_get_ident(db, child, COV_ATTR_NAME);
+
+      if (icmp(name, tb_get(tb))) {
          tb_trim(tb, pfxlen);
          tb_printf(tb, "#%d", ++dup);
       }
    }
 
    ident_t suffix = ident_new(tb_get(tb));
-   ident_t name = ident_prefix(inst->name, suffix, '.');
+   ident_t name = ident_prefix(rt_scope->name, suffix, '.');
 
    user_scope_t *us = jit_mspace_alloc(sizeof(user_scope_t));
    us->counters = NULL;
    us->name     = name;
-   us->scope    = cover_create_user_scope(data, parent, *tree_loc(inst->where),
-                                          suffix);
+   us->scope    = cover_scope_new(db, inst, root, CSCOPE_USER, suffix,
+                                  *tree_loc(rt_scope->where));
 
    *ptr = us;
 }
@@ -399,19 +406,27 @@ void _nvc_set_cover_scope_name(jit_scalar_t *args)
    if (us == NULL)
       return;
 
+   rt_model_t *m = get_model_or_null();
+   if (m == NULL)
+      return;
+
+   cover_data_t *db = get_coverage(m);
+
    LOCAL_TEXT_BUF tb = tb_new();
    sanitise_name(tb, name_bytes, name_len);
 
    ident_t name_id = ident_new(tb_get(tb));
 
-   if (us->scope->items.count > 0)
+   if (cover_count(db, us->scope, COV_REL_ITEMS) > 0)
       jit_msg(NULL, DIAG_FATAL, "cannot change name of cover scope after "
               "items are created");
 
-   us->scope->name = name_id;
+   cover_put_ident(db, us->scope, COV_ATTR_NAME, name_id);
 
-   ident_t prefix = ident_runtil(us->scope->hier,'.');
-   us->scope->hier = ident_prefix(prefix, name_id, '.');
+   ident_t hier = cover_get_ident(db, us->scope, COV_ATTR_HIER);
+   ident_t prefix = ident_runtil(hier, '.');
+   cover_put_ident(db, us->scope, COV_ATTR_HIER,
+                   ident_prefix(prefix, name_id, '.'));
 }
 
 DLLEXPORT
@@ -427,7 +442,7 @@ void _nvc_add_cover_item(jit_scalar_t *args)
    if (name_len == 0)
       jit_msg(NULL, DIAG_FATAL, "coverage item name cannot be empty");
 
-   if (us == NULL || !us->scope->emit)
+   if (us == NULL)
       return;
 
    assert(us->counters == NULL);   // TODO: add test
@@ -436,52 +451,65 @@ void _nvc_add_cover_item(jit_scalar_t *args)
    if (m == NULL)
       return;
 
-   cover_data_t *data = get_coverage(m);
-   if (data == NULL || !cover_enabled(data, COVER_MASK_FUNCTIONAL))
+   cover_data_t *db = get_coverage(m);
+   if (db == NULL || !cover_enabled(db, COVER_MASK_FUNCTIONAL))
       return;
 
    LOCAL_TEXT_BUF tb = tb_new();
-   tb_istr(tb, us->scope->hier);
+   tb_istr(tb, cover_get_ident(db, us->scope, COV_ATTR_HIER));
    tb_append(tb, '.');
    sanitise_name(tb, name_bytes, name_len);
 
    const size_t pfxlen = tb_len(tb);
-   for (int i = 0, dup = 0; i < us->scope->items.count; i++) {
-      if (icmp(us->scope->items.items[i]->hier, tb_get(tb))) {
+   const int nitems = cover_count(db, us->scope, COV_REL_ITEMS);
+   for (int i = 0, dup = 0; i < nitems; i++) {
+      cover_obj_t item = cover_at(db, us->scope, COV_REL_ITEMS, i);
+      cover_obj_t bin0 = cover_at(db, item, COV_REL_BINS, 0);
+
+      ident_t hier = cover_get_ident(db, bin0, COV_ATTR_HIER);
+      if (icmp(hier, tb_get(tb))) {
          tb_trim(tb, pfxlen);
          tb_printf(tb, "#%d", ++dup);
       }
    }
 
-   cover_item_t *item =
-      cover_add_items_for(data, us->scope, NULL, COV_ITEM_FUNCTIONAL);
-   assert(item != NULL);   // Preconditions checked above
+   // XXX: keeps report from crashing but location does not make sense here
+   loc_t scope_loc = cover_get_loc(db, us->scope, COV_ATTR_LOC);
 
-   item->hier = ident_new(tb_get(tb));
-   item->loc = us->scope->loc;   // XXX: keeps report from crashing but location
-                                 //      does not make sense here
+   cover_obj_t item = cover_item_new(db, us->scope, COV_ITEM_FUNCTIONAL,
+                                     scope_loc, 1);
+   assert(!cover_is_null(item));   // Preconditions checked above
+
+   cover_obj_t bin0 = cover_at(db, item, COV_REL_BINS, 0);
+   cover_put_ident(db, bin0, COV_ATTR_HIER, ident_new(tb_get(tb)));
 
    // Name remembered at the time of cover point creation in its scope
-   item->func_name = us->scope->name;
+   ident_t scope_name = cover_get_ident(db, us->scope, COV_ATTR_NAME);
+   cover_put_ident(db, item, COV_ATTR_FUNC_NAME, scope_name);
 
-   item->source = COV_SRC_USER_COVER;
-   item->atleast = args[7].integer;
+   cover_put_u32(db, item, COV_ATTR_SOURCE, COV_SRC_USER_COVER);
 
-   item->flags = COV_FLAG_USER_DEFINED;
-   if (item->atleast == 0)
-      item->flags |= (COV_FLAG_EXCLUDED | COV_FLAG_EXCLUDED_USER);
+   const unsigned atleast = args[7].integer;
+   cover_put_u32(db, item, COV_ATTR_ATLEAST, atleast);
 
-   item->n_ranges = ffi_array_length(args[10].integer);
-   item->ranges = xcalloc_array(item->n_ranges, sizeof(cover_range_t));
+   cover_flags_t flags = COV_FLAG_USER_DEFINED;
+   if (atleast == 0)
+      flags |= (COV_FLAG_EXCLUDED | COV_FLAG_EXCLUDED_USER);
+
+   cover_put_flags(db, bin0, flags);
+
+   const int n_ranges = ffi_array_length(args[10].integer);
+   cover_add_ranges(db, bin0, n_ranges);
 
    int64_t *ptr = (int64_t *)args[8].pointer;
 
-   for (int i = 0; i < item->n_ranges; i++) {
-      item->ranges[i].min = *ptr++;
-      item->ranges[i].max = *ptr++;
+   for (int i = 0; i < n_ranges; i++) {
+      cover_obj_t r = cover_at(db, bin0, COV_REL_RANGES, i);
+      cover_put_i64(db, r, COV_ATTR_MIN, *ptr++);
+      cover_put_i64(db, r, COV_ATTR_MAX, *ptr++);
    }
 
-   *index_ptr = us->scope->items.count - 1;
+   *index_ptr = nitems;
 }
 
 DLLEXPORT
@@ -490,22 +518,29 @@ void _nvc_increment_cover_item(jit_scalar_t *args)
    user_scope_t *us = *(user_scope_t **)args[2].pointer;
    int32_t index = args[3].integer;
 
-   if (us == NULL || !us->scope->emit)
+   if (us == NULL)
       return;
 
    rt_model_t *m = get_model_or_null();
    if (m == NULL)
       return;
 
-   cover_data_t *data = get_coverage(m);
-   if (data == NULL || !cover_enabled(data, COVER_MASK_FUNCTIONAL))
+   cover_data_t *db = get_coverage(m);
+   if (db == NULL || !cover_enabled(db, COVER_MASK_FUNCTIONAL))
       return;
 
-   if (index < 0 || index >= us->scope->items.count)
+   if (index < 0)
+      jit_msg(NULL, DIAG_FATAL, "cover item handle not initialised");
+
+   cover_obj_t item = cover_at(db, us->scope, COV_REL_ITEMS, index);
+   if (cover_is_null(item))
       jit_msg(NULL, DIAG_FATAL, "cover item index %d out of range", index);
 
    if (us->counters == NULL)
-      us->counters = cover_get_counters(data, us->name);
+      us->counters = cover_get_counters(db, us->name);
 
-   cover_merge_one_item(us->scope->items.items[index], 1);
+   assert(cover_count(db, item, COV_REL_BINS) == 1);
+
+   cover_obj_t bin0 = cover_at(db, item, COV_REL_BINS, 0);
+   cover_merge_bin(db, bin0, 1);
 }

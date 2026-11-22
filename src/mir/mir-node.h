@@ -223,8 +223,10 @@ typedef enum {
    MIR_OP_FILE_WRITE,
    MIR_OP_LINK_VAR,
    MIR_OP_DRIVING_VALUE,
-   MIR_OP_FORCE,
-   MIR_OP_RELEASE,
+   MIR_OP_SCHED_FORCE,
+   MIR_OP_SCHED_RELEASE,
+   MIR_OP_FORCE_SIGNAL,
+   MIR_OP_RELEASE_SIGNAL,
    MIR_OP_DISCONNECT,
    MIR_OP_PROCESS_INIT,
    MIR_OP_COVER_STMT,
@@ -268,6 +270,7 @@ typedef enum {
    MIR_OP_GET_COUNTERS,
    MIR_OP_INSTANCE_INIT,
    MIR_OP_SCHED_ACTIVE,
+   MIR_OP_TCHECK,
 } mir_op_t;
 
 typedef enum {
@@ -324,6 +327,7 @@ typedef enum {
    MIR_MEM_STACK,
    MIR_MEM_LOCAL,
    MIR_MEM_GLOBAL,
+   MIR_MEM_SIGNAL,
    MIR_MEM_TOP,
 } mir_mem_t;
 
@@ -385,6 +389,7 @@ mir_type_t mir_file_type(mir_unit_t *mu, mir_type_t base);
 mir_type_t mir_vec2_type(mir_unit_t *mu, int size, bool issigned);
 mir_type_t mir_vec4_type(mir_unit_t *mu, int size, bool issigned);
 
+mir_type_t mir_vector_slice(mir_unit_t *mu, mir_type_t base, int size);
 mir_type_t mir_get_base(mir_unit_t *mu, mir_type_t type);
 mir_type_t mir_get_elem(mir_unit_t *mu, mir_type_t type);
 mir_type_t mir_get_pointer(mir_unit_t *mu, mir_type_t type);
@@ -428,6 +433,8 @@ mir_value_t mir_add_var(mir_unit_t *mu, mir_type_t type, mir_stamp_t stamp,
                         ident_t name, mir_var_flags_t flags);
 bool mir_get_const(mir_unit_t *mu, mir_value_t value, int64_t *result);
 bool mir_get_const_real(mir_unit_t *mu, mir_value_t value, double *result);
+bool mir_within_int(mir_unit_t *mu, mir_value_t value, int64_t low,
+                    int64_t high);
 mir_type_t mir_get_type(mir_unit_t *mu, mir_value_t value);
 mir_stamp_t mir_get_stamp(mir_unit_t *mu, mir_value_t value);
 mir_mem_t mir_get_mem(mir_unit_t *mu, mir_value_t value);
@@ -660,9 +667,14 @@ mir_value_t mir_build_resolved(mir_unit_t *mu, mir_value_t signal);
 mir_value_t mir_build_last_value(mir_unit_t *mu, mir_value_t signal);
 mir_value_t mir_build_driving_value(mir_unit_t *mu, mir_value_t signal,
                                     mir_value_t count);
-void mir_build_force(mir_unit_t *mu, mir_value_t target, mir_value_t count,
-                     mir_value_t values);
-void mir_build_release(mir_unit_t *mu, mir_value_t target, mir_value_t count);
+void mir_build_sched_force(mir_unit_t *mu, mir_value_t target,
+                           mir_value_t count, mir_value_t values);
+void mir_build_sched_release(mir_unit_t *mu, mir_value_t target,
+                             mir_value_t count);
+void mir_build_force_signal(mir_unit_t *mu, mir_value_t target,
+                            mir_value_t count, mir_value_t values);
+void mir_build_release_signal(mir_unit_t *mu, mir_value_t target,
+                              mir_value_t count, mir_value_t mode);
 void mir_build_disconnect(mir_unit_t *mu, mir_value_t target, mir_value_t count,
                           mir_value_t reject, mir_value_t after);
 mir_value_t mir_build_last_event(mir_unit_t *mu, mir_value_t signal,
@@ -728,7 +740,8 @@ mir_value_t mir_build_link_package(mir_unit_t *mu, ident_t name);
 mir_value_t mir_build_link_var(mir_unit_t *mu, mir_value_t context,
                                ident_t name, mir_type_t type);
 void mir_build_bind_foreign(mir_unit_t *mu, mir_value_t spec,
-                            mir_value_t length, mir_value_t locus);
+                            mir_value_t length, mir_value_t locus,
+                            mir_value_t region);
 mir_value_t mir_build_bind_external(mir_unit_t *mu, mir_value_t locus,
                                     ident_t scope, mir_type_t type,
                                     mir_stamp_t stamp, const mir_value_t *args,
@@ -757,6 +770,8 @@ void mir_build_assert(mir_unit_t *mu, mir_value_t value, mir_value_t message,
                       mir_value_t hint_right);
 void mir_build_report(mir_unit_t *mu, mir_value_t message, mir_value_t length,
                       mir_value_t severity, mir_value_t locus);
+void mir_build_tcheck(mir_unit_t *mu, mir_value_t stamp, mir_value_t limit,
+                      mir_value_t locus);
 
 // Miscellaneous
 mir_value_t mir_build_instance_name(mir_unit_t *mu, mir_value_t kind);

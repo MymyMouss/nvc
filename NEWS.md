@@ -1,20 +1,206 @@
 ## Unreleased changes
+- The state of a running simulation can be saved to a file and restored
+  in a new process of the same elaborated design: `nvc -r
+  --checkpoint=FILE@TIME` writes FILE at the end of the first time step
+  at or after TIME and carries on, and `nvc -r --restore=FILE` continues
+  from it, with processes, signals, drivers, pending transactions, files
+  opened by the design and heap data restored by name rather than copied
+  from memory.  A checkpoint is refused for a different design or build
+  of nvc, and a save that cannot be exact (for example PSL properties or
+  forced signals) fails with a message naming the object.  A restore is
+  checked by saving the restored state again and comparing it with the
+  file.  `--restore=FILE --allow-changes` restores into a design whose
+  source was changed (for example after fixing a bug) and says whether the
+  result is exact, because the changed code had not run any of the changed
+  part before the checkpoint, or only approximate (as if the fix had been
+  applied at that time); `--verdict=FILE` writes it as JSON.  The code
+  that ran is compared basic block by basic block, so a fix in a branch
+  that had not been reached yet in a unit that did run is still exact.
+- A fix can be confirmed against a whole earlier run: `--checkpoint=DIR@every=TIME`
+  writes a checkpoint file every TIME of simulated time (at most 64 are
+  kept, the interval doubling when there would be more), and `nvc -r
+  --confirm=DIR top` runs the changed design from each file to the next,
+  `--jobs=N` at a time, and compares the states.  The result is printed
+  and written with `--confirm-result=FILE` as JSON: confirmed (the changed
+  design reaches every saved state from time zero), different (the first
+  segment, time interval and object that differ) or incomplete (segments
+  that could not be checked, or the `--confirm-budget` or `--confirm-max`
+  limit was reached).  It can be interrupted and resumed.  A fix inside a
+  process that is suspended at a wait (a sequential testbench) is
+  confirmed like any other: each segment restores the previous file as the
+  changed design's own state.  The saved state no longer depends on whether
+  a waveform is being recorded.  A restore with `--allow-changes` into a
+  process suspended in changed code that had run now resumes it at the wait
+  with the same number and reports the verdict approximate, naming it.
+- `nvc -r --restore-confirmed=DIR` resumes exactly after any fix: it
+  confirms the changed design against the periodic checkpoints in DIR and
+  restores the last checkpoint that is proved to be the changed design's own
+  state, then runs on.  If no checkpoint is confirmed it stops
+  (`--confirmed-or-zero` starts from time zero instead).  The MCP tool
+  `nvc_sim_open` has `restore_confirmed` for the same, and the status of a
+  finished background confirmation names the last confirmed file.
+- The MCP tool `nvc_sim_open` takes `checkpoint_dir` and `checkpoint_every`
+  to write checkpoint files during a run, and `confirm_dir` to confirm in
+  the background a fix restored with `restore_from` and `allow_changes`;
+  `nvc_sim_status` shows the progress and result and `nvc_sim_wait` wakes
+  when it ends.
+- Added an experimental Model Context Protocol server, started with
+  `nvc --mcp`, that lets AI agents drive nvc.  Its tools compile and
+  elaborate designs (`nvc_analyse`, `nvc_elaborate`), list source files
+  and library units (`nvc_workspace_list`, `nvc_library_list`), and run
+  live simulations that can be stopped at the first failed assertion,
+  inspected and forced (`nvc_sim_open`, `nvc_sim_run`, `nvc_design_list`,
+  `nvc_design_search`, `nvc_signal_get`, `nvc_signal_set`,
+  `nvc_sim_close`), and record signal changes in a bounded in-memory
+  buffer to look back at what led to a failure (`nvc_wave_start`,
+  `nvc_wave_get`, `nvc_wave_stop`).  Long simulations run in the
+  background (`nvc_sim_run` with `background`, followed with
+  `nvc_sim_status`, `nvc_sim_wait` and `nvc_sim_stop`), signals can be
+  recorded to size-limited FST files while a simulation runs
+  (`nvc_wave_start`, `nvc_wave_stop`) and read back with
+  `nvc_wave_summary`, `nvc_wave_get` and `nvc_wave_find`, and what a
+  design prints is kept in a log read with `nvc_sim_log`.  A recording
+  also keeps the latest changes in memory so they can be read while a
+  simulation runs.  Questions about time are answered by the tools rather
+  than left to the caller: `nvc_wave_find` tests a VHDL-like condition per
+  clock cycle and `nvc_wave_table` shows one row per clock edge with the
+  design messages on their cycle.  A simulation can be saved at any
+  time as a frozen copy of its process (`nvc_sim_checkpoint`, also taken
+  automatically during background runs) and opened again from that point
+  as a new simulation (`nvc_sim_restore`), for example to record more
+  signals just before a failure.  Each call that
+  loads a design runs in an isolated worker process.
+- Fixed a crash when attaching a waveform dumper to signals whose watch had
+  been freed.
+- Code coverage can now be collected for package declarations and
+  bodies, opted in via the new `+package` directive (or an existing
+  `+hierarchy` rule) in a coverage specification file.  Packages from the
+  `STD`, `IEEE`, and `NVC` libraries are never instrumented.
+- Fixed expression coverage of short-circuit logical operators, where
+  the bin for the unevaluated right hand side was reported as uncovered
+  (#1450).
+- Fixed a crash in expression coverage for overloaded package
+  subprograms.
+- Fixed a crash in `--cover-report` when a recorded source span extends
+  past the end of the source file.
+- Logical operators on arrays and IEEE vectors now emit a warning if
+  their operands differ in length (from @NikLeberg) (#1667).
+- Added basic support for Verilog `$setup`, `$hold`, `$recovery`, and
+  `$removal` timing checks (from @Blebowski).
+- Added a `pkg-config` configuration file to aid locating the VHPI
+  headers (from @gsmecher).
+- Environment variables with braces like `{ENV}` are now supported in
+  the analysis `-f` file list (from @mak-gitdev).
+- Array aggregates with a non-locally static choice and an `others`
+  choice are now accepted with `--relaxed` (#1637).
+- `process(all)` sensitivity list construction now correctly checks
+  all nested subprograms instead of only procedures (#1721).
+- Signed integral operands of Verilog expressions mixed with real
+  operands are now converted to real as signed values.
+- Fixed a JIT bug where sign extension of a Verilog vector could
+  corrupt the value used by later expressions.
+- Added support for Verilog `force` and `release` statements and partial
+  support for deprecated procedural `assign` and `deassign` (#1676).
+- Fixed a crash when a Verilog user function call or cast is used as a
+  system task argument.
+- Various fixes and improvements to Cobertura coverage export (#1684).
+- Several other minor bugs were resolved (#1678, #1718, #1685, #1726,
+  #1730, #1722, #1724).
+
+## Version 1.23.1 - 2026-10-28
+- Fixed a crash after a severity `failure` assertion failure during
+  elaboration.
+- Aliases of globally static names are now correctly treated as globally
+  static themselves (#1683).
+- Fixed connecting VHDL `std_logic_vector` signals to System Verilog
+  `input logic` ports in mixed language simulation (#1681).
+- Fixed a crash when a PSL directive has an inline clock expression
+  (#1693).
+- PSL declarations are now accepted in generate blocks (#1694).
+- Several other minor bugs were resolved (#1663, #1672, #1668, #1670,
+  #1686, #1687, #1692, #1695, #1700, #1707).
+
+## Version 1.23.0 - 2026-09-19
+- Added basic support for System Verilog assignment pattern expressions.
+- Added support for randomised signal initialisation using a bundled
+  VHPI plugin.  This is useful for finding reset issues, see the manual
+  for details (from @Blebowski).
+- Added support for System Verilog procedural assertions.
+- Fixed an issue where VHPI could not iterate the constraints of objects
+  declared with an unconstrained subtype (#1632).
+- Fixed several cases where `--preserve-case` would cause incorrect
+  behaviour (#1641).
+- Added support for System Verilog sized casts (#1640).
+- The value of `'instance_name` for subprograms no longer includes
+  spaces between parameters in the signature (#1648).
+- Fixed a critical bug which could cause garbage collection to deadlock
+  with background JIT threads (#1649).
+- Fixed a bug where toggle coverage of a port could be incorrectly
+  excluded as unreachable when `--cover=exclude-unreachable` was used,
+  even though the port was actually driven (#1639).
+- Several other minor bugs were resolved (#1638, #1636, #1579, #1647,
+  #1658).
+
+## Version 1.22.1 - 2026-08-01
+- Waveform dumping now dumps multiple top units instead of only the first
+  elaborated unit.
+- Fixed incorrect statement coverage in `--per-file` report when two
+  instances of the same entity have different generic values (#1567).
+- Fixed a regression which caused a crash when using `vhpi_put_value` on
+  a selected name in a record with an unconstrained field (#1624).
+- Fixed a regression where `'event` was not set properly when a signal
+  was updated by a `vhpi_put_value` deposit twice in one delta cycle
+  (#1626).
+- Unpacked dimensions are now allowed in System Verilog port
+  declarations (#1625).
+- Several other minor bugs were resolved (#1621, #1627, #1629)
+
+## Version 1.22.0 - 2026-07-22
+- Added support for evaluating user function calls in Verilog constant
+  expressions (#1518).
+- VHDL architectures can now be specified on the command line with `-e
+  entity(arch)`. The previous form `entity-arch` is still supported.
+- Added support for default arguments in Verilog macros.
+- Added support for `$info`, `$warning`, `$error`, and `$fatal`, Verilog
+  system tasks.
+- Elaboration now supports multiple top level design units (#1588).
+- Verilog hierarchical references are now supported.
+- External names are now allowed in the prefix of selected or indexed
+  names (#1602, #1603).
+- Verilog `disable` statements are now supported (#1605).
+- Added the `$tcl_interactive` variable to distinguish `nvc -i` and `nvc
+  --do` (#1608).
+- Added support for VHPI `vhpiCbRepAfterDelay` callbacks (#1616).
+- Several other minor bugs were resolved (#1587, #1594, #1409, #1597,
+  #1599, #1600, #1596, #1569, #1607, #1610, #1590, #1609, #1612, #1606,
+  #1613, #1614, #1595).
+
+## Version 1.21.1 - 2026-06-20
+- Fixed a regression which caused calls to an overloaded subprogram with
+  the same name as an enclosing subprogram to be incorrectly reported as
+  ambiguous (#1560).
+- Fixed reading scalar `out` and `inout` parameters in VHPI foreign
+  subprograms (#1570).
+- Fix memory corruption when a record with unconstrained fields is
+  allocated in a procedure (#1576).
+- Fixed a crash when using the `'stable` attribute with a time
+  expression referencing constants declared in a process (#1537).
+- Added binary package for Ubuntu 26.04.
+- Several other minor bugs were resolved (#1559, #1562, #1581, #1578).
+
+## Version 1.21.0 - 2026-05-23
 - Systems with emulated thread-local storage (in particular all MSYS2
   environments except Clang x64 and Clang Arm) are no longer supported
   due to performance issues.
+- Verilog support is significantly improved, particularly in expression
+  width determination, sign extension, and X-propagation.
 - Local variables are now ignored in Verilog `@(*)` sensitivity lists
   (#1480).
 - PSL `next_a` is now supported with simple expressions.
-- Code coverage can now be collected for package declarations, opted
-  in via the new `+package` directive in a coverage specification
-  file (#1007).
-- Fixed a crash when collecting expression coverage for overloaded
-  subprograms in a package: each overloaded body now gets a distinct
-  coverage scope so the per-expression cover items no longer desync.
-- Expression coverage of a short-circuit logical operator no longer
-  leaves the bin where the left operand controls the result (`10` for
-  `or`/`nor`, `01` for `and`/`nand`) permanently uncovered (#1450).
-- Several other minor bugs were resolved (#1506, #1516, #1522, #1529).
+- Fixed several bugs related to concatenating arrays-of-arrays (#1534,
+  #1539)
+- Several other minor bugs were resolved (#1506, #1516, #1522, #1529,
+  #1541, #1544, #1543, #1528, #1503, #1475, #1535, #1517).
 
 ## Version 1.20.1 - 2026-04-22
 - Fix a crash while evaluating matching relational operator with

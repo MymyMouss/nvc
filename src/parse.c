@@ -20,7 +20,6 @@
 #include "common.h"
 #include "diag.h"
 #include "hash.h"
-#include "inst.h"
 #include "lib.h"
 #include "names.h"
 #include "object.h"
@@ -34,6 +33,7 @@
 #include "thread.h"
 #include "tree.h"
 #include "type.h"
+#include "vhdl/vhdl-phase.h"
 #include "vhdl/vhdl-util.h"
 
 #include <string.h>
@@ -75,10 +75,11 @@ typedef void (*add_func_t)(tree_t, tree_t);
    EXTEND(s);                                           \
    state.start_loc = (t) ? *tree_loc(t) : LOC_INVALID;  \
 
-#define BEGIN(s)  BEGIN_WITH_HEAD(s, NULL)
+#define BEGIN(s) BEGIN_WITH_HEAD(s, NULL)
 
 static tree_t p_expression(void);
 static tree_t p_expression_with_head(tree_t head);
+static tree_t p_conditional_expression(tree_t head);
 static tree_t p_sequential_statement(void);
 static tree_t p_concurrent_statement(void);
 static tree_t p_package_declaration(tree_t unit);
@@ -524,10 +525,11 @@ static tree_t bit_string_to_literal(const char *str, const loc_t *loc)
    }
 
    enum { UNSIGNED, SIGNED } mode = UNSIGNED;
+   bool has_mode = false;
 
    switch (*p) {
-   case 'U': case 'u': mode = UNSIGNED; ++p; break;
-   case 'S': case 's': mode = SIGNED; ++p; break;
+   case 'U': case 'u': mode = UNSIGNED; has_mode = true; ++p; break;
+   case 'S': case 's': mode = SIGNED; has_mode = true; ++p; break;
    }
 
    char base_ch = *p++;
@@ -536,7 +538,14 @@ static tree_t bit_string_to_literal(const char *str, const loc_t *loc)
    case 'X': case 'x': base = 16; break;
    case 'O': case 'o': base = 8;  break;
    case 'B': case 'b': base = 2;  break;
-   case 'D': case 'd': base = 10; break;
+   case 'D': case 'd':
+      if (has_mode) {
+         parse_error(loc, "invalid base '%c' for %s bit string", base_ch,
+                     mode == SIGNED ? "signed" : "unsigned");
+         return t;
+      }
+      base = 10;
+      break;
    default:
       parse_error(loc, "invalid base '%c' for bit string", base_ch);
       return t;
@@ -651,7 +660,11 @@ static tree_t bit_string_to_literal(const char *str, const loc_t *loc)
       }
    }
 
-   if (pad == NULL && nbits < length)
+   if (mode == SIGNED && length > 0 && nbits == length
+       && tree_ident(bits[0]) != tree_ident(pad))
+      parse_error(CURRENT_LOC, "excess significant digits in bit string "
+                  "literal");
+   else if (pad == NULL && nbits < length)
       parse_error(CURRENT_LOC, "signed bit string literal cannot be an "
                   "empty string");
    else if (length >= 0) {
@@ -1476,23 +1489,30 @@ static void declare_ieee_intrinsics(tree_t unit)
 {
    static const struct {
       const char *name;
-      subprogram_kind_t kind;
+      subprogram_kind_t scalar;
+      subprogram_kind_t vector;
    } ops[] = {
-      { "\"and\"",  S_IEEE_AND },
-      { "\"or\"",   S_IEEE_OR },
-      { "\"xor\"",  S_IEEE_XOR },
-      { "\"nand\"", S_IEEE_NAND },
-      { "\"nor\"",  S_IEEE_NOR },
-      { "\"xnor\"", S_IEEE_XNOR },
-      { "\"not\"",  S_IEEE_NOT },
+      { "\"and\"",  S_IEEE_AND,  S_IEEE_LOGICAL },
+      { "\"or\"",   S_IEEE_OR,   S_IEEE_LOGICAL },
+      { "\"xor\"",  S_IEEE_XOR,  S_IEEE_LOGICAL },
+      { "\"nand\"", S_IEEE_NAND, S_IEEE_LOGICAL },
+      { "\"nor\"",  S_IEEE_NOR,  S_IEEE_LOGICAL },
+      { "\"xnor\"", S_IEEE_XNOR, S_IEEE_LOGICAL },
+      { "\"not\"",  S_IEEE_NOT,  S_IEEE_MISC    },
    };
 
    for (int i = 0; i < ARRAY_LEN(ops); i++) {
-      tree_t sub = get_local_decl(nametab, unit, ident_new(ops[i].name), 0);
-      assert(sub != NULL);
-      assert(tree_kind(sub) == T_FUNC_DECL);
+      ident_t name = ident_new(ops[i].name);
 
-      tree_set_subkind(sub, ops[i].kind);
+      tree_t scalar = get_local_decl(nametab, unit, name, 0);
+      assert(scalar != NULL);
+      assert(tree_kind(scalar) == T_FUNC_DECL);
+      tree_set_subkind(scalar, ops[i].scalar);
+
+      tree_t vector = get_local_decl(nametab, unit, name, 1);
+      assert(vector != NULL);
+      assert(tree_kind(vector) == T_FUNC_DECL);
+      tree_set_subkind(vector, ops[i].vector);
    }
 }
 
@@ -1719,7 +1739,7 @@ static void instantiate_subprogram(tree_t new, tree_t decl, tree_t body)
    tree_t roots[] = { decl, body };
    ident_t prefixes[] = { tree_ident(decl) };
    ident_t dotted = ident_prefix(scope_prefix(nametab), tree_ident(new), '.');
-   new_instance(roots, body != NULL ? 2 :1, dotted, prefixes, 1);
+   vhdl_subprogram_instance(roots, body != NULL ? 2 :1, dotted, prefixes, 1);
 
    tree_t decl_copy = roots[0], body_copy = roots[1];
    tree_t src = body_copy ?: decl_copy;
@@ -1756,7 +1776,7 @@ static void instantiate_package(tree_t new, tree_t pack, tree_t body)
    tree_t roots[] = { pack, body };
    ident_t prefixes[] = { prefix };
    ident_t dotted = ident_prefix(scope_prefix(nametab), tree_ident(new), '.');
-   new_instance(roots, body != NULL ? 2 : 1, dotted, prefixes, 1);
+   vhdl_package_instance(roots, body != NULL ? 2 : 1, dotted, prefixes, 1);
 
    tree_t pack_copy = roots[0], body_copy = roots[1];
 
@@ -1765,9 +1785,6 @@ static void instantiate_package(tree_t new, tree_t pack, tree_t body)
    const int ndecls = tree_decls(pack_copy);
    for (int i = 0; i < ndecls; i++) {
       tree_t d = tree_decl(pack_copy, i);
-      if (tree_kind(d) == T_CONST_DECL && !tree_has_value(d))
-         continue;   // Skip deferred constants
-
       tree_add_decl(new, d);
    }
 
@@ -2051,8 +2068,8 @@ static type_t apply_index_attribute(tree_t aref)
 
       const int64_t ival = tree_ival(p);
       if (ival < 1 || ival > ndims) {
-         parse_error(tree_loc(p), "'INDEX parameter for type %s must be "
-                     "between 1 and %d", type_pp(type), ndims);
+         parse_error(tree_loc(p), "'INDEX parameter for type %pT must be "
+                     "between 1 and %d", type, ndims);
          return type_new(T_NONE);
       }
 
@@ -2141,15 +2158,20 @@ static type_t apply_type_attribute(tree_t aref)
 static void implicit_signal_attribute(tree_t aref)
 {
    if (find_enclosing(nametab, S_SUBPROGRAM) != NULL) {
-      parse_error(tree_loc(aref), "implicit signal %s cannot be used in a "
-                  "subprogram body", istr(tree_ident(aref)));
+      parse_error(tree_loc(aref), "implicit signal %pI cannot be used in a "
+                  "subprogram body", tree_ident(aref));
       return;
    }
 
-   tree_t b = find_enclosing(nametab, S_CONCURRENT_BLOCK);
-   if (b == NULL) {
-      parse_error(tree_loc(aref), "implicit signal %s cannot be used in "
-                  "this context", istr(tree_ident(aref)));
+   // Signal must be created under process scope if it captures local
+   // constants
+   tree_t container = find_enclosing(nametab, S_PROCESS);
+   if (container == NULL)
+      container = find_enclosing(nametab, S_CONCURRENT_BLOCK);
+
+   if (container == NULL) {
+      parse_error(tree_loc(aref), "implicit signal %pI cannot be used in "
+                  "this context", tree_ident(aref));
       return;
    }
 
@@ -2192,9 +2214,9 @@ static void implicit_signal_attribute(tree_t aref)
       fatal_trace("invalid implicit signal attribute");
    }
 
-   const int ndecls = tree_decls(b);
+   const int ndecls = tree_decls(container);
    for (int i = 0; i < ndecls; i++) {
-      tree_t d = tree_decl(b, i);
+      tree_t d = tree_decl(container, i);
       if (tree_kind(d) != T_IMPLICIT_SIGNAL)
          continue;
       else if (tree_ident(d) != id || tree_subkind(d) != kind)
@@ -2245,7 +2267,7 @@ static void implicit_signal_attribute(tree_t aref)
       tree_set_value(imp, w);
    }
 
-   tree_add_decl(b, imp);
+   tree_add_decl(container, imp);
    tree_set_value(aref, make_ref(imp));
 }
 
@@ -2599,8 +2621,8 @@ static void package_body_deferred_instantiation(tree_t pack, tree_t container)
       tree_t body = find_subprogram_body(ref);
       if (body == NULL) {
          diag_t *d = diag_new(DIAG_ERROR, CURRENT_LOC);
-         diag_printf(d, "subprogram %s cannot be instantiated until its "
-                     "body has been analysed", type_pp(tree_type(decl)));
+         diag_printf(d, "subprogram %pT cannot be instantiated until its "
+                     "body has been analysed", tree_type(decl));
          diag_hint(d, tree_loc(decl), "subprogram instantiation in package "
                    "declarative part");
          diag_hint(d, NULL, "the instantiated subprogram body occurs at "
@@ -2645,7 +2667,7 @@ static void package_body_deferred_instantiation(tree_t pack, tree_t container)
 
          hash_t *gmap = get_generic_map(nametab);
          if (gmap != NULL)
-            instance_fixup(inst, gmap);
+            vhdl_instance_fixup(inst, gmap);
 
          tree_add_decl(container, inst);
       }
@@ -3165,7 +3187,7 @@ static tree_t p_actual_designator(tree_t head)
    BEGIN_WITH_HEAD("actual designator", head);
 
    if (head != NULL)
-      return p_expression_with_head(head);
+      return p_conditional_expression(head);
 
    if (optional(tOPEN)) {
       tree_t t = tree_new(T_OPEN);
@@ -3186,7 +3208,7 @@ static tree_t p_actual_designator(tree_t head)
       return w;
    }
 
-   return p_expression();
+   return p_conditional_expression(NULL);
 }
 
 static tree_t p_actual_part(class_t class, type_t constraint, tree_t head,
@@ -3429,7 +3451,7 @@ static tree_t p_function_call(ident_t id, tree_t prefix)
 
       hash_t *map = get_generic_map(nametab);
       if (map != NULL)
-         instance_fixup(inst, map);
+         vhdl_instance_fixup(inst, map);
 
       tree_set_ref(call, inst);
 
@@ -3782,19 +3804,32 @@ static tree_t p_name(name_mask_t stop_mask)
 
    BEGIN("name");
 
-   ident_t id = NULL;
-   switch (peek()) {
+   name_mask_t mask;
+   tree_t prefix;
+   token_t first = peek();
+   switch (first) {
    case tSTRING:
-      id = p_operator_symbol();
-      break;
-
    case tID:
-      id = p_identifier();
+      {
+         ident_t id;
+         if (first == tSTRING)
+            id = p_operator_symbol();
+         else
+            id = p_identifier();
+
+         tree_t decl = NULL;
+         mask = query_name(nametab, id, &decl);
+
+         prefix = tree_new(T_REF);
+         tree_set_ident(prefix, id);
+         tree_set_loc(prefix, CURRENT_LOC);
+         tree_set_ref(prefix, decl);
+      }
       break;
-
    case tLTLT:
-      return p_external_name();
-
+      prefix = p_external_name();
+      mask = N_OBJECT;
+      break;
    default:
       {
          expect(tSTRING, tID);
@@ -3806,14 +3841,6 @@ static tree_t p_name(name_mask_t stop_mask)
          return dummy;
       }
    }
-
-   tree_t decl = NULL;
-   name_mask_t mask = query_name(nametab, id, &decl);
-
-   tree_t prefix = tree_new(T_REF);
-   tree_set_ident(prefix, id);
-   tree_set_loc(prefix, CURRENT_LOC);
-   tree_set_ref(prefix, decl);
 
    for (;;) {
       switch (peek()) {
@@ -3927,8 +3954,10 @@ static type_t p_type_mark(tree_t head)
          // latter if current prefix cannot be interpreted as a type mark
          prefix = solve_types(nametab, prefix, NULL);
 
-         type_t type = tree_type(prefix);
-         if (type_is_none(type))
+         type_t type = get_type_or_null(prefix);
+         if (type == NULL)
+            break;
+         else if (type_is_none(type))
             return type;
 
          if (tree_kind(prefix) == T_REF && tree_has_ref(prefix)) {
@@ -4023,8 +4052,12 @@ static type_t p_element_constraint(type_t base)
    else
       type_set_base(sub, base);
 
-   if (type_is_record(base))
-      type_set_constraint(sub, p_record_constraint(sub));
+   if (type_is_record(base)) {
+      type_set_constraint(sub, p_record_constraint(base));
+
+      if (type_is_unconstrained(sub) && is_anonymous_subtype(base))
+         sub = merge_constraints(sub, base);
+   }
    else
       p_array_constraint(sub, base);
 
@@ -4045,7 +4078,7 @@ static void p_array_constraint(type_t type, type_t base)
 
       if (!type_is_array(type) && !type_is_none(type))
          parse_error(CURRENT_LOC, "open array constraint cannot be used "
-                     "with non-array type %s", type_pp(type));
+                     "with non-array type %pT", type);
    }
    else {
       tree_t c = p_index_constraint(base);
@@ -4991,6 +5024,15 @@ static tree_t p_expression_with_head(tree_t head)
 
    BEGIN("expression");
 
+   if (head == NULL && optional(tCCONV)) {
+      require_std(STD_08, "condition conversion");
+
+      tree_t expr = tree_new(T_FCALL);
+      tree_set_ident(expr, well_known(W_OP_CCONV));
+      unary_op(expr, p_primary);
+      return expr;
+   }
+
    tree_t expr = p_relation(head);
 
    for (;;) {
@@ -5024,18 +5066,7 @@ static tree_t p_expression_with_head(tree_t head)
 
 static inline tree_t p_expression(void)
 {
-   // expression | 2008: condition_operator primary
-
-   if (optional(tCCONV)) {
-      require_std(STD_08, "condition conversion");
-
-      tree_t expr = tree_new(T_FCALL);
-      tree_set_ident(expr, well_known(W_OP_CCONV));
-      unary_op(expr, p_primary);
-      return expr;
-   }
-   else
-      return p_expression_with_head(NULL);
+   return p_expression_with_head(NULL);
 }
 
 static type_t p_interface_type_indication(tree_t parent)
@@ -6897,13 +6928,13 @@ static tree_t p_subtype_declaration(void)
    return t;
 }
 
-static tree_t p_conditional_expression(void)
+static tree_t p_conditional_expression(tree_t head)
 {
    // expression { when condition else expression }
 
    BEGIN("conditional expression");
 
-   tree_t expr0 = p_expression();
+   tree_t expr0 = p_expression_with_head(head);
 
    if (optional(tWHEN)) {
       require_std(STD_19, "conditional expressions");
@@ -7012,7 +7043,7 @@ static void p_constant_declaration(tree_t parent)
 
    tree_t init = NULL;
    if (optional(tWALRUS))
-      init = p_conditional_expression();
+      init = p_conditional_expression(NULL);
 
    // According to the LRM all constants are globally static but that
    // leads to a number of logical inconsistencies so we retrict to only
@@ -7323,7 +7354,7 @@ static tree_t p_subprogram_instantiation_declaration(void)
 
    hash_t *map = get_generic_map(nametab);
    if (map != NULL)
-      instance_fixup(inst, map);
+      vhdl_instance_fixup(inst, map);
 
    mangle_func(nametab, inst);
    insert_name(nametab, inst, NULL);
@@ -7352,7 +7383,7 @@ static void p_variable_declaration(tree_t parent)
 
    tree_t init = NULL;
    if (optional(tWALRUS))
-      init = solve_types(nametab, p_conditional_expression(), type);
+      init = solve_types(nametab, p_conditional_expression(NULL), type);
 
    consume(tSEMI);
 
@@ -7411,7 +7442,7 @@ static void p_signal_declaration(tree_t parent)
 
    tree_t init = NULL;
    if (optional(tWALRUS))
-      init = p_conditional_expression();
+      init = p_conditional_expression(NULL);
 
    consume(tSEMI);
 
@@ -8000,7 +8031,7 @@ static tree_t p_package_instantiation_declaration(tree_t unit)
 
    hash_t *map = get_generic_map(nametab);
    if (map != NULL)
-      instance_fixup(new, map);
+      vhdl_instance_fixup(new, map);
 
    return new;
 }
@@ -9328,7 +9359,7 @@ static tree_t p_block_configuration(tree_t of)
       case T_ARCH:
          {
             ident_t expect = ident_rfrom(tree_ident(of), '-');
-            if (tree_ident(b) != expect)
+            if (!ident_casecmp(tree_ident(b), expect))
                parse_error(CURRENT_LOC, "block specification label %s does not "
                            "match architecture name %s", istr(tree_ident(b)),
                            istr(expect));
@@ -10429,7 +10460,7 @@ static tree_t p_procedure_call_statement(ident_t label, tree_t name)
 
       hash_t *map = get_generic_map(nametab);
       if (map != NULL)
-         instance_fixup(inst, map);
+         vhdl_instance_fixup(inst, map);
 
       tree_set_ref(call, inst);
 
@@ -11102,20 +11133,25 @@ static void p_block_header(tree_t block)
          p_generic_map_aspect(block, block);
          consume(tSEMI);
       }
-
-      insert_generics(nametab, block);
    }
 
    if (peek() == tPORT) {
+      // Generics must not be visible in port map aspect
+      push_scope(nametab);
+      insert_generics(nametab, block);
+
       p_port_clause(block);
+
+      pop_scope(nametab);
 
       if (peek() == tPORT) {
          p_port_map_aspect(block, block);
          consume(tSEMI);
       }
-
-      insert_ports(nametab, block);
    }
+
+   insert_ports(nametab, block);
+   insert_generics(nametab, block);
 }
 
 static tree_t p_block_statement(ident_t label)
@@ -11166,7 +11202,7 @@ static tree_t p_block_statement(ident_t label)
 
    hash_t *map = get_generic_map(nametab);
    if (map != NULL)
-      instance_fixup(b, map);
+      vhdl_instance_fixup(b, map);
 
    pop_scope(nametab);
    return b;
@@ -11179,9 +11215,19 @@ static void p_generate_statement_body(tree_t container, ident_t alt_label)
 
    BEGIN("generate statement body");
 
-   if (scan(tSIGNAL, tTYPE, tSUBTYPE, tFILE, tCONSTANT, tFUNCTION, tIMPURE,
-            tPURE, tALIAS, tATTRIBUTE, tBEGIN, tPROCEDURE, tFOR, tCOMPONENT,
-            tUSE, tSHARED)) {
+   bool has_decls = false;
+   if (peek() == tSTARTPSL) {
+      const token_t after_psl = peek_nth(2);
+      has_decls = after_psl == tDEFAULT || after_psl == tSEQUENCE
+         || after_psl == tPROPERTY || after_psl == tENDPOINT;
+   }
+   else
+      has_decls = scan(tSIGNAL, tTYPE, tSUBTYPE, tFILE, tCONSTANT, tFUNCTION,
+                       tIMPURE, tPURE, tALIAS, tATTRIBUTE, tBEGIN, tPROCEDURE,
+                       tFOR, tCOMPONENT, tUSE, tSHARED, tDEFAULT, tSEQUENCE,
+                       tPROPERTY, tENDPOINT);
+
+   if (has_decls) {
       while (not_at_token(tBEGIN))
          p_block_declarative_item(container);
       consume(tBEGIN);
@@ -11263,12 +11309,13 @@ static tree_t p_if_generate_statement(ident_t label)
       consume(tCOLON);
    }
 
-   push_scope(nametab);
-   scope_set_container(nametab, g);
-   scope_set_prefix(nametab, alt_label ?: label);
-
    tree_t c0 = tree_new(T_COND_STMT);
    tree_set_ident(c0, alt_label ?: label);
+
+   push_scope(nametab);
+   scope_set_container(nametab, c0);
+   scope_set_prefix(nametab, alt_label ?: label);
+
    tree_set_value(c0, p_condition());
 
    tree_add_cond(g, c0);
@@ -11290,11 +11337,13 @@ static tree_t p_if_generate_statement(ident_t label)
          consume(tCOLON);
       }
 
-      push_scope(nametab);
-      scope_set_prefix(nametab, alt_label ?: label);
-
       tree_t c = tree_new(T_COND_STMT);
       tree_set_ident(c, alt_label ?: label);
+
+      push_scope(nametab);
+      scope_set_container(nametab, c);
+      scope_set_prefix(nametab, alt_label ?: label);
+
       tree_set_value(c, p_condition());
 
       consume(tGENERATE);
@@ -11316,11 +11365,12 @@ static tree_t p_if_generate_statement(ident_t label)
          consume(tCOLON);
       }
 
-      push_scope(nametab);
-      scope_set_prefix(nametab, alt_label ?: label);
-
       tree_t c = tree_new(T_COND_STMT);
       tree_set_ident(c, alt_label ?: label);
+
+      push_scope(nametab);
+      scope_set_container(nametab, c);
+      scope_set_prefix(nametab, alt_label ?: label);
 
       consume(tGENERATE);
 
