@@ -723,6 +723,10 @@ def check_confirm(before, after, nvc, lib, fstdump, timeout, jobs=2):
         r = json.load(open(cr))
         res["confirm"] = r["result"]
         res["wall_s"] = r["wall_s"]
+        if r["result"] == "incomplete":
+            res["why"] = next((x["detail"] for x in r["segment_results"]
+                               if x["state"] not in ("same", "different")),
+                              "") or "budget or not run"
         if r["result"] == "confirmed" and first is not None:
             res["ok"] = False
             res["detail"] = "confirmed but the reference differs at checkpoint %d" \
@@ -753,6 +757,10 @@ def confirm_summary(results):
     print("\nconfirmation by segments against the reference:")
     for (c, t), n in sorted(table.items(), key=str):
         print("  %-11s reference %-8s %d" % (c, t, n))
+    why = collections.Counter(re.sub(r"/\S+: |:\S+ |[0-9]+", "", r["why"])[:150]
+                              for r in results if r.get("why"))
+    for w, n in why.most_common():
+        print("  incomplete because: %3d  %s" % (n, w))
     bad = [r for r in results if not r["ok"]]
     # A difference found earlier than the reference has it is the known
     # limit of comparing bytes (design note 12.2): conservative, not wrong
