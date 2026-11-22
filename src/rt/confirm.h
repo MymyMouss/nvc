@@ -20,6 +20,17 @@
 
 #include "prim.h"
 
+// What a confirmation proved, for a caller that wants to restore from it
+typedef struct {
+   unsigned  confirmed;      // Segments 1 to this agree: 0 if none
+   unsigned  total;
+   uint64_t  up_to_fs;       // Time of the last checkpoint of that prefix
+   char     *path;           // ... and the file, or NULL
+   unsigned  first_diff;     // The first segment that differs (1 based), or 0
+   bool      budget_out;     // The budget or the segment limit stopped it
+   bool      interrupted;
+} confirm_prefix_t;
+
 typedef struct {
    const char  *dir;           // Checkpoints written by --checkpoint=DIR@every=
    const char  *top;
@@ -28,6 +39,8 @@ typedef struct {
    double       budget_s;      // Wall time allowed, or 0
    unsigned     max_segments;  // Segments to start, or 0
    const char  *result_file;   // JSON result, or NULL for standard output
+   bool         quiet;         // No JSON on standard output without a file
+   confirm_prefix_t *prefix;   // Filled in if not NULL
 } confirm_opts_t;
 
 // Run the design as it is now from time zero and from each checkpoint in

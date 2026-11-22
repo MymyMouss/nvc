@@ -1063,6 +1063,23 @@ tourne et se réveille avec `woke_because: confirmation_finished`. Seul
 `confirmed` signifie que le correctif reproduit le run d'origine; `incomplete`
 (segments non vérifiables ou budget épuisé) ne compte jamais comme confirmé.
 
+### 8.15 Reprise exacte depuis le dernier checkpoint confirmé
+
+Une reprise directe dans du code modifié qui a déjà tourné est une
+hypothèse (numéro de `wait`, refus des boucles à `wait`). La reprise exacte
+est de partir du dernier fichier dont les segments, et tous ceux d'avant, sont
+« same »: c'est l'état propre du design corrigé (`CHECKPOINT-DESIGN.md`
+section 15). `nvc_sim_open` accepte `restore_confirmed` (répertoire), avec
+`confirm_jobs` et `confirm_budget_s`: le worker lance
+`--restore-confirmed=DIR` (la confirmation tourne dans le worker, avant le
+chargement du design, donc l'appel attend: relever `timeout_ms`, ou confirmer
+d'abord en arrière-plan avec `confirm_dir`, qui peut maintenant se passer de
+`restore_from`). Le statut d'une confirmation terminée donne
+`last_confirmed` (temps et fichier) et la façon d'ouvrir. Le verdict est
+`exact` avec `basis: confirmed_by_segments`; la reprise par numéro de `wait`
+reste approximate. Aucun fichier n'est restauré si aucun segment n'est
+confirmé: l'ouverture échoue.
+
 ## Références
 
 - Spécification MCP 2026-07-28, changements:

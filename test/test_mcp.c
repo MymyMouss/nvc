@@ -3324,11 +3324,12 @@ START_TEST(test_sim_confirm)
                                      "\"checkpoint_every\":\"100 ns\"}"));
    ck_assert_ptr_nonnull(strstr(err, "already holds"));
 
-   // Confirming needs a restore into a changed design
+   // A restore for it needs to be into a changed design
    err = tool_error(tool(f.mp, f.srv, &f.sink, "nvc_sim_open",
                          "{\"top\":\"conf\",\"std\":\"2008\","
+                         "\"restore_from\":\"run1/ck-00000000000200000000.ckpt\","
                          "\"confirm_dir\":\"run1\"}"));
-   ck_assert_ptr_nonnull(strstr(err, "restore_from and allow_changes"));
+   ck_assert_ptr_nonnull(strstr(err, "needs allow_changes"));
 
    // A fix that does not change the behaviour is confirmed
    sc = confirm_with(&f, id, 1);
@@ -3488,6 +3489,141 @@ START_TEST(test_sim_confirm_waves)
       unlink(ps);
       free(ps);
    }
+
+   free(v1);
+   fixture_close(&f);
+}
+END_TEST
+
+static const char loopw_src[] =
+   "entity loopw is end entity;\n"
+   "architecture a of loopw is\n"
+   "  signal clk : bit := '0';\n"
+   "  signal d : integer := 0;\n"
+   "begin\n"
+   "  clk <= not clk after 5 ns;\n"
+   "  stim: process begin\n"
+   "    wait for 20 ns;\n"
+   "    for i in 1 to 8 loop\n"
+   "      d <= d + i + i / %s;\n"
+   "      wait for 25 ns;\n"
+   "    end loop;\n"
+   "    wait;\n"
+   "  end process;\n"
+   "end architecture;\n";
+
+static void rebuild_loopw(fixture_t *f, const char *div)
+{
+   char *text = xasprintf(loopw_src, div);
+   write_file(f->root, "loopw.vhd", text, 0644);
+   free(text);
+   const json_t *sc = structured(tool(f->mp, f->srv, &f->sink, "nvc_analyse",
+                                      "{\"files\":[\"counter.vhd\","
+                                      "\"loopw.vhd\"],\"std\":\"2008\"}"));
+   ck_assert(bool_field(sc, "ok"));
+   sc = structured(tool(f->mp, f->srv, &f->sink, "nvc_elaborate",
+                        "{\"top\":\"loopw\",\"std\":\"2008\"}"));
+   ck_assert(bool_field(sc, "ok"));
+}
+
+static int64_t signal_d(fixture_t *f, const char *id)
+{
+   const json_t *sc = structured(sim_tool(f, "nvc_signal_get", id,
+                                          "\"paths\":[\"/d\"]"));
+   return atoll(str_field(json_at(json_get(sc, "values"), 0), "value"));
+}
+
+START_TEST(test_sim_restore_confirmed)
+{
+   fixture_t f;
+   char *v1 = xasprintf(loopw_src, "100");
+   const char *names[] = { "loopw.vhd" }, *sources[] = { v1 };
+   const char *tops[] = { "loopw" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   char id[40];
+   const json_t *sc = structured(tool(
+      f.mp, f.srv, &f.sink, "nvc_sim_open",
+      "{\"top\":\"loopw\",\"std\":\"2008\",\"checkpoint_dir\":\"orig\","
+      "\"checkpoint_every\":\"20 ns\"}"));
+   snprintf(id, sizeof(id), "%s", str_field(sc, "sim_id"));
+   sim_tool(&f, "nvc_sim_run", id, "\"until\":\"300 ns\","
+            "\"pause_on\":\"never\"");
+   sim_tool(&f, "nvc_sim_close", id, "");
+
+   // A fix in the last iteration of a loop that contains a wait
+   rebuild_loopw(&f, "8");
+
+   // What the fixed design does from time 0
+   sc = structured(tool(f.mp, f.srv, &f.sink, "nvc_sim_open",
+                        "{\"top\":\"loopw\",\"std\":\"2008\"}"));
+   snprintf(id, sizeof(id), "%s", str_field(sc, "sim_id"));
+   sim_tool(&f, "nvc_sim_run", id, "\"until\":\"300 ns\","
+            "\"pause_on\":\"never\"");
+   const int64_t want = signal_d(&f, id);
+   sim_tool(&f, "nvc_sim_close", id, "");
+
+   // Not allowed together with restore_from
+   const char *err = tool_error(tool(
+      f.mp, f.srv, &f.sink, "nvc_sim_open",
+      "{\"top\":\"loopw\",\"std\":\"2008\",\"restore_confirmed\":\"orig\","
+      "\"restore_from\":\"orig/ck-00000000000100000000.ckpt\"}"));
+   ck_assert_ptr_nonnull(strstr(err, "cannot be used with"));
+
+   // The confirmation in the background first: its status names the file
+   sc = structured(tool(
+      f.mp, f.srv, &f.sink, "nvc_sim_open",
+      "{\"top\":\"loopw\",\"std\":\"2008\",\"confirm_dir\":\"orig\"}"));
+   snprintf(id, sizeof(id), "%s", str_field(sc, "sim_id"));
+   const json_t *conf = NULL;
+   for (int i = 0; i < 30; i++) {
+      sc = structured(sim_tool(&f, "nvc_sim_wait", id, "\"timeout_ms\":2000"));
+      conf = json_get(sc, "confirmation");
+      ck_assert_ptr_nonnull(conf);
+      if (strcmp(str_field(conf, "state"), "running"))
+         break;
+   }
+   ck_assert_str_eq(str_field(conf, "state"), "different");
+   const json_t *last = json_get(conf, "last_confirmed");
+   ck_assert_ptr_nonnull(last);
+   ck_assert_ptr_nonnull(strstr(str_field(conf, "hint"), "restore_confirmed"));
+   const int64_t last_fs = int_field(last, "time_fs");
+   ck_assert_int_gt(last_fs, 0);
+   ck_assert_int_lt(last_fs, 300000000);
+   sim_tool(&f, "nvc_sim_close", id, "");
+
+   // Opening from the confirmed prefix is exact and reuses what was settled
+   sc = structured(tool(
+      f.mp, f.srv, &f.sink, "nvc_sim_open",
+      "{\"top\":\"loopw\",\"std\":\"2008\",\"restore_confirmed\":\"orig\","
+      "\"confirm_jobs\":2,\"confirm_budget_s\":600,"
+      "\"timeout_ms\":120000}"));
+   snprintf(id, sizeof(id), "%s", str_field(sc, "sim_id"));
+   const json_t *verdict = json_get(sc, "restore_verdict");
+   ck_assert_ptr_nonnull(verdict);
+   ck_assert_str_eq(str_field(verdict, "verdict"), "exact");
+   ck_assert_str_eq(str_field(verdict, "basis"), "confirmed_by_segments");
+   ck_assert(bool_field(verdict, "state_verified"));
+   ck_assert_int_eq(int_field(sc, "now_fs"), last_fs);
+   sim_tool(&f, "nvc_sim_run", id, "\"until\":\"300 ns\","
+            "\"pause_on\":\"never\"");
+   ck_assert_int_eq(signal_d(&f, id), want);
+   sim_tool(&f, "nvc_sim_close", id, "");
+
+   // A change in the very first iteration: nothing is confirmed, and the
+   // simulation is not opened
+   rebuild_loopw(&f, "1");
+   err = tool_error(tool(
+      f.mp, f.srv, &f.sink, "nvc_sim_open",
+      "{\"top\":\"loopw\",\"std\":\"2008\",\"restore_confirmed\":\"orig\","
+      "\"timeout_ms\":120000}"));
+   ck_assert_ptr_nonnull(strstr(err, "is confirmed"));
+
+   // A directory without files
+   err = tool_error(tool(
+      f.mp, f.srv, &f.sink, "nvc_sim_open",
+      "{\"top\":\"loopw\",\"std\":\"2008\",\"restore_confirmed\":\"nodir\"}"));
+   ck_assert_ptr_nonnull(strstr(err, "holds no checkpoint files"));
 
    free(v1);
    fixture_close(&f);
@@ -3918,6 +4054,7 @@ Suite *get_mcp_tests(void)
    tcase_add_test(tc, test_sim_restore_changed);
    tcase_add_test(tc, test_sim_confirm);
    tcase_add_test(tc, test_sim_confirm_waves);
+   tcase_add_test(tc, test_sim_restore_confirmed);
    tcase_add_test(tc, test_sim_restore_files);
    tcase_add_test(tc, test_sim_restore_errors);
    tcase_add_test(tc, test_sim_restore_failed);

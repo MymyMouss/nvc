@@ -19,6 +19,7 @@
 #define _MCP_H
 
 #include "prim.h"
+#include "rt/confirm.h"
 
 // Run the MCP server on standard input and output until the client
 // closes its end.  The root directory bounds every file the tools may
@@ -38,6 +39,6 @@ void mcp_format_time(int64_t fs, char *buf, size_t len);
 int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
                     const char *files_dir, const char *restore_file,
                     bool allow_changes, const char *every_dir,
-                    uint64_t every_fs);
+                    uint64_t every_fs, const confirm_prefix_t *conf);
 
 #endif   // _MCP_H

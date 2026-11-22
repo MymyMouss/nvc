@@ -903,7 +903,19 @@ static const char open_input[] = MCP_JSON({
          "type": "string",
          "minLength": 1,
          "maxLength": 64,
-         "description": "With restore_from and allow_changes: start confirming in the background that the fixed design really produces the states of the original run. The directory (below .nvc-mcp/) holds the files written by a run with checkpoint_dir. The fixed design is run from each file to the next in parallel and the states compared. nvc_sim_status shows the progress and the result under confirmation; nvc_sim_wait wakes when it ends. Result confirmed means a rerun of the fixed design from time zero would have reached the same state at every file (so the restored simulation continues exactly as that rerun would, whatever restore_verdict said); different names the first segment, time interval and object that differ; incomplete says which segments could not be checked and why, and never counts as confirmed. The file restored should be one of the files of the directory: the result says if it is not."
+         "description": "Start confirming in the background, alone (the simulation starts at time 0) or with restore_from and allow_changes, that the fixed design really produces the states of the original run. The directory (below .nvc-mcp/) holds the files written by a run with checkpoint_dir. The fixed design is run from each file to the next in parallel and the states compared. nvc_sim_status shows the progress and the result under confirmation; nvc_sim_wait wakes when it ends. Result confirmed means a rerun of the fixed design from time zero would have reached the same state at every file (so the restored simulation continues exactly as that rerun would, whatever restore_verdict said); different names the first segment, time interval and object that differ; incomplete says which segments could not be checked and why, and never counts as confirmed. The file restored should be one of the files of the directory: the result says if it is not. When it ends the status names the last file that is confirmed and how to resume from it exactly (restore_confirmed)."
+      },
+      "restore_confirmed": {
+         "type": "string",
+         "minLength": 1,
+         "maxLength": 64,
+         "description": "The exact way to resume after a fix in code that has already run. The directory (below .nvc-mcp/) holds the files of a run opened with checkpoint_dir. The fixed design is confirmed against them as for confirm_dir (settled segments from an earlier confirmation are reused only if the design, program, inputs and files are exactly the same), then the simulation starts from the last file whose segments, and all before them, agree: that file is proved to be the state of the fixed design itself, so the simulation continues exactly as the fixed design run from time 0 would, whatever the change (loops containing waits, waits added or moved). restore_verdict has verdict exact and basis confirmed_by_segments, with the time and the number of segments confirmed. It is refused, and nothing is opened, if no file is confirmed. The confirmation runs while the call waits: raise timeout_ms, or confirm in the background first with confirm_dir and open when nvc_sim_status shows confirmation done, which then takes no time. Not with restore_from."
+      },
+      "confirm_budget_s": {
+         "type": "integer",
+         "minimum": 1,
+         "maximum": 86400,
+         "description": "With restore_confirmed: real seconds after which no new segment is started; the simulation then starts from the last file that is confirmed so far, which is still exact."
       },
       "confirm_jobs": {
          "type": "integer",
@@ -1201,7 +1213,7 @@ static char *confirm_members(sim_t *s)
                 state, s->confirm_dir, s->confirm_jobs, done, total,
                 elapsed_ms, s->confirm_restore_fs);
 
-      if (s->confirm_restore_fs < 0)
+      if (s->confirm_restore_fs == -1)
          tb_cat(tb, ",\"note\":\"The restored file is not one of the "
                 "checkpoints in the directory, so the confirmation says "
                 "nothing about the state this simulation started from\"");
@@ -1216,9 +1228,25 @@ static char *confirm_members(sim_t *s)
          json_as_int(json_get(j, "confirmed_up_to_fs"), &upto);
          pool_free(mp);
 
-         tb_printf(tb, ",\"restore_point_confirmed\":%s",
-                   s->confirm_restore_fs >= 0 && upto >= s->confirm_restore_fs
-                   ? "true" : "false");
+         if (s->confirm_restore_fs != -2)
+            tb_printf(tb, ",\"restore_point_confirmed\":%s",
+                      s->confirm_restore_fs >= 0
+                      && upto >= s->confirm_restore_fs ? "true" : "false");
+         if (upto > 0) {
+            const char *dir = s->confirm_dir;
+            if (!strncmp(dir, ".nvc-mcp/", 9))
+               dir += 9;
+            tb_printf(tb, ",\"last_confirmed\":{\"time_fs\":%"PRIi64
+                      ",\"file\":\"%s/ck-%020"PRIi64".ckpt\"},"
+                      "\"hint\":\"The fixed design reaches the state of "
+                      "that file when run from time 0: open it exactly with "
+                      "nvc_sim_open and restore_confirmed \\\"%s\\\" "
+                      "(same top, std and library); the confirmation is "
+                      "checked again, which takes no time while nothing "
+                      "has changed. A restore_from of this file is only "
+                      "exact if the change is in code not yet run.\"",
+                      upto, dir, upto, dir);
+         }
          tb_cat(tb, ",\"result\":");
          tb_cat(tb, s->confirm_json);
       }
@@ -1313,6 +1341,11 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
    int64_t confirm_jobs = 2;
    json_as_int(json_get(args, "confirm_jobs"), &confirm_jobs);
 
+   const char *rc_arg = json_string(json_get(args, "restore_confirmed"));
+   int64_t confirm_budget = 0;
+   json_as_int(json_get(args, "confirm_budget_s"), &confirm_budget);
+   char *rc_rel = NULL, *rc_abs = NULL;
+
    char *ckpt_rel = NULL, *ckpt_abs = NULL, *confirm_rel = NULL,
       *confirm_abs = NULL;
    int64_t every_fs = 0;
@@ -1320,8 +1353,11 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
       const char *bad = NULL;
       if ((ckpt_dir_arg == NULL) != (every_arg == NULL))
          bad = "checkpoint_dir and checkpoint_every go together";
-      else if (confirm_arg != NULL && (restore_path == NULL || !allow_changes))
-         bad = "confirm_dir needs restore_from and allow_changes: it "
+      else if (rc_arg != NULL && (restore_path != NULL || confirm_arg != NULL))
+         bad = "restore_confirmed cannot be used with restore_from or "
+            "confirm_dir";
+      else if (confirm_arg != NULL && restore_path != NULL && !allow_changes)
+         bad = "confirm_dir with restore_from needs allow_changes: it "
             "confirms a fix against the files of an earlier run";
       else if (ckpt_dir_arg != NULL && confirm_arg != NULL
                && !strcmp(ckpt_dir_arg, confirm_arg))
@@ -1353,6 +1389,19 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
       track_code = true;
    }
 
+   if (rc_arg != NULL) {
+      if ((rc_abs = ckpt_dir_path(call, rc_arg, &rc_rel)) == NULL)
+         goto bad_args;
+
+      int64_t latest;
+      if (ckpt_files_in(rc_abs, &latest) == 0) {
+         mcp_call_error(call, "The directory %s holds no checkpoint files: "
+                        "write them with checkpoint_dir and checkpoint_every "
+                        "in the run to confirm against", rc_rel);
+         goto bad_args;
+      }
+   }
+
    if (confirm_arg != NULL) {
       if ((confirm_abs = ckpt_dir_path(call, confirm_arg, &confirm_rel))
           == NULL)
@@ -1375,6 +1424,8 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
    free(ckpt_abs);
    free(confirm_rel);
    free(confirm_abs);
+   free(rc_rel);
+   free(rc_abs);
    return false;
 
  args_ok:
@@ -1416,11 +1467,16 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
    int ngargs;
    const char *const *gargs = mcp_call_global_argv(call, &ngargs);
 
-   const char **argv = xcalloc_array(ngargs + 14, sizeof(char *));
+   const char **argv = xcalloc_array(ngargs + 18, sizeof(char *));
    size_t argc = 0;
 
    char *restore_opt = restore_path ? xasprintf("--restore-from=%s",
                                                 restore_path) : NULL;
+   char *rc_opt = rc_rel ? xasprintf("--restore-confirmed=%s", rc_rel) : NULL;
+   char *rc_jobs_opt = rc_rel ? xasprintf("--confirm-jobs=%"PRIi64,
+                                          confirm_jobs) : NULL;
+   char *rc_budget_opt = rc_rel && confirm_budget > 0
+      ? xasprintf("--confirm-budget=%"PRIi64, confirm_budget) : NULL;
    char *ckpt_dir_opt = ckpt_rel ? xasprintf("--checkpoint-dir=%s", ckpt_rel)
       : NULL;
    char *ckpt_every_opt = ckpt_rel ? xasprintf("--checkpoint-every=%"PRIi64,
@@ -1480,6 +1536,12 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
       argv[argc++] = ckpt_dir_opt;
       argv[argc++] = ckpt_every_opt;
    }
+   if (rc_opt != NULL) {
+      argv[argc++] = rc_opt;
+      argv[argc++] = rc_jobs_opt;
+      if (rc_budget_opt != NULL)
+         argv[argc++] = rc_budget_opt;
+   }
    argv[argc++] = top;
    argv[argc] = NULL;
 
@@ -1523,6 +1585,11 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
    s->confirm_restore_fs = -1;
    free(ckpt_dir_opt);
    free(ckpt_every_opt);
+   free(rc_opt);
+   free(rc_jobs_opt);
+   free(rc_budget_opt);
+   free(rc_rel);
+   free(rc_abs);
 
    // Wait for the worker to report that the design is loaded.  Until
    // then anything it prints on its standard streams is kept so a
@@ -1634,7 +1701,8 @@ static bool tool_sim_open(mcp_call_t *call, const json_t *args,
                                     mcp_call_root(call), s->files_dir);
       s->confirm_log = xasprintf("%s/%s/confirm.log", mcp_call_root(call),
                                  s->files_dir);
-      s->confirm_restore_fs = find_restored_in(confirm_abs, restore_abs);
+      s->confirm_restore_fs = restore_abs != NULL
+         ? find_restored_in(confirm_abs, restore_abs) : -2;
       confirm_spawn(call, s, mcp_call_root(call), library, std,
                     confirm_jobs, confirm_abs);
       free(confirm_abs);
@@ -3401,7 +3469,13 @@ static const mcp_tool_t sim_tools[] = {
          "confirmed, different (with the first segment, time interval and "
          "object that differ) or incomplete (which segments were not "
          "checked and why).  Only confirmed means the fix reproduces the "
-         "original run.",
+         "original run.  To resume after a fix: in code the run had not "
+         "reached yet restore_from is exact; otherwise open with "
+         "restore_confirmed, which starts from the last file proved to be "
+         "the fixed design's own state and is exact for any change.  The "
+         "status of a finished confirmation names that file and says how to "
+         "open it.  Resuming at the same wait number (restore_from with "
+         "allow_changes) is only a quick look.",
       .input_schema  = open_input,
       .output_schema = open_output,
       .example       = open_example,

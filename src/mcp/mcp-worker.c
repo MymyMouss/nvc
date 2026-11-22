@@ -2799,7 +2799,7 @@ static void op_checkpoint_file(worker_t *w, const json_t *req)
 int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
                     const char *files_dir, const char *restore_file,
                     bool allow_changes, const char *every_dir,
-                    uint64_t every_fs)
+                    uint64_t every_fs, const confirm_prefix_t *conf)
 {
    worker_t w = {
       .model       = m,
@@ -2830,10 +2830,22 @@ int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
 
    if (restore_file != NULL) {
       ckpt_report_t rep = {};
-      char *err = checkpoint_restore(m, jit, restore_file, allow_changes,
-                                     &rep);
+      char *err = conf != NULL
+         ? checkpoint_restore_confirmed(m, jit, restore_file, &rep)
+         : checkpoint_restore(m, jit, restore_file, allow_changes, &rep);
       if (err != NULL)
          fatal("cannot restore checkpoint: %s", err);
+
+      if (conf != NULL) {
+         if (!rep.verified)
+            fatal("cannot restore checkpoint: the restored state could not "
+                  "be verified");
+         rep.by_confirmation = true;
+         rep.conf_segments = conf->confirmed;
+         rep.conf_total = conf->total;
+         rep.conf_first_diff = conf->first_diff;
+         rep.conf_up_to_fs = conf->up_to_fs;
+      }
 
       if (allow_changes)
          w.verdict = checkpoint_report_json(&rep);

@@ -790,3 +790,97 @@ would run the new code from a wrong place:
 If the confirmation of the checkpoints up to the restore time comes back
 confirmed, the MCP status says the restore point is confirmed (the changed
 design reaches that very state from zero).
+
+## 15. Restoring from the last confirmed checkpoint
+
+Any direct restore into code that has changed and had run is a guess (resume
+by wait number, refusal for loops with a wait).  The exact way to resume
+after such a fix is to start from a checkpoint that is proved to be the state
+of the changed design itself, which a confirmation by segments (section 12)
+establishes for a prefix of the checkpoints.
+
+### 15.1 Argument
+
+If segments `1 ... k` are all `same`, then by section 12.1 `Ck` is
+byte for byte the state that the changed design `F` has when run from time
+zero at `Tk`.  Restoring it with the own-state mode (12.1a) gives a model
+that serialises to `Ck` (`state_verified`), and a run is a function of the
+state, so what follows is what `F` does from zero after `Tk`, for any change
+whatever, including loops that contain waits and waits that were added,
+removed or reordered.  Nothing about `F`'s code is guessed: the state numbers
+in `Ck` are `F`'s own.
+
+### 15.2 Interface
+
+* `nvc -r --restore-confirmed=DIR [--jobs=N] [--confirm-budget=S]
+  [--confirm-max=N] [--confirmed-or-zero] top`.  It runs, or resumes, the
+  confirmation of `DIR` and restores the checkpoint of the last segment `k`
+  such that `1 ... k` agree, then simulates on.  If no segment agrees it
+  stops with a message and starts nothing: the safe default; the run from
+  zero is a plain `-r`, and `--confirmed-or-zero` asks for that when nothing
+  is confirmed.  If everything agrees, the last checkpoint is restored.
+  A budget (`--confirm-budget`, `--confirm-max`) or an interruption (not
+  Ctrl-C, which ends the command) leaves a shorter prefix, and the restore
+  is from that: still exact, and the message says up to where it is
+  confirmed.  `--verdict=FILE` writes the verdict; `--confirm-result=FILE`
+  writes the result of the confirmation.  Options are those of `--confirm`;
+  the name follows `--restore` and `--confirm`.
+* The verdict is `"verdict":"exact"` with `"basis":"confirmed_by_segments"`
+  (the other exact verdict has basis `code_tracking`), a `confirmation` object
+  (`checkpoint_fs`, `segments_confirmed`, `segments`,
+  `first_difference_segment` or null), and the message says `EXACT BY
+  CONFIRMATION`.
+* MCP: `nvc_sim_open` with `restore_confirmed` (the directory), `confirm_jobs`
+  and `confirm_budget_s`; the status of a background confirmation
+  (`confirm_dir`, which may now be given without `restore_from`) names
+  `last_confirmed` (time and file) and says how to open it.  Opening with
+  `restore_confirmed` goes through the same check, which is quick when
+  nothing has changed because the settled segments are reused.
+
+### 15.3 The trust chain, checked when it is used
+
+1. The confirmation is run in the same command, by the same code as
+   `--confirm`; a result of an earlier run is used only through
+   `confirm-progress.txt`, a settled segment of which counts only if its key
+   is the same: a hash of the program (its executable), the top unit, the
+   global options and the work and library directories (every file in them),
+   the input files, and the two checkpoint files at the ends of the segment.
+   So a changed design, program, input file or checkpoint file makes the
+   segment run again, and nothing is restored on the strength of a stale
+   result.
+2. Each line of the progress file also carries a check over its content, so
+   that a line edited by hand, or one that was not written by this program,
+   is ignored and the segment is run.  This is protection against accidents.
+   It is not a signature: someone who computes the check, or who copies a
+   line together with its key from a run of the same files, is believed.
+3. The own-state restore cannot be selected from the command line or by an
+   environment variable of a user: it is reached by `--restore-confirmed`
+   only, and by the children of a confirmation, which are told by their
+   parent with its process id as a token that has to be the process id of the
+   parent of the child.  Setting the variable by hand does not work unless
+   the value happens to be the id of the process that runs the command.
+4. The restore needs `state_verified`; otherwise the command stops.
+5. The prefix must start at segment 1, so every segment before the restored
+   one agreed in a run of this program.  A difference found after an
+   unconfirmed segment is not reported, and not restored from.
+6. A differing segment is run twice, as before, and ends the work: the
+   segments after it are stopped as soon as it is settled.
+
+### 15.4 Not covered
+
+* The options of the later run: the segments run without plusargs and with
+  the default run options, so `--restore-confirmed` refuses plusargs; options
+  such as `--exit-severity` or `--stop-delta` after `-r` are not part of the
+  key and are the caller's responsibility to keep as they were for the
+  original run.
+* Files written or read by absolute path, files opened and closed between
+  checkpoints, and anything the saved state does not hold (section 8), as for
+  every confirmation.
+* The progress file can be forged by someone who knows how (15.3, 2).
+* The program is hashed by content, the libraries by content of the work
+  directory and of the directories of the library path; a library edited
+  while the command runs is not noticed.
+* A checkpoint replaced between the confirmation and the restore, a window of
+  milliseconds, is not noticed by the key but is by the verification of the
+  restore, which compares the model with the file, not with what was
+  confirmed.

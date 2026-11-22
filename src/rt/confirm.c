@@ -207,8 +207,13 @@ static void start_segment(const confirm_opts_t *o, segment_t *s, unsigned idx,
       // (design note 12.1).  Whether the segments before it do agree is
       // decided afterwards; a difference that depends on one that did not
       // is not reported.
-      if (s->from_path != NULL)
-         setenv("NVC_CKPT_OWN_STATE", "1", 1);
+      if (s->from_path != NULL) {
+         char tok[32];
+         snprintf(tok, sizeof(tok), "%ld", (long)getppid());
+         setenv("NVC_CKPT_OWN_STATE", tok, 1);
+      }
+      else
+         unsetenv("NVC_CKPT_OWN_STATE");
 
       int out = open("out.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
       int err = open("err.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
@@ -456,6 +461,18 @@ static uint64_t design_key(const confirm_opts_t *o, char **inputs,
    return h;
 }
 
+// A line of the progress file carries a check over its content, so that a
+// line edited by hand, or copied from another file, is not believed.  It is
+// not protection against someone who computes it: it is against accidents.
+static uint64_t progress_mac(uint64_t from, uint64_t to, uint64_t key,
+                             double cpu)
+{
+   char buf[160];
+   const int n = snprintf(buf, sizeof(buf), "nvc-confirm-1 %"PRIu64" %"PRIu64
+                          " same %.3f %016"PRIx64, from, to, cpu, key);
+   return hash_bytes(0xcbf29ce484222325ull, buf, n);
+}
+
 static void save_progress(const char *dir, segment_t *segs, unsigned n)
 {
    char *path = xasprintf("%s/confirm-progress.txt", dir);
@@ -466,8 +483,10 @@ static void save_progress(const char *dir, segment_t *segs, unsigned n)
 
    for (unsigned i = 0; i < n; i++) {
       if (segs[i].state == SEG_SAME)
-         fprintf(f, "%"PRIu64" %"PRIu64" same %.3f %016"PRIx64"\n",
-                 segs[i].from_fs, segs[i].to_fs, segs[i].cpu_s, segs[i].key);
+         fprintf(f, "%"PRIu64" %"PRIu64" same %.3f %016"PRIx64" %016"PRIx64"\n",
+                 segs[i].from_fs, segs[i].to_fs, segs[i].cpu_s, segs[i].key,
+                 progress_mac(segs[i].from_fs, segs[i].to_fs, segs[i].key,
+                              segs[i].cpu_s));
    }
    fclose(f);
 }
@@ -483,9 +502,11 @@ static void load_progress(const char *dir, segment_t *segs, unsigned n)
    uint64_t from, to;
    char what[16];
    double cpu;
-   uint64_t key;
-   while (fscanf(f, "%"SCNu64" %"SCNu64" %15s %lf %"SCNx64, &from, &to, what,
-                 &cpu, &key) == 5) {
+   uint64_t key, mac;
+   while (fscanf(f, "%"SCNu64" %"SCNu64" %15s %lf %"SCNx64" %"SCNx64, &from,
+                 &to, what, &cpu, &key, &mac) == 6) {
+      if (mac != progress_mac(from, to, key, cpu))
+         continue;   // Edited, or not written by this program
       for (unsigned i = 0; i < n; i++) {
          // Only if the checkpoints at both ends are as they were
          if (segs[i].from_fs == from && segs[i].to_fs == to
@@ -631,8 +652,19 @@ int confirm_run(const confirm_opts_t *opts)
                        segs[i].detail ? segs[i].detail : "",
                        now_s() - segs[i].start_s);
 
-               if (segs[i].state == SEG_DIFFERENT && i < first_diff)
+               if (segs[i].state == SEG_DIFFERENT && i < first_diff) {
                   first_diff = i;
+
+                  // What comes after it is of no use: stop it
+                  for (unsigned j = i + 1; j < nck; j++) {
+                     if (segs[j].state == SEG_RUNNING) {
+                        kill(segs[j].pid, SIGTERM);
+                        waitpid(segs[j].pid, NULL, 0);
+                        segs[j].state = SEG_CANCELLED;
+                        running--;
+                     }
+                  }
+               }
                if (segs[i].state == SEG_SAME)
                   save_progress(o->dir, segs, nck);
                break;
@@ -698,7 +730,21 @@ int confirm_run(const confirm_opts_t *opts)
    for (unsigned i = 0; i < nck; i++)
       cpu += segs[i].cpu_s;
 
-   FILE *f = o->result_file ? fopen(o->result_file, "w") : stdout;
+   if (o->prefix != NULL) {
+      confirm_prefix_t *px = o->prefix;
+      memset(px, '\0', sizeof(*px));
+      px->confirmed = prefix;
+      px->total = nck;
+      px->up_to_fs = covered;
+      px->path = prefix > 0 ? xstrdup(segs[prefix - 1].to_path) : NULL;
+      px->first_diff = (prefix < nck && segs[prefix].state == SEG_DIFFERENT)
+         ? prefix + 1 : 0;
+      px->budget_out = budget_out;
+      px->interrupted = interrupted;
+   }
+
+   FILE *f = o->result_file ? fopen(o->result_file, "w")
+      : o->quiet ? fopen("/dev/null", "w") : stdout;
    if (f == NULL)
       fatal_errno("%s", o->result_file);
 
@@ -707,6 +753,9 @@ int confirm_run(const confirm_opts_t *opts)
            "\"wall_s\":%.3f,\"cpu_s\":%.3f,\"budget_exhausted\":%s,"
            "\"interrupted\":%s", result, covered, total, nck, now_s() - start,
            cpu, budget_out ? "true" : "false", interrupted ? "true" : "false");
+
+   if (prefix > 0)
+      fprintf(f, ",\"last_confirmed_file\":\"ck-%020"PRIu64".ckpt\"", covered);
 
    if (first_diff < nck) {
       fprintf(f, ",\"first_difference\":{\"segment\":%u,\"from_fs\":%"PRIu64
@@ -737,6 +786,9 @@ int confirm_run(const confirm_opts_t *opts)
           && segs[i].state != SEG_INCOMPLETE)
          remove_tree(segs[i].dir);
    }
+
+   signal(SIGINT, SIG_DFL);
+   signal(SIGTERM, SIG_DFL);
 
    return interrupted ? 130 : rc;
 }

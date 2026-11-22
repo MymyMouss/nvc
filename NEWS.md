@@ -32,6 +32,13 @@
   a waveform is being recorded.  A restore with `--allow-changes` into a
   process suspended in changed code that had run now resumes it at the wait
   with the same number and reports the verdict approximate, naming it.
+- `nvc -r --restore-confirmed=DIR` resumes exactly after any fix: it
+  confirms the changed design against the periodic checkpoints in DIR and
+  restores the last checkpoint that is proved to be the changed design's own
+  state, then runs on.  If no checkpoint is confirmed it stops
+  (`--confirmed-or-zero` starts from time zero instead).  The MCP tool
+  `nvc_sim_open` has `restore_confirmed` for the same, and the status of a
+  finished background confirmation names the last confirmed file.
 - The MCP tool `nvc_sim_open` takes `checkpoint_dir` and `checkpoint_every`
   to write checkpoint files during a run, and `confirm_dir` to confirm in
   the background a fix restored with `restore_from` and `allow_changes`;

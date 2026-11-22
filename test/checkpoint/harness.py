@@ -755,6 +755,162 @@ def check_confirm(before, after, nvc, lib, fstdump, timeout, jobs=2):
             shutil.rmtree(work, ignore_errors=True)
 
 
+CONF_LINE_RE = re.compile(rb"^confirm: [^\n]*\n", re.M)
+
+
+def check_rc(before, after, nvc, lib, fstdump, timeout, waves=False):
+    """The strong oracle for restoring from the last confirmed checkpoint:
+    the original run writes checkpoints, the changed design is restored from
+    the last one that the confirmation proves to be its own state and run on,
+    and what it does from there on is compared with the changed design run
+    from zero: output, waveform and the state at a late time"""
+    work = tempfile.mkdtemp(prefix="ckrc-")
+    wb, wa = os.path.join(work, "b"), os.path.join(work, "a")
+    os.makedirs(wb)
+    os.makedirs(wa)
+    env = dict(os.environ)
+    env["NVC_LIBPATH"] = lib
+    env["NVC_IMP_LIB"] = lib
+    res = {"name": after.name, "status": None, "detail": "", "k": None,
+           "n": None, "frac": None}
+    try:
+        base = [nvc, "--std=" + after.std]
+        if not elaborate(before, base, wb, env, timeout) \
+                or not elaborate(after, base, wa, env, timeout):
+            res["status"] = "n/a"
+            return res
+        stop = (["--stop-time=" + before.stop] if before.stop else [])
+
+        rc, _, _, _ = run(base + ["-r", "--wave=b.fst"] + stop + [before.top],
+                          wb, env, timeout)
+        if not os.path.exists(os.path.join(wb, "b.fst")):
+            res["status"] = "n/a"
+            return res
+        times = sorted(t for t in parse_dump(subprocess.run(
+            [fstdump, "b.fst"], cwd=wb, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL).stdout.decode("utf-8", "replace"))
+            if t > 0)
+        if len(times) < 8:
+            res["status"] = "n/a"
+            return res
+        every = max(times[-1] // 8 // 1000000 * 1000000, 1000000)
+        ck = os.path.join(work, "ckb")
+        wv = ["--wave=orig.fst"] if waves else []
+        run(base + ["-r"] + stop + wv + ["--checkpoint=%s@every=%dfs,max=100000"
+                                         % (ck, every), before.top],
+            wb, env, timeout)
+        if len(ck_files(ck)) < 2:
+            res["status"] = "n/a"
+            return res
+
+        # The changed design from zero, with waveform, output and a late state
+        late = times[-1]
+        rc_s, s_out, s_err, _ = run(
+            base + ["-r", "--wave=ref.fst", "--checkpoint=ref.ckpt@%dfs" % late]
+            + stop + [after.top], wa, env, timeout)
+        if rc_s is None or not os.path.exists(os.path.join(wa, "ref.fst")):
+            res["status"] = "n/a"
+            return res
+        sdump = parse_dump(subprocess.run(
+            [fstdump, "ref.fst"], cwd=wa, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL).stdout.decode("utf-8", "replace"))
+
+        vj = os.path.join(work, "v.json")
+        def restored(with_ckpt):
+            return run(
+                base + ["-r", "--wave=res.fst", "--restore-confirmed=" + ck,
+                        "--confirmed-or-zero", "--verdict=" + vj]
+                + (["--checkpoint=res.ckpt@%dfs" % late] if with_ckpt else [])
+                + stop + [after.top], wa, env, timeout)
+
+        rc_r, r_out, r_err, secs = restored(True)
+        if rc_r not in (None, rc_s) and os.path.exists(vj) \
+                and json.load(open(vj))["confirmation"]["checkpoint_fs"] >= late:
+            # Restored at or after the time of the late state
+            rc_r, r_out, r_err, secs = restored(False)
+        r_err = CONF_LINE_RE.sub(b"", r_err)
+        if rc_r is None:
+            res["status"] = "different"
+            res["detail"] = "restored run timed out"
+            return res
+
+        t_rest = 0
+        res["k"] = 0
+        if os.path.exists(vj):
+            v = json.load(open(vj))
+            if v.get("verdict") != "exact" or not v.get("state_verified"):
+                res["status"] = "different"
+                res["detail"] = "verdict %s" % v.get("verdict")
+                return res
+            c = v["confirmation"]
+            t_rest = c["checkpoint_fs"]
+            res["k"], res["n"] = c["segments_confirmed"], c["segments"]
+        res["frac"] = t_rest / float(late) if late else 0.0
+
+        # What the changed design printed before that time
+        a_err = b""
+        if t_rest > 0:
+            _, _, a_err, _ = run(base + ["-r", "--stop-time=%dfs" % t_rest,
+                                         after.top], wa, env, timeout)
+            _, a_out, _, _ = run(base + ["-r", "--stop-time=%dfs" % t_rest,
+                                         after.top], wa, env, timeout)
+        else:
+            a_out = b""
+
+        problems = []
+        if rc_r != rc_s:
+            problems.append("exit status %s, reference %s" % (rc_r, rc_s))
+        if norm(r_out) != norm(s_out)[len(norm(a_out)):]:
+            problems.append("stdout differs")
+        why = stderr_diff(norm(s_err), norm(a_err), norm(r_err))
+        if why:
+            problems.append(why)
+        if t_rest > 0 or os.path.exists(os.path.join(wa, "res.fst")):
+            rdump = parse_dump(subprocess.run(
+                [fstdump, "res.fst"], cwd=wa, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL).stdout.decode("utf-8", "replace"))
+            problems += waveform_diff(sdump, rdump, t_rest)
+        rf, sf = os.path.join(wa, "res.ckpt"), os.path.join(wa, "ref.ckpt")
+        if os.path.exists(sf) and t_rest < late:
+            if not os.path.exists(rf):
+                problems.append("no state saved at the late time")
+            elif payload_of(rf) != payload_of(sf):
+                problems.append("state at the late time differs")
+        res["status"] = "different" if problems else "identical"
+        res["detail"] = "; ".join(problems[:3])
+        return res
+    finally:
+        if os.environ.get("CONFIRM_KEEP") and res["status"] == "different":
+            print("kept", work, after.name, flush=True)
+        else:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def rc_summary(results):
+    print("\nrestore from the last confirmed checkpoint, against the changed "
+          "design run from zero:")
+    cnt = collections.Counter(r["status"] for r in results)
+    print("  identical %d  different %d  n/a %d" % (cnt["identical"],
+          cnt["different"], cnt["n/a"]))
+    ok = [r for r in results if r["status"] != "n/a"]
+    zero = [r for r in ok if not r["k"]]
+    print("  restarted from zero: %d; from a later checkpoint: %d"
+          % (len(zero), len(ok) - len(zero)))
+    bins = collections.Counter()
+    for r in ok:
+        if r["k"]:
+            bins[min(int(r["frac"] * 10), 9)] += 1
+    print("  how far into the run (tenths of the run): " + ", ".join(
+        "%d-%d%%: %d" % (b * 10, b * 10 + 10, bins[b]) for b in sorted(bins)))
+    if ok:
+        print("  mean fraction saved: %.2f" % (sum(r["frac"] or 0 for r in ok)
+                                              / len(ok)))
+    bad = [r for r in results if r["status"] == "different"]
+    for r in bad[:10]:
+        print("RESTORE-CONFIRMED DIFFERS %s: %s" % (r["name"], r["detail"]))
+    return len(bad)
+
+
 def confirm_summary(results):
     table = collections.Counter((r["confirm"], r["truth"] and
                                  ("same" if r["truth"] == "same" else "differs"))
@@ -982,6 +1138,12 @@ def mutation_task(task):
             c["name"] = "%s/%s" % (name, desc)
             res.append({"name": c["name"], "status": "confirm", "confirm": c,
                         "verdict": None})
+        if os.environ.get("HARNESS_RC"):
+            c = check_rc(before, after, nvc, lib, fstdump, timeout,
+                         bool(os.environ.get("HARNESS_CONFIRM_WAVES")))
+            c["name"] = "%s/%s" % (name, desc)
+            res.append({"name": c["name"], "status": "rc", "rc": c,
+                        "verdict": None})
         return res
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1001,11 +1163,15 @@ def mutate_main(args, nvc, lib, fstdump):
     table = collections.Counter()
     results = []
     cresults = []
+    rcresults = []
     with multiprocessing.Pool(args.jobs) as pool:
         for res in pool.imap_unordered(mutation_task, tasks):
             for r in res:
                 if r["status"] == "confirm":
                     cresults.append(r["confirm"])
+                    continue
+                if r["status"] == "rc":
+                    rcresults.append(r["rc"])
                     continue
                 results.append(r)
                 tally([r], table)
@@ -1017,6 +1183,8 @@ def mutate_main(args, nvc, lib, fstdump):
     bad = print_table(table)
     if args.confirm:
         bad += confirm_summary(cresults)
+    if args.restore_confirmed:
+        bad += rc_summary(rcresults)
     if args.json:
         json.dump(results, open(args.json, "w"), indent=1)
     return 1 if bad else 0
@@ -1048,6 +1216,11 @@ def fix_main(args, nvc, lib, fstdump):
         cres = [check_confirm(b, a, nvc, lib, fstdump, args.timeout)
                 for b, a in pairs]
         bad += confirm_summary(cres)
+    if args.restore_confirmed:
+        rres = [check_rc(b, a, nvc, lib, fstdump, args.timeout,
+                         bool(os.environ.get("HARNESS_CONFIRM_WAVES")))
+                for b, a in pairs]
+        bad += rc_summary(rres)
     if args.json:
         json.dump(results, open(args.json, "w"), indent=1)
     return 1 if bad else 0
@@ -1148,6 +1321,10 @@ def main():
     ap.add_argument("--confirm", action="store_true",
                     help="fix and mutate modes: also run the confirmation by "
                     "segments and compare it with the reference")
+    ap.add_argument("--restore-confirmed", action="store_true",
+                    help="fix and mutate modes: restore the changed design "
+                    "from the last confirmed checkpoint and compare the rest "
+                    "of the run with the changed design run from zero")
     ap.add_argument("--confirm-waves", action="store_true",
                     help="with --confirm: the original run records waveforms")
     ap.add_argument("--count", type=int, default=40,
@@ -1162,6 +1339,8 @@ def main():
 
     if args.confirm_waves:
         os.environ["HARNESS_CONFIRM_WAVES"] = "1"
+    if args.restore_confirmed:
+        os.environ["HARNESS_RC"] = "1"
 
     nvc = os.path.abspath(args.nvc)
     lib = os.path.abspath(args.lib)

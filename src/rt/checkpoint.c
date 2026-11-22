@@ -511,12 +511,31 @@ static void json_escape(text_buf_t *tb, const char *s)
 char *checkpoint_report_json(const ckpt_report_t *rep)
 {
    LOCAL_TEXT_BUF tb = tb_new();
-   tb_printf(tb, "{\"verdict\":\"%s\",\"verdict_without_mappings\":\"%s\","
-             "\"tracked\":%s,\"state_verified\":%s,\"changed_units\":[",
-             rep->exact ? "exact" : "approximate",
-             rep->exact_prefix ? "exact" : "approximate",
+   // A checkpoint proved by a confirmation to be this design's own state is
+   // an exact restore for a different reason than the tracking of code
+   const bool conf = rep->by_confirmation && rep->verified;
+   tb_printf(tb, "{\"verdict\":\"%s\",\"basis\":\"%s\","
+             "\"verdict_without_mappings\":\"%s\","
+             "\"tracked\":%s,\"state_verified\":%s,",
+             conf || (!rep->by_confirmation && rep->exact) ? "exact"
+             : "approximate",
+             rep->by_confirmation ? "confirmed_by_segments" : "code_tracking",
+             rep->by_confirmation ? "not_applicable"
+             : rep->exact_prefix ? "exact" : "approximate",
              rep->tracked ? "true" : "false",
              rep->verified ? "true" : "false");
+   if (rep->by_confirmation) {
+      tb_printf(tb, "\"confirmation\":{\"checkpoint_fs\":%"PRIu64
+                ",\"segments_confirmed\":%u,\"segments\":%u,"
+                "\"first_difference_segment\":", rep->conf_up_to_fs,
+                rep->conf_segments, rep->conf_total);
+      if (rep->conf_first_diff > 0)
+         tb_printf(tb, "%u", rep->conf_first_diff);
+      else
+         tb_cat(tb, "null");
+      tb_cat(tb, "},");
+   }
+   tb_cat(tb, "\"changed_units\":[");
    for (unsigned i = 0; i < rep->nchanged; i++) {
       tb_printf(tb, "%s{\"unit\":", i ? "," : "");
       json_escape(tb, rep->changed[i]);
@@ -4148,8 +4167,29 @@ char *checkpoint_save(rt_model_t *m, jit_t *jit, const ckpt_id_t *id,
    return err;
 }
 
+static char *restore_impl(rt_model_t *m, jit_t *jit, const char *path,
+                          bool allow, bool own, ckpt_report_t *rep);
+
 char *checkpoint_restore(rt_model_t *m, jit_t *jit, const char *path,
                          bool allow, ckpt_report_t *rep)
+{
+   // The children of a confirmation restore the checkpoint at the start of
+   // their segment as the changed design's own state (design note 12.1a).
+   // They are told so by their parent, with its process id as the token, so
+   // that the setting cannot come from a stale environment or a typing slip.
+   const char *tok = getenv("NVC_CKPT_OWN_STATE");
+   const bool own = allow && tok != NULL && atol(tok) == (long)getppid();
+   return restore_impl(m, jit, path, allow, own, rep);
+}
+
+char *checkpoint_restore_confirmed(rt_model_t *m, jit_t *jit, const char *path,
+                                   ckpt_report_t *rep)
+{
+   return restore_impl(m, jit, path, true, true, rep);
+}
+
+static char *restore_impl(rt_model_t *m, jit_t *jit, const char *path,
+                          bool allow, bool own, ckpt_report_t *rep)
 {
    ckpt_report_t local = {};
    if (rep == NULL)
@@ -4223,7 +4263,6 @@ char *checkpoint_restore(rt_model_t *m, jit_t *jit, const char *path,
    // another version does not matter, since the file holds the state that
    // this version has reached, and the state numbers of suspended processes
    // are its own.  Anything that does not fit is an error, not a note.
-   const bool own = allow && getenv("NVC_CKPT_OWN_STATE") != NULL;
    rep->own_state = own;
 
    ckpt_id_t *now = checkpoint_identify(m, jit);

@@ -2,7 +2,9 @@
 
 Statut: phases 0 à 3 **réalisées** (voir `CHECKPOINT-DESIGN.md`). Reste la
 phase 4 (élargir le périmètre) et le « mode invisible » de la phase 3.
-Remplace et détaille `PLAN.md` §1.
+Remplace et détaille `PLAN.md` §1.  Le besoin B a de plus une reprise exacte
+après n'importe quel correctif: `--restore-confirmed` (voir
+`CHECKPOINT-DESIGN.md` section 15).
 
 ## 1. Les deux besoins, qui ne se résolvent pas de la même façon
 

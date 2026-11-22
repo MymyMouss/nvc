@@ -66,7 +66,13 @@ static const char instructions[] =
    "fixed design with restore_from (one of those files), allow_changes "
    "and confirm_dir.  The status of that simulation shows the "
    "confirmation; only the result confirmed means the fix reproduces the "
-   "original run, and nvc_sim_wait wakes when it ends.";
+   "original run, and nvc_sim_wait wakes when it ends.  To resume after a "
+   "fix: if the change is in code the run had not reached yet, restore_from "
+   "is exact; otherwise use restore_confirmed with the directory of the "
+   "checkpoint files, which starts from the last file that is proved to be "
+   "the fixed design's own state and is exact for any change.  Resuming at "
+   "the same wait number with restore_from and allow_changes is only a "
+   "quick look, never a proof.";
 
 typedef struct {
    char   *line;

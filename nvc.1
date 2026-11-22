@@ -636,6 +636,33 @@ checkpoints are not run again.  Segments run in directories below
 .Ar DIR
 with the input files the design read made available by name, so a design
 that writes files by absolute path may overwrite them.
+.\" --restore-confirmed
+.It Fl \-restore-confirmed Ns = Ns Ar DIR
+Resume exactly after a fix, whatever the change.  The checkpoints in
+.Ar DIR
+were written by the original run with
+.Fl \-checkpoint=DIR@every= .
+The changed design is confirmed against them as for
+.Fl \-confirm
+(and settled segments of an earlier confirmation of the same design,
+program, inputs and files are reused), and the simulation is restored from the
+last checkpoint such that it and all before it agree, which is then proved to
+be the state of the changed design itself, and runs on.  The restore is
+reported as exact with the basis
+.Cm confirmed_by_segments ,
+the time and the number of segments confirmed.  If no checkpoint is confirmed
+the command stops, unless
+.Fl \-confirmed-or-zero
+is given, which starts from time zero.  Takes the options of
+.Fl \-confirm
+(including
+.Fl \-jobs
+and the budget); plusargs are not allowed.
+.\" --confirmed-or-zero
+.It Fl \-confirmed-or-zero
+With
+.Fl \-restore-confirmed ,
+start from time zero if no checkpoint is confirmed.
 .\" --jobs
 .It Fl \-jobs Ns = Ns Ar N
 With

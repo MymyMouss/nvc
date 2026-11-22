@@ -952,6 +952,23 @@ static void enable_ieee_warnings_cb(rt_model_t *m, void *ctx)
    *ptr = 0;
 }
 
+// Program arguments of a segment of a confirmation: the global options of
+// this run and the work library by its absolute path
+static char **confirm_child_args(void)
+{
+   unsigned nglobal = 0;
+   while (g_global_argv[nglobal] != NULL)
+      nglobal++;
+
+   char **args = xcalloc_array(nglobal + 3, sizeof(char *));
+   for (unsigned i = 0; i < nglobal; i++)
+      args[i] = g_global_argv[i];
+
+   char *abswork = realpath(g_global_work, NULL);
+   args[nglobal] = xasprintf("--work=%s", abswork ?: g_global_work);
+   return args;
+}
+
 static int run_cmd(int argc, char **argv, cmd_state_t *state)
 {
    static struct option long_options[] = {
@@ -982,9 +999,13 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       { "confirm-budget", required_argument, 0, 'B' },
       { "confirm-max",   required_argument, 0, 'N' },
       { "confirm-result", required_argument, 0, 'Q' },
+      { "restore-confirmed", required_argument, 0, 'K' },
+      { "confirmed-or-zero", no_argument,       0, 'Z' },
       { 0, 0, 0, 0 }
    };
 
+   const char     *restore_confirmed = NULL;
+   bool            or_zero = false;
    bool            allow_changes = false;
    const char     *verdict_file = NULL;
    const char     *resave_file = NULL;
@@ -1155,6 +1176,13 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       case 'Q':
          confirm_result = optarg;
          break;
+      case 'K':
+         restore_confirmed = optarg;
+         jit_exec_tracking = true;
+         break;
+      case 'Z':
+         or_zero = true;
+         break;
       case 'H':
          warnf("the $bold$--shuffle$$ option is intended for debug use only "
                "and may introduce significant performance overhead as well "
@@ -1178,26 +1206,59 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
 
    set_top_level(argv, next_cmd, state);
 
-   if (confirm_dir != NULL) {
+   confirm_prefix_t cpx = {};
+   bool restore_own = false;
+
+   if (confirm_dir != NULL || restore_confirmed != NULL) {
       // Run segments of the simulation in other processes: nothing is loaded
       // here
-      unsigned nglobal = 0;
-      while (g_global_argv[nglobal] != NULL)
-         nglobal++;
-
-      char **args = xcalloc_array(nglobal + 3, sizeof(char *));
-      for (unsigned i = 0; i < nglobal; i++)
-         args[i] = g_global_argv[i];
-
-      char *abswork = realpath(g_global_work, NULL);
-      args[nglobal] = xasprintf("--work=%s", abswork ?: g_global_work);
+      if (confirm_dir != NULL && restore_confirmed != NULL)
+         fatal("$bold$--confirm$$ and $bold$--restore-confirmed$$ cannot be "
+               "used together");
+      else if (restore_confirmed != NULL && restore_file != NULL)
+         fatal("$bold$--restore-confirmed$$ and $bold$--restore$$ cannot be "
+               "used together");
+      else if (restore_confirmed != NULL && nplusargs > 0)
+         fatal("plusargs cannot be used with $bold$--restore-confirmed$$: "
+               "the segments that are confirmed run without them");
 
       const confirm_opts_t opts = {
-         .dir = confirm_dir, .top = state->top_level_arg, .child_args = args,
+         .dir = confirm_dir ?: restore_confirmed,
+         .top = state->top_level_arg, .child_args = confirm_child_args(),
          .jobs = confirm_jobs, .budget_s = confirm_budget,
          .max_segments = confirm_max, .result_file = confirm_result,
+         .quiet = restore_confirmed != NULL,
+         .prefix = restore_confirmed != NULL ? &cpx : NULL,
       };
-      return confirm_run(&opts);
+      const int crc = confirm_run(&opts);
+      if (confirm_dir != NULL)
+         return crc;
+      else if (crc == 130)
+         return crc;   // Interrupted
+
+      // Only the part of the run that the confirmation proved is used
+      if (cpx.confirmed == 0 && !or_zero)
+         fatal("no checkpoint in %s is confirmed as a state of this design "
+               "(%s): run without $bold$--restore-confirmed$$ to start from "
+               "time zero, or add $bold$--confirmed-or-zero$$ to do that "
+               "when nothing is confirmed", restore_confirmed,
+               cpx.first_diff == 1 ? "the first segment differs"
+               : cpx.budget_out ? "the budget ran out"
+               : "no segment could be checked");
+      else if (cpx.confirmed == 0)
+         notef("no checkpoint is confirmed: starting from time zero");
+      else {
+         char tm[64];
+         checkpoint_format_time(cpx.up_to_fs, tm, sizeof(tm));
+         notef("confirmed by segments up to %s (%u of %u segments)%s", tm,
+               cpx.confirmed, cpx.total,
+               cpx.first_diff ? ": the next one differs"
+               : cpx.confirmed < cpx.total ? ": the rest was not checked"
+               : "");
+         restore_file = cpx.path;
+         restore_own = true;
+         allow_changes = true;
+      }
    }
 
    ident_t ename = ident_prefix(state->top_level, well_known(W_ELAB), '.');
@@ -1298,8 +1359,11 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
    if (restore_file != NULL) {
       const uint64_t t0 = get_timestamp_us();
       ckpt_report_t rep = {};
-      char *err = checkpoint_restore(state->model, state->jit, restore_file,
-                                     allow_changes, &rep);
+      char *err = restore_own
+         ? checkpoint_restore_confirmed(state->model, state->jit,
+                                        restore_file, &rep)
+         : checkpoint_restore(state->model, state->jit, restore_file,
+                              allow_changes, &rep);
       if (err != NULL)
          fatal("cannot restore checkpoint: %s", err);
 
@@ -1309,7 +1373,35 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       notef("restored checkpoint %s at %s (%.1f ms)", restore_file, tmbuf,
             (get_timestamp_us() - t0) / 1000.0);
 
-      if (allow_changes) {
+      if (restore_own) {
+         if (!rep.verified)
+            fatal("cannot restore checkpoint: the restored state could not "
+                  "be verified");
+
+         rep.by_confirmation = true;
+         rep.conf_segments = cpx.confirmed;
+         rep.conf_total = cpx.total;
+         rep.conf_first_diff = cpx.first_diff;
+         rep.conf_up_to_fs = cpx.up_to_fs;
+
+         char tm[64];
+         checkpoint_format_time(cpx.up_to_fs, tm, sizeof(tm));
+         notef("restore verdict: EXACT BY CONFIRMATION (this is the state of "
+               "the changed design at %s: segments 1 to %u of %u agree, "
+               "first difference at %s)", tm, cpx.confirmed, cpx.total,
+               cpx.first_diff ? "the next segment" : "none");
+
+         if (verdict_file != NULL) {
+            char *json = checkpoint_report_json(&rep);
+            FILE *vf = fopen(verdict_file, "w");
+            if (vf == NULL)
+               fatal_errno("%s", verdict_file);
+            fprintf(vf, "%s\n", json);
+            fclose(vf);
+            free(json);
+         }
+      }
+      else if (allow_changes) {
          LOCAL_TEXT_BUF tb = tb_new();
          unsigned nran = 0;
          for (unsigned i = 0; i < rep.nchanged; i++)
@@ -1882,6 +1974,9 @@ static int mcp_worker_cmd(int argc, char **argv, cmd_state_t *state)
       { "track-code", no_argument, 0, 'T' },
       { "checkpoint-dir", required_argument, 0, 'D' },
       { "checkpoint-every", required_argument, 0, 'E' },
+      { "restore-confirmed", required_argument, 0, 'K' },
+      { "confirm-jobs", required_argument, 0, 'j' },
+      { "confirm-budget", required_argument, 0, 'B' },
       { 0, 0, 0, 0 }
    };
 
@@ -1889,6 +1984,9 @@ static int mcp_worker_cmd(int argc, char **argv, cmd_state_t *state)
    int c, index = 0, ctl_fd = -1;
    const char *files_dir = NULL, *restore_from = NULL, *every_dir = NULL;
    uint64_t every_fs = 0;
+   const char *restore_confirmed = NULL;
+   unsigned confirm_jobs = 2;
+   double confirm_budget = 0;
    bool allow_changes = false;
    const char *spec = ":";
    while ((c = getopt_long(next_cmd, argv, spec, long_options, &index)) != -1) {
@@ -1917,6 +2015,16 @@ static int mcp_worker_cmd(int argc, char **argv, cmd_state_t *state)
       case 'E':
          every_fs = strtoull(optarg, NULL, 10);
          break;
+      case 'K':
+         restore_confirmed = optarg;
+         jit_exec_tracking = true;
+         break;
+      case 'j':
+         confirm_jobs = parse_int(optarg);
+         break;
+      case 'B':
+         confirm_budget = parse_int(optarg);
+         break;
       case '?': bad_option("mcp-worker", argv);
       case ':': missing_argument("mcp-worker", argv);
       default: abort();
@@ -1929,6 +2037,33 @@ static int mcp_worker_cmd(int argc, char **argv, cmd_state_t *state)
 
 
    set_top_level(argv, next_cmd, state);
+
+   confirm_prefix_t cpx = {};
+   if (restore_confirmed != NULL) {
+      // Find the last checkpoint that is proved to be a state of this
+      // design before anything is loaded
+      if (restore_from != NULL)
+         fatal("$bold$--restore-confirmed$$ and $bold$--restore-from$$ "
+               "cannot be used together");
+
+      const confirm_opts_t opts = {
+         .dir = restore_confirmed, .top = state->top_level_arg,
+         .child_args = confirm_child_args(), .jobs = confirm_jobs,
+         .budget_s = confirm_budget, .quiet = true, .prefix = &cpx,
+      };
+      if (confirm_run(&opts) == 130)
+         return 130;
+
+      if (cpx.confirmed == 0)
+         fatal("no checkpoint in %s is confirmed as a state of this design "
+               "(%s)", restore_confirmed,
+               cpx.first_diff == 1 ? "the first segment differs"
+               : cpx.budget_out ? "the budget ran out"
+               : "no segment could be checked");
+
+      restore_from = cpx.path;
+      allow_changes = true;
+   }
 
    ident_t ename = ident_prefix(state->top_level, well_known(W_ELAB), '.');
 
@@ -1959,7 +2094,8 @@ static int mcp_worker_cmd(int argc, char **argv, cmd_state_t *state)
 
    const int rc = mcp_worker_main(state->model, top, state->jit, ctl_fd,
                                   files_dir, restore_from, allow_changes,
-                                  every_dir, every_fs);
+                                  every_dir, every_fs,
+                                  restore_confirmed ? &cpx : NULL);
 
    vhpi_context_free(state->vhpi);
    state->vhpi = NULL;

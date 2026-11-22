@@ -55,6 +55,9 @@ typedef struct {
    bool      exact_prefix;    // ... the verdict by that rule
    bool      verified;        // The restored state was compared with the file
    bool      own_state;       // Restored as the state of this very design
+   bool      by_confirmation; // ... which a confirmation by segments proved
+   unsigned  conf_segments, conf_total, conf_first_diff;
+   uint64_t  conf_up_to_fs;
    unsigned  nresumed;
    char    **resumed;         // Suspended processes resumed at the same wait
                               // number of changed code that had run
@@ -74,6 +77,14 @@ char *checkpoint_report_json(const ckpt_report_t *rep);
 // failure the model must be discarded.
 char *checkpoint_restore(rt_model_t *m, jit_t *jit, const char *path,
                          bool allow_changes, ckpt_report_t *rep);
+
+// Restore a checkpoint that a confirmation by segments has shown to be the
+// state of this design itself (design note 12.1a), whatever the code that
+// wrote it looked like.  Only for the caller that has checked that: the
+// verdict is exact because of that proof, and the restored state is still
+// verified against the file.
+char *checkpoint_restore_confirmed(rt_model_t *m, jit_t *jit, const char *path,
+                                   ckpt_report_t *rep);
 
 // Arrange for a checkpoint to be written the first time a time step at or
 // after the given time ends.  The result is reported through diagnostics
