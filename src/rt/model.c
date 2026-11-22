@@ -2405,10 +2405,23 @@ static void sched_event(rt_model_t *m, void **pending, rt_wakeable_t *obj)
    else {
       rt_pending_t *p = untag_pointer(*pending, rt_pending_t);
 
-      for (int i = 0; i < p->count; i++) {
-         if (p->wake[i] == NULL || p->wake[i] == obj) {
-            p->wake[i] = obj;
-            return;
+      // The order in which the entries are woken decides the order in
+      // which processes run, so it must not depend on whether a tool such
+      // as the waveform dumper has put a watch in the list: a watch is
+      // always added at the end and never takes the place of an entry that
+      // was removed
+      if (obj->kind == W_WATCH) {
+         for (int i = 0; i < p->count; i++) {
+            if (p->wake[i] == obj)
+               return;
+         }
+      }
+      else {
+         for (int i = 0; i < p->count; i++) {
+            if (p->wake[i] == NULL || p->wake[i] == obj) {
+               p->wake[i] = obj;
+               return;
+            }
          }
       }
 
@@ -2434,7 +2447,14 @@ static void clear_event(rt_model_t *m, void **pending, rt_wakeable_t *obj)
       rt_pending_t *p = untag_pointer(*pending, rt_pending_t);
       for (int i = 0; i < p->count; i++) {
          if (p->wake[i] == obj) {
-            p->wake[i] = NULL;
+            if (obj->kind == W_WATCH) {
+               // Leave no gap that a process could later fill
+               memmove(p->wake + i, p->wake + i + 1,
+                       (p->count - i - 1) * sizeof(rt_wakeable_t *));
+               p->count--;
+            }
+            else
+               p->wake[i] = NULL;
             return;
          }
       }

@@ -3215,17 +3215,22 @@ START_TEST(test_sim_restore_changed)
    ck_assert_int_eq(json_get(sc, "messages")->array.count, 0);   // x /= 2
    sim_tool(&f, "nvc_sim_close", id, "");
 
-   // Changing code that had run cannot resume the process in it
+   // Changing code that had run: the process is resumed at the wait with the
+   // same number, which the verdict says is only approximate
    char *v3 = xasprintf(late_src, 1);
    char *p = strstr(v3, "wait for 100 ns; x <= 1");
    ck_assert_ptr_nonnull(p);
    p[strlen("wait for 100 ns; x <= ")] = '3';
    rebuild_late(&f, v3);
-   err = tool_error(tool(f.mp, f.srv, &f.sink, "nvc_sim_open",
-                         "{\"top\":\"late\",\"std\":\"2008\","
-                         "\"restore_from\":\"late.ckpt\","
-                         "\"allow_changes\":true}"));
-   ck_assert_ptr_nonnull(strstr(err, "has changed"));
+   sc = structured(tool(f.mp, f.srv, &f.sink, "nvc_sim_open",
+                        "{\"top\":\"late\",\"std\":\"2008\","
+                        "\"restore_from\":\"late.ckpt\","
+                        "\"allow_changes\":true}"));
+   verdict = json_get(sc, "restore_verdict");
+   ck_assert_str_eq(str_field(verdict, "verdict"), "approximate");
+   ck_assert_int_eq(json_get(verdict, "resumed_by_number")->array.count, 1);
+   snprintf(id, sizeof(id), "%s", str_field(sc, "sim_id"));
+   sim_tool(&f, "nvc_sim_close", id, "");
 
    free(v1);
    free(v2);
@@ -3344,6 +3349,145 @@ START_TEST(test_sim_confirm)
              int_field(json_get(conf, "result"), "confirmed_up_to_fs")
              >= 200000000);
    sim_tool(&f, "nvc_sim_close", id, "");
+
+   free(v1);
+   fixture_close(&f);
+}
+END_TEST
+
+static const char seqw_src[] =
+   "entity seqw is end entity;\n"
+   "architecture a of seqw is\n"
+   "  signal clk : bit := '0';\n"
+   "  signal d : integer := 0;\n"
+   "  signal log : integer := 0;\n"
+   "begin\n"
+   "  clk <= not clk after 5 ns;\n"
+   "  stim: process begin\n"
+   "    wait for 100 ns; d <= %s;\n"
+   "    wait for 100 ns; d <= d + 1;\n"
+   "    wait for 100 ns; d <= d + 1;\n"
+   "    wait for 100 ns; wait;\n"
+   "  end process;\n"
+   "  mon: process (clk) begin\n"
+   "    if clk = '1' then log <= log + d; end if;\n"
+   "  end process;\n"
+   "end architecture;\n";
+
+static char *slurp(const char *path)
+{
+   FILE *fp = fopen(path, "rb");
+   ck_assert_ptr_nonnull(fp);
+   size_t len = 0, alloc = 4096;
+   char *buf = xmalloc(alloc);
+   size_t n;
+   while ((n = fread(buf + len, 1, alloc - len, fp)) > 0) {
+      len += n;
+      if (len == alloc)
+         buf = xrealloc(buf, alloc *= 2);
+   }
+   fclose(fp);
+   buf = xrealloc(buf, len + 1);
+   buf[len] = '\0';
+   return buf;
+}
+
+START_TEST(test_sim_confirm_waves)
+{
+   fixture_t f;
+   char *v1 = xasprintf(seqw_src, "d + 1");
+   const char *names[] = { "seqw.vhd" }, *sources[] = { v1 };
+   const char *tops[] = { "seqw" };
+   fixture_open(&f, names, sources, 1, tops, 1);
+
+   // Two runs of the same design write files every 50 ns, the second one
+   // with a recording started and stopped in the middle
+   char id[40];
+   const json_t *sc;
+   const char *dirs[] = { "plainw", "wavew" };
+   for (int k = 0; k < 2; k++) {
+      char *args = xasprintf("{\"top\":\"seqw\",\"std\":\"2008\","
+                             "\"checkpoint_dir\":\"%s\","
+                             "\"checkpoint_every\":\"50 ns\"}", dirs[k]);
+      sc = structured(tool(f.mp, f.srv, &f.sink, "nvc_sim_open", args));
+      free(args);
+      snprintf(id, sizeof(id), "%s", str_field(sc, "sim_id"));
+
+      sim_tool(&f, "nvc_sim_run", id, "\"until\":\"120 ns\","
+               "\"pause_on\":\"never\"");
+      if (k == 1)
+         structured(sim_tool(&f, "nvc_wave_start", id, ""));
+      sim_tool(&f, "nvc_sim_run", id, "\"until\":\"230 ns\","
+               "\"pause_on\":\"never\"");
+      if (k == 1)
+         structured(sim_tool(&f, "nvc_wave_stop", id, ""));
+      sim_tool(&f, "nvc_sim_run", id, "\"until\":\"450 ns\","
+               "\"pause_on\":\"never\"");
+      sim_tool(&f, "nvc_sim_close", id, "");
+   }
+
+   // The files are the same, whether or not a recording was on
+   int compared = 0;
+   for (int t = 50; t <= 450; t += 50) {
+      char name[64];
+      snprintf(name, sizeof(name), "ck-%020d.ckpt", t * 1000000);
+      char *pa = xasprintf("%s/.nvc-mcp/plainw/%s", f.root, name);
+      char *pb = xasprintf("%s/.nvc-mcp/wavew/%s", f.root, name);
+      char *a = slurp(pa), *b = slurp(pb);
+      ck_assert_str_eq(a, b);
+      compared++;
+      free(a);
+      free(b);
+      free(pa);
+      free(pb);
+   }
+   ck_assert_int_eq(compared, 9);
+
+   // A fix inside the process that is waiting at the checkpoint: confirmed
+   // when it changes nothing, and found in the right segment when it does
+   const char *fixes[] = { "1 + d", "d + 2" };
+   const char *want[] = { "confirmed", "different" };
+   for (int k = 0; k < 2; k++) {
+      char *text = xasprintf(seqw_src, fixes[k]);
+      write_file(f.root, "seqw.vhd", text, 0644);
+      free(text);
+      sc = structured(tool(f.mp, f.srv, &f.sink, "nvc_analyse",
+                           "{\"files\":[\"counter.vhd\",\"seqw.vhd\"],"
+                           "\"std\":\"2008\"}"));
+      ck_assert(bool_field(sc, "ok"));
+      sc = structured(tool(f.mp, f.srv, &f.sink, "nvc_elaborate",
+                           "{\"top\":\"seqw\",\"std\":\"2008\"}"));
+      ck_assert(bool_field(sc, "ok"));
+
+      sc = structured(tool(
+         f.mp, f.srv, &f.sink, "nvc_sim_open",
+         "{\"top\":\"seqw\",\"std\":\"2008\",\"allow_changes\":true,"
+         "\"restore_from\":\"wavew/ck-00000000000150000000.ckpt\","
+         "\"confirm_dir\":\"wavew\"}"));
+      snprintf(id, sizeof(id), "%s", str_field(sc, "sim_id"));
+
+      const json_t *conf = NULL;
+      for (int i = 0; i < 30; i++) {
+         sc = structured(sim_tool(&f, "nvc_sim_wait", id,
+                                  "\"timeout_ms\":2000"));
+         conf = json_get(sc, "confirmation");
+         ck_assert_ptr_nonnull(conf);
+         if (strcmp(str_field(conf, "state"), "running"))
+            break;
+      }
+      ck_assert_str_eq(str_field(conf, "state"), want[k]);
+      if (k == 1)
+         ck_assert_int_eq(int_field(json_get(json_get(conf, "result"),
+                                             "first_difference"), "segment"),
+                          2);
+      sim_tool(&f, "nvc_sim_close", id, "");
+
+      // Start again from the same directory: settled segments are not run
+      // for a changed design and the state files are not touched
+      char *ps = xasprintf("%s/.nvc-mcp/wavew/confirm-progress.txt", f.root);
+      unlink(ps);
+      free(ps);
+   }
 
    free(v1);
    fixture_close(&f);
@@ -3773,6 +3917,7 @@ Suite *get_mcp_tests(void)
    tcase_add_test(tc, test_sim_checkpoint_file);
    tcase_add_test(tc, test_sim_restore_changed);
    tcase_add_test(tc, test_sim_confirm);
+   tcase_add_test(tc, test_sim_confirm_waves);
    tcase_add_test(tc, test_sim_restore_files);
    tcase_add_test(tc, test_sim_restore_errors);
    tcase_add_test(tc, test_sim_restore_failed);

@@ -687,9 +687,14 @@ def check_confirm(before, after, nvc, lib, fstdump, timeout, jobs=2):
         every = max(times[-1] // 8 // 1000000 * 1000000, 1000000)
 
         stop = (["--stop-time=" + before.stop] if before.stop else [])
-        run(base + ["-r"] + stop + ["--checkpoint=%s@every=%dfs,max=100000"
-                                    % (os.path.join(work, "ckb"), every),
-                                    before.top], wb, env, timeout)
+        # The original run may record waveforms: the saved state must not
+        # depend on it
+        wv = ["--wave=orig.fst"] if os.environ.get("HARNESS_CONFIRM_WAVES") \
+            else []
+        run(base + ["-r"] + stop + wv
+            + ["--checkpoint=%s@every=%dfs,max=100000"
+               % (os.path.join(work, "ckb"), every), before.top],
+            wb, env, timeout)
         fb = ck_files(os.path.join(work, "ckb"))
         if len(fb) < 2:
             res["confirm"] = "n/a"
@@ -1048,9 +1053,86 @@ def fix_main(args, nvc, lib, fstdump):
     return 1 if bad else 0
 
 
+def waves_check(d, nvc, lib, fstdump, keep, timeout):
+    """Periodic checkpoints of the same run without a dumper, with an FST
+    dump and with a VCD dump must have byte-equal states"""
+    work = tempfile.mkdtemp(prefix="ckwave-")
+    env = dict(os.environ)
+    env["NVC_LIBPATH"] = lib
+    env["NVC_IMP_LIB"] = lib
+    env["LANG"] = "en_US.UTF-8"
+    env.update(d.env)
+    res = {"name": d.name, "status": None, "detail": ""}
+    try:
+        base = [nvc, "--std=" + d.std]
+        if d.heap:
+            base.append("-H" + d.heap)
+        rc, _, _, _ = run(base + ["-a"] + d.files + d.aflags
+                          + ["-e", d.top, "-O%d" % d.olevel]
+                          + ["-g%s=%s" % g for g in d.gens], work, env, timeout)
+        if rc != 0:
+            raise NA("analysis or elaboration failed")
+
+        def runcmd(extra):
+            cmd = base + ["-r"] + (["--stop-time=" + d.stop] if d.stop else [])
+            return run(cmd + extra + d.rflags + [d.top], work, env, timeout)
+
+        rc, _, _, _ = runcmd(["--wave=t.fst"])
+        if rc is None or not os.path.exists(os.path.join(work, "t.fst")):
+            raise NA("no waveform produced")
+        dump = subprocess.run([fstdump, "t.fst"], cwd=work,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL).stdout.decode(
+                                  "utf-8", "replace")
+        times = sorted(t for t in parse_dump(dump) if t > 0)
+        if len(times) < 2:
+            raise NA("no simulated time elapses")
+        every = max(times[-1] // 6, 1)
+
+        dirs = {}
+        for tag, extra in (("plain", []), ("fst", ["--wave=a.fst"]),
+                           ("vcd", ["--wave=a.vcd", "--format=vcd"])):
+            dd = os.path.join(work, "ck-" + tag)
+            rc, _, err, _ = runcmd(["--checkpoint=%s@every=%dfs,max=100000"
+                                    % (dd, every)] + extra)
+            if rc is None:
+                raise NA("run timed out")
+            dirs[tag] = ck_files(dd)
+        if not dirs["plain"]:
+            m = re.search(rb"cannot write checkpoint [^\n]*? at [^:]*: ([^\n]*)",
+                          err)
+            res["status"] = "refused"
+            res["detail"] = (m.group(1).decode() if m
+                             else err.decode("utf-8", "replace")[-200:].strip())
+            return res
+
+        problems = []
+        for tag in ("fst", "vcd"):
+            if sorted(dirs[tag]) != sorted(dirs["plain"]):
+                problems.append("%s: checkpoints at other times" % tag)
+                continue
+            for t, f in sorted(dirs["plain"].items()):
+                if payload_of(f) != payload_of(dirs[tag][t]):
+                    problems.append("%s: state differs at %d" % (tag, t))
+                    break
+        res["status"] = "different" if problems else "identical"
+        res["detail"] = "; ".join(problems)
+        res["files"] = len(dirs["plain"])
+        return res
+    except NA as e:
+        res["status"] = "n/a"
+        res["detail"] = str(e)
+        return res
+    finally:
+        if keep:
+            res["dir"] = work
+        else:
+            shutil.rmtree(work, ignore_errors=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description="nvc checkpoint validation harness (see the comment at the top of the file)")
-    ap.add_argument("mode", choices=["regress", "bench", "design", "fix", "mutate"])
+    ap.add_argument("mode", choices=["regress", "bench", "design", "fix", "mutate", "waves"])
     ap.add_argument("--pairs", default="all", choices=["bench", "own", "all"],
                     help="for the fix mode: which pairs of designs")
     ap.add_argument("names", nargs="*")
@@ -1066,6 +1148,8 @@ def main():
     ap.add_argument("--confirm", action="store_true",
                     help="fix and mutate modes: also run the confirmation by "
                     "segments and compare it with the reference")
+    ap.add_argument("--confirm-waves", action="store_true",
+                    help="with --confirm: the original run records waveforms")
     ap.add_argument("--count", type=int, default=40,
                     help="mutate mode: mutants per base design")
     ap.add_argument("--seed", type=int, default=1)
@@ -1076,6 +1160,9 @@ def main():
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
+    if args.confirm_waves:
+        os.environ["HARNESS_CONFIRM_WAVES"] = "1"
+
     nvc = os.path.abspath(args.nvc)
     lib = os.path.abspath(args.lib)
     fstdump = args.fstdump or os.path.join(os.path.dirname(nvc), "fstdump")
@@ -1084,6 +1171,22 @@ def main():
         return fix_main(args, nvc, lib, fstdump)
     if args.mode == "mutate":
         return mutate_main(args, nvc, lib, fstdump)
+
+    if args.mode == "waves":
+        designs = bench_designs() + regress_designs(set(args.names))
+        counts = collections.Counter()
+        bad = 0
+        for d in designs:
+            if getattr(d, "skip", None):
+                counts["n/a"] += 1
+                continue
+            r = waves_check(d, nvc, lib, fstdump, args.keep, args.timeout)
+            counts[r["status"]] += 1
+            if r["status"] == "different":
+                bad += 1
+                print("DIFFERENT %s: %s" % (r["name"], r["detail"]), flush=True)
+        print("waves: %s" % dict(counts))
+        return 1 if bad else 0
 
     if args.mode == "regress":
         designs = regress_designs(set(args.names))

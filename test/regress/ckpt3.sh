@@ -64,15 +64,27 @@ grep -q '"verdict":"approximate"' v2.json
 grep -q '"executed_before_checkpoint":true' v2.json
 grep -q "APPROXIMATE" after2.err
 
-# A process suspended in changed code that had run cannot be resumed
+# A process suspended in changed code that had run is resumed at the wait
+# with the same number, and the verdict says so
 write_design 1 1
 sed -i 's/wait for 100 ns; x <= 1;/wait for 100 ns; x <= 7;/' ckpt3.vhd
 nvc -a ckpt3.vhd -e ckpt3
-if nvc -r --restore=state.ckpt --allow-changes ckpt3 2> refused2.err; then
-  echo "resumed a process in changed code"
+nvc -r --stop-time=300ns --restore=state.ckpt --allow-changes --verdict=v3.json \
+    ckpt3 2> after3.err
+grep -q '"verdict":"approximate"' v3.json
+grep -q '"resumed_by_number":\["process' v3.json
+grep -q "right only if the change does not add, remove or reorder waits" v3.json
+
+# It is refused where the new code has no wait with the saved number
+write_design 1 1
+sed -i 's/wait for 100 ns; x <= 1;/wait for 100 ns; x <= 1; wait for 1 ns;/' ckpt3.vhd
+nvc -a ckpt3.vhd -e ckpt3
+if nvc -r --stop-time=300ns --restore=state.ckpt --allow-changes ckpt3 \
+     2> refused2.err; then
+  echo "resumed a process at a wait that does not exist"
   exit 1
 fi
-grep -q "has changed" refused2.err
+grep -q "number of waits\|no wait with that number" refused2.err
 
 # A different build is never accepted, and nor is a damaged file
 head -c 100 state.ckpt > short.ckpt

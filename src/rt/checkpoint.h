@@ -54,6 +54,10 @@ typedef struct {
    bool     *prefix_ran;      // What the rule without mappings would say
    bool      exact_prefix;    // ... the verdict by that rule
    bool      verified;        // The restored state was compared with the file
+   bool      own_state;       // Restored as the state of this very design
+   unsigned  nresumed;
+   char    **resumed;         // Suspended processes resumed at the same wait
+                              // number of changed code that had run
    unsigned  nnotes;
    char    **notes;           // Why the verdict is not exact, and more
 } ckpt_report_t;
@@ -88,15 +92,9 @@ void checkpoint_format_time(uint64_t t, char *buf, size_t len);
 void checkpoint_schedule_every(rt_model_t *m, jit_t *jit, const char *dir,
                                uint64_t every, unsigned max);
 
-// Tell the checkpoint code whether waveform dumping is on: it changes the
-// numbers of the delta cycles, which are part of the saved state, so two
-// checkpoints can only be compared if it was the same for both
-void checkpoint_note_wave(bool on);
-
 // What can be read from a checkpoint file without restoring it
 typedef struct {
    uint64_t  time_fs;
-   bool      wave;        // Waveform dumping was on
    char    **inputs;      // Files the design had open for reading
    unsigned  ninputs;
 } ckpt_info_t;

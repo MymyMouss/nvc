@@ -184,6 +184,7 @@ static void jit_free_func(jit_func_t *f)
    mptr_free(f->jit->mspace, &(f->privdata));
    free(f->irbuf);
    free(f->exec);
+   free(f->resume);
    for (unsigned i = 0; f->linktab != NULL && i < f->nvars; i++)
       jit_free_vtype(f->linktab[i].type);
    free(f->linktab);
@@ -513,6 +514,8 @@ bool jit_get_code(jit_t *j, jit_handle_t handle, jit_code_t *out)
    out->exec = f->exec;
    out->restart_top = f->restart_top;
    out->restart_state = f->restart_state;
+   out->resume = f->resume;
+   out->nresume = f->nresume;
    out->has_next_tier = f->next_tier != NULL;
    out->hash = xmalloc_array(MAX(f->nirs, 1), sizeof(uint64_t));
    out->label = xmalloc_array(MAX(f->nirs, 1), sizeof(uint32_t));

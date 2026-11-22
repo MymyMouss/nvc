@@ -131,6 +131,8 @@ typedef struct {
    size_t         cpool_size;
    bool           restart_top;
    int            restart_state;
+   const uint32_t *resume;    // States a suspended unit can resume at
+   unsigned       nresume;
    bool           has_next_tier;
 } jit_code_t;
 

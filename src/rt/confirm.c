@@ -202,6 +202,14 @@ static void start_segment(const confirm_opts_t *o, segment_t *s, unsigned idx,
 
       setenv("NVC_CKPT_ANYDIR", "1", 1);
 
+      // The checkpoint a segment starts from is, if the segments before it
+      // agree, the state of the design being confirmed: restore it as that
+      // (design note 12.1).  Whether the segments before it do agree is
+      // decided afterwards; a difference that depends on one that did not
+      // is not reported.
+      if (s->from_path != NULL)
+         setenv("NVC_CKPT_OWN_STATE", "1", 1);
+
       int out = open("out.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
       int err = open("err.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
       int in = open("/dev/null", O_RDONLY);
@@ -528,7 +536,6 @@ int confirm_run(const confirm_opts_t *opts)
    unsigned ninputs = 0;
    uint64_t prev = 0;
    char *prev_path = NULL;
-   bool any_wave = false;
 
    for (unsigned i = 0; i < nck; i++) {
       char *path = xasprintf("%s/%s", o->dir, names[i]);
@@ -543,16 +550,6 @@ int confirm_run(const confirm_opts_t *opts)
       s->to_path = path;
       s->to_fs = info.time_fs;
       s->state = SEG_TODO;
-      if (info.wave) {
-         s->state = SEG_INCOMPLETE;
-         any_wave = true;
-         s->detail = xstrdup("the checkpoint was written with waveform "
-                             "dumping on, which changes the delta cycle "
-                             "numbers in the state, so it cannot be compared");
-         if (i + 1 < nck)
-            ;   // The next segment starts from it: it is marked below
-      }
-
       for (unsigned k = 0; k < info.ninputs; k++) {
          bool have = false;
          for (unsigned j = 0; j < ninputs; j++)
@@ -566,16 +563,6 @@ int confirm_run(const confirm_opts_t *opts)
       checkpoint_info_free(&info);
       prev = s->to_fs;
       prev_path = path;
-   }
-
-   // A segment that starts at a checkpoint taken with dumping cannot be
-   // compared either
-   for (unsigned i = 1; i < nck; i++) {
-      if (segs[i - 1].state == SEG_INCOMPLETE && segs[i].state == SEG_TODO
-          && any_wave) {
-         segs[i].state = SEG_INCOMPLETE;
-         segs[i].detail = xstrdup(segs[i - 1].detail);
-      }
    }
 
    // A result saved by an earlier run counts only if the design, this
@@ -691,9 +678,16 @@ int confirm_run(const confirm_opts_t *opts)
       rc = 0;
    }
    else if (first_diff < nck) {
-      // There is a difference but an earlier segment is not settled
-      result = "different";
-      rc = 1;
+      // A segment differs but one before it was not settled: it started
+      // from a state that may not be the changed design's own, so what it
+      // found says nothing
+      result = "incomplete";
+      rc = 2;
+      segs[first_diff].detail = xasprintf("not decided: a segment before "
+                                          "this one was not confirmed (%s)",
+                                          segs[first_diff].detail ?: "");
+      segs[first_diff].state = SEG_INCOMPLETE;
+      first_diff = nck;
    }
    else {
       result = "incomplete";

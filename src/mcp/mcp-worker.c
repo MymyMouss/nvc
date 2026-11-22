@@ -1274,10 +1274,6 @@ static char *wave_filter_pattern(worker_t *w, const char *entry)
 
 static void op_wave_start(worker_t *w, const json_t *req)
 {
-   // Dumping changes the delta cycle numbers, so checkpoints written from
-   // here on are marked as not comparable
-   checkpoint_note_wave(true);
-
    if (w->files_dir == NULL) {
       reply_error(w, "This simulation has no file directory");
       return;
@@ -2847,7 +2843,6 @@ int mcp_worker_main(rt_model_t *m, tree_t top, jit_t *jit, int ctl_fd,
    if (every_dir != NULL && every_fs > 0) {
       // Files of the state at regular simulated times, which can later be
       // used to confirm a fix by running segments from one to the next
-      checkpoint_note_wave(false);
       checkpoint_schedule_every(m, jit, every_dir, every_fs, 64);
    }
 

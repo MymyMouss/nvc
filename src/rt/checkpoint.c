@@ -56,7 +56,7 @@
 #include <unistd.h>
 
 #define CKPT_MAGIC   "NVCCKPT1"
-#define CKPT_VERSION 2
+#define CKPT_VERSION 3
 
 ////////////////////////////////////////////////////////////////////////////////
 // Output and input buffers
@@ -448,6 +448,7 @@ typedef enum {
    U_COMPAT,     // Changed, but only code that had never run
    U_APPROX,     // Changed code had run
    U_REMOVED,    // No longer in the design
+   U_OWN,        // Changed, and the checkpoint is its own state
 } unit_class_t;
 
 typedef struct {
@@ -455,6 +456,8 @@ typedef struct {
    bool         old_restart, new_restart;
    int          new_state;     // Resume state of the new code, if it restarts
    bool         by_mapping, prefix_ran;
+   const uint32_t *old_resume, *new_resume;   // States that can be resumed
+   unsigned     nold, nnew;
 } unit_t;
 
 __attribute__((format(printf, 2, 3)))
@@ -485,6 +488,9 @@ void checkpoint_report_free(ckpt_report_t *rep)
    free(rep->by_mapping);
    free(rep->prefix_ran);
    free(rep->notes);
+   for (unsigned i = 0; i < rep->nresumed; i++)
+      free(rep->resumed[i]);
+   free(rep->resumed);
    memset(rep, '\0', sizeof(*rep));
 }
 
@@ -518,7 +524,14 @@ char *checkpoint_report_json(const ckpt_report_t *rep)
                 rep->executed[i] ? "true" : "false",
                 rep->by_mapping[i] ? "true" : "false");
    }
-   tb_cat(tb, "],\"reasons\":[");
+   tb_cat(tb, "],\"resumed_by_number\":[");
+   for (unsigned i = 0; i < rep->nresumed; i++) {
+      if (i > 0)
+         tb_append(tb, ',');
+      json_escape(tb, rep->resumed[i]);
+   }
+   tb_printf(tb, "],\"own_state\":%s,\"reasons\":[",
+             rep->own_state ? "true" : "false");
    for (unsigned i = 0; i < rep->nnotes; i++) {
       if (i > 0)
          tb_append(tb, ',');
@@ -551,13 +564,6 @@ typedef struct {
    unsigned     fkind;
    size_t       size;
 } range_t;
-
-static bool g_wave;
-
-void checkpoint_note_wave(bool on)
-{
-   g_wave = on;
-}
 
 typedef struct {
    rt_model_t   *m;
@@ -602,6 +608,7 @@ typedef struct {
    unsigned      nsfiles;
    const char   *saved_cwd;   // Where the design was when it was saved
    bool          allow;       // Restoring into a changed design
+   bool          own;         // ... from the state of that design itself
    ckpt_report_t *rep;
    shash_t      *units;       // Code of the checkpoint against this build
    char         *err;
@@ -1879,17 +1886,23 @@ static bool save_pending(index_t *ix, wbuf_t *w, void *pending,
    }
 
    // Value change callbacks belong to tools (waveform dumper) rather than
-   // to the design and may be added later without changing the order of
-   // processes in the list
-   unsigned keep = 0;
+   // to the design, so they are left out: the list is saved as it would be
+   // without them (model.c keeps the order of the other entries the same).
+   // Holes at the end do not matter: the next entry added takes the first
+   // hole, or goes at the end, which is the same place.
+   unsigned last = 0, keep = 0;
    for (unsigned i = 0; i < count; i++) {
+      if (list[i] != NULL && list[i]->kind != W_WATCH)
+         last = i + 1;
+   }
+   for (unsigned i = 0; i < last; i++) {
       if (list[i] == NULL || list[i]->kind != W_WATCH)
          keep++;
    }
 
    w_u32(w, keep);
 
-   for (unsigned i = 0; i < count; i++) {
+   for (unsigned i = 0; i < last; i++) {
       rt_wakeable_t *obj = list[i];
       if (obj == NULL)
          w_u8(w, 0);
@@ -2426,7 +2439,6 @@ static char *serialise_model(index_t *ix, wbuf_t *w, bool check_quiet)
    for (int i = 0; i < 4; i++)
       w_u32(w, counts[i]);
    w_u32(w, mask);
-   w_u8(w, g_wave);
 
    // Packages are initialised lazily so a restore must do the same ones
    w_tag(w, "PKGS");
@@ -2490,6 +2502,8 @@ typedef struct {
    bool      restart;
    uint64_t  cphash;
    bool      unsupported;
+   uint32_t *resume;    // States a suspended unit can resume at, sorted
+   unsigned  nresume;
    uint64_t *hash;
    uint32_t *label;
    uint8_t  *kind;
@@ -2508,12 +2522,19 @@ static void exec_free(exec_info_t *e)
    free(e->cwd);
    for (unsigned i = 0; i < e->nunits; i++) {
       free(e->units[i].name);
+      free(e->units[i].resume);
       free(e->units[i].hash);
       free(e->units[i].label);
       free(e->units[i].kind);
       free(e->units[i].bits);
    }
    free(e->units);
+}
+
+static int uint32_cmp(const void *a, const void *b)
+{
+   const uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+   return x < y ? -1 : x > y;
 }
 
 static void save_exec(jit_t *jit, wbuf_t *t)
@@ -2547,6 +2568,15 @@ static void save_exec(jit_t *jit, wbuf_t *t)
       w_u8(t, c->restart_top);
       w_u64(t, c->cpool_hash);
       w_u8(t, c->unsupported);
+
+      uint32_t *rs = xmalloc_array(MAX(c->nresume, 1), sizeof(uint32_t));
+      memcpy(rs, c->resume, c->nresume * sizeof(uint32_t));
+      qsort(rs, c->nresume, sizeof(uint32_t), uint32_cmp);
+      w_u32(t, c->nresume);
+      for (unsigned i = 0; i < c->nresume; i++)
+         w_u32(t, rs[i]);
+      free(rs);
+
       for (unsigned i = 0; i < c->nirs; i++) {
          w_u64(t, c->hash[i]);
          w_u32(t, c->label[i]);
@@ -2599,6 +2629,12 @@ static bool parse_exec(const uint8_t *data, size_t len, exec_info_t *e)
       u->restart = r_u8(&r);
       u->cphash  = r_u64(&r);
       u->unsupported = r_u8(&r);
+      u->nresume = r_u32(&r);
+      if (r.err != NULL || (size_t)u->nresume * 4 > (size_t)(r.end - r.p))
+         break;
+      u->resume = xmalloc_array(MAX(u->nresume, 1), sizeof(uint32_t));
+      for (unsigned k = 0; k < u->nresume; k++)
+         u->resume[k] = r_u32(&r);
       if (r.err != NULL || (size_t)u->nirs * 13 > (size_t)(r.end - r.p))
          break;
 
@@ -2646,7 +2682,7 @@ static bool bit_set(const uint8_t *bits, unsigned i)
 // instruction that differs had run: everything before it is the same code
 // and so did the same things.
 static void analyse_units(const exec_info_t *e, jit_t *jit, shash_t *units,
-                          ckpt_report_t *rep)
+                          ckpt_report_t *rep, bool own)
 {
    rep->tracked = e->tracked;
 
@@ -2692,6 +2728,10 @@ static void analyse_units(const exec_info_t *e, jit_t *jit, shash_t *units,
 
       info->new_restart = c.restart_top;
       info->new_state = c.restart_state;
+      info->old_resume = u->resume;
+      info->nold = u->nresume;
+      info->new_resume = c.resume;
+      info->nnew = c.nresume;
 
       bool same = c.nirs == u->nirs && c.cpool_hash == u->cphash
          && memcmp(c.hash, u->hash, u->nirs * sizeof(uint64_t)) == 0
@@ -2753,6 +2793,12 @@ static void analyse_units(const exec_info_t *e, jit_t *jit, shash_t *units,
 
          info->cls = (ran && !confirmed) ? U_APPROX : U_COMPAT;
          info->by_mapping = ran && confirmed;
+         if (own) {
+            // The file is the state of this code, whatever ran before
+            info->cls = U_OWN;
+            ran = confirmed = false;
+            info->by_mapping = false;
+         }
          info->prefix_ran = ran;
 
          rep->changed = xrealloc_array(rep->changed, rep->nchanged + 1,
@@ -2780,6 +2826,58 @@ static void analyse_units(const exec_info_t *e, jit_t *jit, shash_t *units,
 
 ////////////////////////////////////////////////////////////////////////////////
 // Restoring the model
+
+// Can a unit whose code has changed be resumed at a state saved by the old
+// code?  The state is the number of a block: it must be one that the new code
+// accepts, and, unless the file is the state of this code, the number of
+// states must not have changed, a sign that waits were added or removed.
+static const char *resume_refusal(const unit_t *u, uint32_t state,
+                                  bool process)
+{
+   if (process && state == 1)
+      return NULL;   // Where a process is after the reset
+
+   bool found = false;
+   for (unsigned i = 0; i < u->nnew; i++)
+      found |= (u->new_resume[i] == state);
+
+   if (!found)
+      return "the new code has no wait with that number";
+   else if (u->cls == U_APPROX && u->nold != u->nnew)
+      return "the number of waits of the unit has changed";
+   else
+      return NULL;
+}
+
+// A loop variable of a frame: the code after a change may assume a range for
+// it that the saved value does not respect
+static const char *frame_loop_var(const frame_t *f)
+{
+   for (unsigned i = 0; i < f->lay.nvars; i++) {
+      const jit_var_t *v = &(f->lay.vars[i]);
+      if (v->name != NULL && strstr(istr(v->name), "._L") != NULL)
+         return istr(v->name);
+   }
+   return NULL;
+}
+
+__attribute__((format(printf, 2, 3)))
+static void report_resumed(ckpt_report_t *rep, const char *fmt, ...)
+{
+   if (rep == NULL)
+      return;
+
+   va_list ap;
+   va_start(ap, fmt);
+   char *msg = NULL;
+   if (vasprintf(&msg, fmt, ap) < 0)
+      msg = xstrdup("?");
+   va_end(ap);
+
+   rep->resumed = xrealloc_array(rep->resumed, rep->nresumed + 1,
+                                 sizeof(char *));
+   rep->resumed[rep->nresumed++] = msg;
+}
 
 static void free_pending(void **pending)
 {
@@ -3398,6 +3496,7 @@ static bool restore_processes(index_t *ix, rbuf_t *r)
       // starts again from the top
       const unit_t *pu = unit_lookup(ix, p->closure.handle);
       uint32_t resume = state;
+      bool by_number = false;
       if (pu != NULL && pu->cls == U_APPROX
           && pu->old_restart && pu->new_restart && pu->new_state >= 0) {
          // It starts again from the top whatever it was waiting for
@@ -3407,11 +3506,24 @@ static bool restore_processes(index_t *ix, rbuf_t *r)
          report_note(ix->rep, "process %s resumes from its start", istr(name));
       }
       else if (pu != NULL && pu->cls == U_APPROX) {
-         r_fail(r, "process %s has changed and is suspended inside code that "
-                "has run (resume point %u), so it cannot be resumed; it "
-                "could only be restored if it always waited at its end",
-                istr(name), state);
-         break;
+         // Resume at the wait with the same number in the new code.  This is
+         // only a guess that the change leaves the waits before it alone.
+         const char *why = resume_refusal(pu, state, true);
+         if (why != NULL) {
+            r_fail(r, "process %s has changed and is suspended inside code "
+                   "that has run (resume point %u): %s", istr(name), state,
+                   why);
+            break;
+         }
+         by_number = true;
+      }
+      else if (pu != NULL && pu->cls != U_SAME) {
+         const char *why = resume_refusal(pu, state, true);
+         if (why != NULL) {
+            r_fail(r, "process %s is saved at resume point %u: %s",
+                   istr(name), state, why);
+            break;
+         }
       }
 
       *(uint32_t *)((uint8_t *)frame + 2 * sizeof(void *)) = resume;
@@ -3425,6 +3537,20 @@ static bool restore_processes(index_t *ix, rbuf_t *r)
          break;
       }
 
+      if (by_number) {
+         const char *loopvar = frame_loop_var(f);
+         if (loopvar != NULL) {
+            r_fail(r, "process %s has changed and is suspended inside code "
+                   "that has run, and it has the loop variable %s: a loop "
+                   "variable saved by the old code could be outside the "
+                   "range that the new code assumes for it, so it is not "
+                   "resumed", istr(name), loopvar);
+            break;
+         }
+         report_resumed(ix->rep, "process %s at wait number %u", istr(name),
+                        state);
+      }
+
       // Recreate the frames of the procedures the process is suspended in
       const uint32_t depth = r_u32(r);
       if (r->err != NULL || depth > 64) {
@@ -3433,6 +3559,7 @@ static bool restore_processes(index_t *ix, rbuf_t *r)
       }
 
       frame_t *chain[64];
+      const unit_t *cunit[64];
       if (depth > 0) {
          if (p->tlab != NULL) {
             r_fail(r, "process %s is already suspended in a procedure",
@@ -3451,11 +3578,18 @@ static bool restore_processes(index_t *ix, rbuf_t *r)
          jit_handle_t h = jit_lazy_compile(ix->jit, unit);
          const unit_t *cu = h == JIT_HANDLE_INVALID ? NULL
             : unit_lookup(ix, h);
-         if (cu != NULL && cu->cls != U_SAME && cu->cls != U_COMPAT) {
-            r_fail(r, "process %s is suspended in procedure %s which has "
-                   "changed and had already run", istr(name), istr(unit));
-            break;
+         if (cu != NULL && cu->cls == U_APPROX) {
+            const char *why = resume_refusal(cu, 0, false);
+            if (why != NULL) {
+               r_fail(r, "process %s is suspended in procedure %s which has "
+                      "changed and had already run: %s", istr(name),
+                      istr(unit), why);
+               break;
+            }
+            report_resumed(ix->rep, "procedure %s of process %s",
+                           istr(unit), istr(name));
          }
+         cunit[k] = cu;
 
          frame_t *cf = xcalloc(sizeof(frame_t));
          if (h == JIT_HANDLE_INVALID
@@ -3489,7 +3623,25 @@ static bool restore_processes(index_t *ix, rbuf_t *r)
 
       for (unsigned k = 0; k < depth && r->err == NULL; k++) {
          uint8_t *fd = chain[k]->data;
-         *(uint32_t *)(fd + 2 * sizeof(void *)) = r_u32(r);
+         const uint32_t pstate = r_u32(r);
+         if (cunit[k] != NULL && cunit[k]->cls != U_SAME) {
+            const char *why = resume_refusal(cunit[k], pstate, false);
+            if (why != NULL) {
+               r_fail(r, "procedure %s of process %s is saved at resume "
+                      "point %u: %s", istr(chain[k]->name), istr(name), pstate,
+                      why);
+               break;
+            }
+            const char *lv = cunit[k]->cls == U_APPROX
+               ? frame_loop_var(chain[k]) : NULL;
+            if (lv != NULL) {
+               r_fail(r, "procedure %s of process %s has changed and had "
+                      "already run, and it has the loop variable %s: it is "
+                      "not resumed", istr(chain[k]->name), istr(name), lv);
+               break;
+            }
+         }
+         *(uint32_t *)(fd + 2 * sizeof(void *)) = pstate;
          *(void **)(fd + sizeof(void *)) = k + 1 < depth ? chain[k + 1]->data
             : NULL;
 
@@ -3654,6 +3806,7 @@ typedef struct {
    const uint8_t *payload;
    size_t      length;
    bool        allow;
+   bool        own;
    ckpt_report_t *rep;
    exec_info_t *exec;
 } restore_arg_t;
@@ -3683,12 +3836,11 @@ static void restore_model_cb(void *arg)
    for (int i = 0; i < 4; i++)
       counts[i] = r_u32(r);
    mask = r_u32(r);
-   r_u8(r);   // Whether waveform dumping was on
    if (r->err != NULL)
       goto fail;
 
    shash_t *units = shash_new(256);
-   analyse_units(ra->exec, jit, units, ra->rep);
+   analyse_units(ra->exec, jit, units, ra->rep, ra->own);
 
    init_packages(NULL, jit, r);
    if (r->err != NULL)
@@ -3703,6 +3855,7 @@ static void restore_model_cb(void *arg)
    }
 
    ix.allow = ra->allow;
+   ix.own   = ra->own;
    ix.rep   = ra->rep;
    ix.saved_cwd = ra->exec->cwd;
    ix.units = units;
@@ -4065,6 +4218,14 @@ char *checkpoint_restore(rt_model_t *m, jit_t *jit, const char *path,
       return err;
    }
 
+   // Used by the confirmation of a fix: when the checkpoint is the state of
+   // this design itself, code that changed since the file was written by
+   // another version does not matter, since the file holds the state that
+   // this version has reached, and the state numbers of suspended processes
+   // are its own.  Anything that does not fit is an error, not a note.
+   const bool own = allow && getenv("NVC_CKPT_OWN_STATE") != NULL;
+   rep->own_state = own;
+
    ckpt_id_t *now = checkpoint_identify(m, jit);
    err = compare_ids(&fid, now, allow);
    const bool design_same = fid.design == now->design;
@@ -4085,7 +4246,7 @@ char *checkpoint_restore(rt_model_t *m, jit_t *jit, const char *path,
 
    restore_arg_t ra = {
       .m = m, .jit = jit, .r = &r, .payload = payload, .length = length,
-      .allow = allow, .rep = rep, .exec = &exec,
+      .allow = allow, .own = own, .rep = rep, .exec = &exec,
    };
    call_with_model(m, restore_model_cb, &ra);
 
@@ -4094,6 +4255,18 @@ char *checkpoint_restore(rt_model_t *m, jit_t *jit, const char *path,
       free(ra.err);
       goto out;
    }
+
+   if (own && (rep->layout_changed || !design_same)) {
+      err = xasprintf("%s: the checkpoint is not the state of this design "
+                      "(%s)", path, rep->layout_changed
+                      ? "variables or signals differ" : "the design differs");
+      goto out;
+   }
+
+   for (unsigned i = 0; i < rep->nresumed; i++)
+      report_note(rep, "%s resumed at the wait with the same number in the "
+                  "new code: right only if the change does not add, remove "
+                  "or reorder waits before it", rep->resumed[i]);
 
    // The verdict: exact only if every unit that changed had not run the
    // part that changed, nothing about the layout of the state differs and
@@ -4250,7 +4423,6 @@ char *checkpoint_describe(const char *path, ckpt_info_t *info)
       r_u64(&r);
       for (int i = 0; i < 5; i++)
          r_u32(&r);
-      info->wave = r_u8(&r);
 
       if (r_tag(&r, "PKGS")) {
          const uint32_t npkgs = r_u32(&r);

@@ -876,7 +876,7 @@ static const char open_input[] = MCP_JSON({
       },
       "allow_changes": {
          "type": "boolean",
-         "description": "With restore_from: allow the design to differ from the one the state file was written from, for example after fixing a bug. The result carries restore_verdict: exact only if the changed code had not run any of the changed part before the state was saved, otherwise approximate (the run is only as if the fix had been applied at that time): validate an approximate resume by running the fixed design from time 0. Refused, with the reason, when the state cannot be mapped onto the changed code."
+         "description": "With restore_from: allow the design to differ from the one the state file was written from, for example after fixing a bug. The result carries restore_verdict: exact only if the changed code had not run any of the changed part before the state was saved, otherwise approximate (the run is only as if the fix had been applied at that time): validate an approximate resume by running the fixed design from time 0. A process suspended at a wait in changed code that had run is resumed at the wait with the same number in the new code, which is only approximate (restore_verdict.resumed_by_number lists them): right if the change does not add, remove or reorder waits before it. Refused, with the reason, when the state cannot be mapped onto the changed code, when the new code has no wait with that number or a different number of waits, or when the process has a loop variable whose saved value the new code may not accept."
       },
       "track_code": {
         "type": "boolean",
@@ -892,7 +892,7 @@ static const char open_input[] = MCP_JSON({
          "type": "string",
          "minLength": 1,
          "maxLength": 64,
-         "description": "Write the state to files in this new directory below .nvc-mcp/ at regular simulated times while the simulation runs (see checkpoint_every), so that a later fix can be confirmed against them with confirm_dir. Implies track_code. Only designs that nvc_sim_checkpoint can save work. The files are named by the time they were written at. Do not start a waveform recording in a run you want to confirm: checkpoints written while it is on cannot be compared."
+         "description": "Write the state to files in this new directory below .nvc-mcp/ at regular simulated times while the simulation runs (see checkpoint_every), so that a later fix can be confirmed against them with confirm_dir. Implies track_code. Only designs that nvc_sim_checkpoint can save work. The files are named by the time they were written at. A waveform recording, started or stopped at any time, does not change the files."
       },
       "checkpoint_every": {
          "type": "string",

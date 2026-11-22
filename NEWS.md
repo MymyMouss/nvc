@@ -25,7 +25,13 @@
   design reaches every saved state from time zero), different (the first
   segment, time interval and object that differ) or incomplete (segments
   that could not be checked, or the `--confirm-budget` or `--confirm-max`
-  limit was reached).  It can be interrupted and resumed.
+  limit was reached).  It can be interrupted and resumed.  A fix inside a
+  process that is suspended at a wait (a sequential testbench) is
+  confirmed like any other: each segment restores the previous file as the
+  changed design's own state.  The saved state no longer depends on whether
+  a waveform is being recorded.  A restore with `--allow-changes` into a
+  process suspended in changed code that had run now resumes it at the wait
+  with the same number and reports the verdict approximate, naming it.
 - The MCP tool `nvc_sim_open` takes `checkpoint_dir` and `checkpoint_every`
   to write checkpoint files during a run, and `confirm_dir` to confirm in
   the background a fix restored with `restore_from` and `allow_changes`;

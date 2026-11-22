@@ -78,9 +78,10 @@ table and referred to by index, so the file contains strings and numbers only.
 The heap array order is saved as it is because nodes with equal keys are not
 ordered by anything but history, and the order in which simultaneous events
 are processed can change what is printed.  Waiting lists keep their empty
-slots for the same reason: a new registration fills the first empty slot.
-Value change callbacks added by tools (the waveform dumper) are left out of
-the lists and do not move the other entries.
+slots (but not those at the end) for the same reason: a new registration
+fills the first empty slot.  Value change callbacks added by tools (the
+waveform dumper) are left out of the lists; section 13 says why they do not
+move the other entries.
 
 After the sections are applied: processes' `pending` flags and the deferred
 queues from the reset are cleared, `now`, `iteration` and `trigger_epoch` are
@@ -507,9 +508,8 @@ and checks that each is rejected.
 `harness.py fix` and `mutate` save, for each exact verdict, the fixed design
 run from zero to the same time and compare its state section by section
 (everything except the identity of the build and the execution marks) with
-the state saved right after the restore (`--resave`).  Waveform dumping must
-be on in both runs: it changes delta cycle numbers, which are part of the
-state.  See the final report for counts.
+the state saved right after the restore (`--resave`).  See the final report
+for counts.
 
 ## 12. Confirmation by segments
 
@@ -535,15 +535,55 @@ The step that needs care is "provided the restore is faithful".  It is not
 assumed: each segment restores with `--allow-changes`, and the restore checks
 itself by saving the restored state again and comparing it with the file
 (`state_verified` in the verdict).  A segment whose restore could not be
-verified (for example the saved process was in code that is not equivalent,
-section 10) is incomplete and does not count; so is every later segment that
-follows it in the chain, because the induction needs every link.  The confirmation never says `confirmed` unless every
+verified is incomplete and does not count.  The induction needs every link,
+so a difference found in a segment is reported only if all the segments
+before it agree: the state it restored is then the changed design's own.  The confirmation never says `confirmed` unless every
 segment was run, was verified and agreed.  "Different" is reported for the
 first segment that disagrees: all segments before it are confirmed, so the
 fixed design reproduces the original up to the previous checkpoint and the
 first real difference lies in the interval of that segment.  Nothing checks that `C1 ... Cn` came
 from one run of one design, but each `Ci` is checked against what `F` does
 from `C(i-1)`, so a file from another run shows up as a difference.
+
+### 12.1a Restoring the file as the design's own state
+
+A segment other than the first restores `C(i-1)` into `F`.  If segments
+`1 ... i-1` agree, `C(i-1)` is byte for byte the state `F` itself saved at
+`T(i-1)` (segment `i-1` ran `F` from its own state and ended in a state equal
+to the file).  The state numbers in it, of processes and of suspended
+procedures, are therefore `F`'s own numbers and mean in `F`'s code what they
+meant when `F` saved them.  Restoring them verbatim is exact whatever the
+code that wrote the original file looked like, so no mapping of resume points
+and no refusal for a changed unit that is suspended is needed.  The children
+of `--confirm` restore in this mode (`NVC_CKPT_OWN_STATE`, set only by the
+confirmation; the restore reads it only with `--allow-changes`):
+
+* every changed unit is accepted whatever had run, and is marked as fully run;
+* a state number that the code does not accept (the jump table of the unit
+  lists the numbers: they are recorded in each file too) is an error, never
+  a guess;
+* anything that does not fit is an error rather than a note: a different
+  design, a frame whose layout differs, a variable or signal added or
+  dropped.  The file cannot then be `F`'s own state, and the segment is
+  incomplete (and an earlier segment must have differed);
+* the restored model must serialise to the file (`state_verified`), as before.
+
+What decides where `F` resumes is all in the payload that is compared: the
+state number of the process and of each procedure of the chain, the
+variables of every frame (including the loop temporaries that hold the
+remaining count of a `wait for` loop), the pending wake-up lists of the
+signals (what the process waits on, in order) and the event queue (the
+timeout), as part of `SIGS` and `HEAP`.  The sensitivity set and timeout of a
+wait come from code only when the wait statement executes, which has already
+happened when the state is saved: the resumed code does not recompute them,
+it is the saved lists that are restored.  The unit stamp is not compared
+and need not be: a process resumed in `F` is run by `F`'s code.  What could
+still be wrong is state that is not saved (section 8), which is as for any
+restore.
+
+If a previous segment did not agree, the restore of a later one may be a
+restore of a state that is not `F`'s own and what it finds is not reported:
+the result is `incomplete`.
 
 ### 12.2 Decisions
 
@@ -577,10 +617,8 @@ from `C(i-1)`, so a file from another run shows up as a difference.
   of the interval, and saves at the end of the first time step at or after
   it: the same rule as the original, so the two are saved at the same point
   of the same delta sequence.
-* **Waveform dumping** changes the delta cycle numbers, which are part of the
-  state.  A checkpoint records whether dumping was on (`META`) and a
-  checkpoint written with it, or a segment that starts from one, is
-  incomplete.  The segments themselves run without dumping.
+* **Waveform dumping** does not change the saved state (section 13), so the
+  original run may record waveforms and the segments need not.
 * **Segments in separate directories.**  Each segment runs in
   `DIR/seg-<time>`, so files the design writes by relative name do not
   collide between parallel segments, and the files the design read (the
@@ -681,3 +719,74 @@ from `C(i-1)`, so a file from another run shows up as a difference.
   32.5, 16.2, 9.4 and 9.9 s (CPU 30 to 32 s; four cores, so 8 jobs do not
   help).  The confirmation does the work of one run, plus one extra
   segment startup per file, spread over the workers.
+
+## 13. Waveform dumping and the saved state
+
+The first version of the confirmation refused checkpoints written while a
+waveform was recorded, on the belief that dumping changes the delta cycle
+numbers.  It does not: with the one byte that said whether a dumper was on
+removed from `META`, the first difference between a run with and without
+`--wave` was in `SIGS`, in the list of what waits on a signal.  The cause is
+in `model.c`, not in `wave.c`:
+
+* The dumper puts a watch (`W_WATCH`) in the list `n->pending` of each nexus
+  it records.  The checkpoint did not save the watches but saved the empty
+  slots of the list, and the list with a watch and one empty slot is not the
+  list without a watch (which is no list at all when it has one entry:
+  `pending` is a tagged pointer, and is cleared when that entry is removed).
+  So a signal that a process had waited on and left had `keep = 1` (one
+  empty slot) with a dumper and `0` without.
+* More seriously, `sched_event` filled the first empty slot with any object,
+  so a watch added while the list had a hole (recording started in the middle
+  of a run) took the place that the next process would have taken, and the
+  order in which processes waiting on the signal are woken, which is the
+  order they run in a delta cycle, depended on the dumper.  That is visible
+  as a different order of reports.
+
+The fix is at the cause (in `sched_event` and `clear_event`): a watch is
+always added at the end of the list and never fills a hole, and removing a
+watch removes its slot instead of leaving a hole.  The order of the other
+entries is then what it would be without the watch, whenever the watch is
+added or removed.  The saved list leaves the watches out and drops holes at
+the end (a list of holes is the empty list: the next entry takes the first
+hole or goes at the end, the same place).  Delta numbers are unaffected:
+`active_delta`, `event_delta` and `iteration` do not depend on the dumper.
+The `META` byte is gone and the file format version is 3.
+
+Checked by `harness.py waves`: periodic checkpoints of the same run with no
+dumper, with `--wave` (FST) and with `--format=vcd` are byte-equal, for the
+bench designs and every regression test that can be checkpointed; by
+`test/regress/ckpt5.sh` (`cmp` on whole files); and by `test_sim_confirm_waves`
+in `test/test_mcp.c`, in which a recording is started and stopped in the
+middle of a run of the MCP worker (in-memory recorder and FST file).
+
+Not covered: other tools that add watches (coverage is not checkpointable).
+Watches that watch part of a signal split its nexus; the dumper watches whole
+signals, and the saved layout would show a split.
+
+## 14. Resuming a changed process by wait number (user-facing restore)
+
+`--restore --allow-changes` used to refuse a process that was suspended at a
+wait in changed code that had run.  It now resumes it at the wait with the
+same number in the new code and says so: the verdict is `approximate`, the
+JSON has `"resumed_by_number"` listing the processes and procedures, and a
+reason says that the result is right only if the change does not add, remove
+or reorder waits before it.  Guards, because a number that does not exist
+would run the new code from a wrong place:
+
+* the number must be one the jump table of the new code accepts (each file
+  records the numbers of every unit; format version 3), or 1, where a process
+  is after the reset;
+* the number of waits of the unit must not have changed;
+* it is refused if the frame has a loop variable (`I._L<n>`).  The risk: the
+  code generator gives a loop variable the range of its loop and omits bounds
+  checks that it proves, so a value saved by the old code, outside the range
+  of a loop whose bounds were changed, would index an array out of bounds in
+  the new code.  The same is true of any variable whose subtype changed,
+  which is the case for every approximate restore since phase 3 (types are
+  compared by kind and size, not by bounds); the loop variable case is refused
+  because it is the one where the generated code relies on the range.
+
+If the confirmation of the checkpoints up to the restore time comes back
+confirmed, the MCP status says the restore point is confirmed (the changed
+design reaches that very state from zero).

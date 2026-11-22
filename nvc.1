@@ -579,8 +579,14 @@ checkpoint, and
 otherwise, in which case the simulation continues as if the fix had been
 applied at that time and should be validated by running the changed design
 from the start.  A process that is suspended in code that changed and had
-run cannot be resumed unless it always waits at its end, and the restore is
-refused.  Added or removed processes and drivers, and signals of a different
+run is resumed at the wait with the same number in the new code, which is
+right only if the change does not add, remove or reorder waits before it:
+the result is then
+.Cm approximate
+and the verdict lists such processes in
+.Cm resumed_by_number .
+It is refused if the new code has no wait with that number, has a different
+number of waits, or the process has a loop variable.  Added or removed processes and drivers, and signals of a different
 size, are refused.  The checkpoint must have been written with code tracking,
 which
 .Fl \-checkpoint

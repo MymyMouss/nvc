@@ -5585,6 +5585,10 @@ static void irgen_jump_table(jit_irgen_t *g)
                  g->blocks[target.id]);
 
       mask_set(&have, target.id);
+
+      g->func->resume = xrealloc_array(g->func->resume,
+                                       g->func->nresume + 1, sizeof(uint32_t));
+      g->func->resume[g->func->nresume++] = target.id;
    }
 
    DEBUG_ONLY(j_trap(g));

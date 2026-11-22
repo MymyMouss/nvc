@@ -1284,10 +1284,6 @@ static int run_cmd(int argc, char **argv, cmd_state_t *state)
       fatal("$bold$--checkpoint$$ and $bold$--restore$$ cannot be used "
             "with VHPI or VPI plugins");
 
-   // The checkpoint identifies the design as it is just after reset so
-   // this must come before the state is restored
-   checkpoint_note_wave(dumper != NULL);
-
    if (ckpt_file != NULL)
       checkpoint_schedule(state->model, state->jit, ckpt_file, ckpt_time);
 

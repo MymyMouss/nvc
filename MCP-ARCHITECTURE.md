@@ -1018,6 +1018,14 @@ toujours ce qui est sûr.
 
 ### 8.14 Confirmation en arrière-plan (segments)
 
+(Mise à jour: l'état sauvé ne dépend plus d'un enregistrement d'ondes, qu'il
+soit démarré ou arrêté en cours de run, et un process suspendu à un `wait`
+dans du code modifié est repris au `wait` de même numéro, verdict
+approximate avec `resumed_by_number`; la confirmation, elle, restaure chaque
+fichier comme l'état propre du design corrigé, voir `CHECKPOINT-DESIGN.md`
+sections 12 à 14. Le flux « restaurer après un correctif de banc de test puis
+confirmer en arrière-plan » démarre donc.)
+
 Un verdict « approximate » se valide en relançant le design corrigé depuis
 zéro, ce qui peut durer aussi longtemps que le run d'origine. La confirmation
 par segments le fait en parallèle: si les états d'origine `C0` (temps zéro),
